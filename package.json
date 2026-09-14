@@ -1,0 +1,62 @@
+{
+  "name": "ai-desk-companion",
+  "productName": "事务助手",
+  "version": "0.1.0",
+  "description": "以 AI 通知分析为入口,集成桌宠、工作台、日历与待办的个人事务管理工具",
+  "main": "out/main/index.js",
+  "author": "MoMingYu",
+  "private": true,
+  "build": {
+    "appId": "com.momingyu.aidesk",
+    "productName": "事务助手",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "out/**",
+      "package.json"
+    ],
+    "extraResources": [
+      "resources/**"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "resources/tray.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "事务助手"
+    }
+  },
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
+    "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
+    "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "test": "vitest run",
+    "gen:assets": "node scripts/gen-assets.mjs",
+    "dist": "electron-vite build && electron-builder --win nsis"
+  },
+  "dependencies": {
+    "pdfjs-dist": "^4.10.38",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "sql.js": "^1.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@types/sql.js": "^1.4.9",
+    "@vitejs/plugin-react": "^5.0.0",
+    "electron": "^37.0.0",
+    "electron-builder": "^26.0.0",
+    "electron-vite": "^4.0.0",
+    "typescript": "^5.8.0",
+    "vite": "^7.0.0",
+    "vitest": "^3.2.0"
+  }
+}
