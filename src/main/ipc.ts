@@ -111,11 +111,14 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     })
   }
 
-  // 桌宠通道:仅接受桌宠窗口主 frame 的调用,防止其他页面调用原生拖动/快照
+  // 桌宠通道:仅接受桌宠窗口主 frame 的调用,防止其他页面/子 frame 调用原生拖动/快照
   const handleFromPet = (channel: string, fn: (...args: never[]) => unknown): void => {
     ipcMain.handle(channel, async (event, ...args) => {
       const pet = getPetWindow()
-      if (!pet || pet.isDestroyed() || event.sender.id !== pet.webContents.id || event.senderFrame && !event.senderFrame.parent) {
+      const senderValid = !!pet && !pet.isDestroyed() && event.sender.id === pet.webContents.id
+      // 主 frame 的 parent 为 null;子 frame(iframe)才有 parent
+      const isMainFrame = !event.senderFrame || !event.senderFrame.parent
+      if (!senderValid || !isMainFrame) {
         throw new Error('FORBIDDEN: 桌宠通道来源无效')
       }
       try {
