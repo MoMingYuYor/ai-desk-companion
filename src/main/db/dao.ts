@@ -220,14 +220,38 @@ export function deleteProvider(db: SqliteDb, id: string): void {
 
 // ---------- conversations ----------
 
+interface ConversationRow {
+  id: string
+  title: string
+  kind: Conversation['kind']
+  status: Conversation['status']
+  created_at: string
+  updated_at: string
+}
+
+/** sql.js getAsObject 返回蛇形列名，出 dao 前必须映射为 shared/types 驼峰接口 */
+function mapConversation(r: ConversationRow): Conversation {
+  return {
+    id: r.id,
+    title: r.title,
+    kind: r.kind,
+    status: r.status,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at
+  }
+}
+
 export function listConversations(db: SqliteDb): Conversation[] {
-  return db.all<Conversation>(
+  return (db.all<ConversationRow>(
     "SELECT * FROM conversations WHERE status = 'active' ORDER BY updated_at DESC"
-  ) as Conversation[]
+  ) as ConversationRow[]).map(mapConversation)
 }
 
 export function getConversation(db: SqliteDb, id: string): Conversation | undefined {
-  return db.get<Conversation>('SELECT * FROM conversations WHERE id = ?', [id]) as Conversation | undefined
+  const r = db.get<ConversationRow>('SELECT * FROM conversations WHERE id = ?', [id]) as
+    | ConversationRow
+    | undefined
+  return r ? mapConversation(r) : undefined
 }
 
 export function createConversation(
@@ -272,11 +296,33 @@ export function deleteConversation(db: SqliteDb, id: string): void {
 
 // ---------- messages ----------
 
+interface MessageRow {
+  id: string
+  conversation_id: string
+  role: ChatMessage['role']
+  content: string
+  model_label: string | null
+  meta: string | null
+  created_at: string
+}
+
+function mapMessage(r: MessageRow): ChatMessage {
+  return {
+    id: r.id,
+    conversationId: r.conversation_id,
+    role: r.role,
+    content: r.content,
+    modelLabel: r.model_label,
+    meta: r.meta,
+    createdAt: r.created_at
+  }
+}
+
 export function listMessages(db: SqliteDb, conversationId: string): ChatMessage[] {
-  return db.all<ChatMessage>(
+  return (db.all<MessageRow>(
     'SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at, rowid',
     [conversationId]
-  ) as ChatMessage[]
+  ) as MessageRow[]).map(mapMessage)
 }
 
 export function insertMessage(
@@ -368,21 +414,43 @@ export function insertAnalysis(
   return a
 }
 
+interface AnalysisRow {
+  id: string
+  conversation_id: string
+  version: number
+  payload: string | null
+  raw_response: string | null
+  model_label: string | null
+  status: Analysis['status']
+  error: string | null
+  created_at: string
+}
+
+function mapAnalysis(r: AnalysisRow): Analysis {
+  return {
+    id: r.id,
+    conversationId: r.conversation_id,
+    version: r.version,
+    payload: safeParse(r.payload),
+    rawResponse: r.raw_response,
+    modelLabel: r.model_label,
+    status: r.status,
+    error: r.error,
+    createdAt: r.created_at
+  }
+}
+
 export function latestAnalysis(db: SqliteDb, conversationId: string): Analysis | undefined {
-  const row = db.get<Analysis & { payload: string }>(
+  const row = db.get<AnalysisRow>(
     'SELECT * FROM analyses WHERE conversation_id = ? ORDER BY version DESC LIMIT 1',
     [conversationId]
-  ) as (Analysis & { payload: string }) | undefined
-  if (!row) return undefined
-  return { ...row, payload: safeParse(row.payload) } as Analysis
+  ) as AnalysisRow | undefined
+  return row ? mapAnalysis(row) : undefined
 }
 
 export function getAnalysis(db: SqliteDb, id: string): Analysis | undefined {
-  const row = db.get<Analysis & { payload: string }>('SELECT * FROM analyses WHERE id = ?', [id]) as
-    | (Analysis & { payload: string })
-    | undefined
-  if (!row) return undefined
-  return { ...row, payload: safeParse(row.payload) } as Analysis
+  const row = db.get<AnalysisRow>('SELECT * FROM analyses WHERE id = ?', [id]) as AnalysisRow | undefined
+  return row ? mapAnalysis(row) : undefined
 }
 
 function safeParse(s: string | null | undefined): AnalysisPayload {
