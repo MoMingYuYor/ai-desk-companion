@@ -158,13 +158,14 @@ function ProviderEditor({
   const [modelsText, setModelsText] = useState(initial.models.join('\n'))
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<ProviderTestResult | null>(null)
+  // 默认模型下拉与模型列表文本框保持实时同步,自动获取后无需保存重进即可选择
+  const parsedModels = modelsText.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
 
   const submit = async (): Promise<void> => {
-    const models = modelsText.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
     await window.api.saveProvider({
       ...form,
-      models,
-      defaultModel: form.defaultModel || models[0] || '',
+      models: parsedModels,
+      defaultModel: form.defaultModel || parsedModels[0] || '',
       apiKey: apiKey || undefined
     })
     onSaved()
@@ -228,7 +229,7 @@ function ProviderEditor({
           <label>默认模型</label>
           <select value={form.defaultModel} onChange={(e) => setForm({ ...form, defaultModel: e.target.value })}>
             <option value="">(选择)</option>
-            {form.models.map((m) => (
+            {parsedModels.map((m) => (
               <option key={m} value={m}>
                 {m}
               </option>
@@ -243,8 +244,7 @@ function ProviderEditor({
               setTesting(true)
               setTestResult(null)
               try {
-                const models = modelsText.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
-                const r = await window.api.testProvider({ ...form, models, defaultModel: form.defaultModel || models[0] || '', apiKey: apiKey || undefined })
+                const r = await window.api.testProvider({ ...form, models: parsedModels, defaultModel: form.defaultModel || parsedModels[0] || '', apiKey: apiKey || undefined })
                 setTestResult(r)
               } finally {
                 setTesting(false)
