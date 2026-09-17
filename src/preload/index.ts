@@ -1,7 +1,9 @@
 // 预加载:通过 contextBridge 向渲染进程暴露类型化 API
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import { Channels } from '../shared/api'
-import type { RendererApi } from '../shared/api'
+import type { AppearanceBridge, RendererApi } from '../shared/api'
+import { AppearanceChannels } from '../shared/appearance'
+import type { AppearanceSnapshot } from '../shared/appearance'
 import type { MailApi, MailSubscribe, MailEventMap } from '../shared/mail'
 
 const invoke =
@@ -48,11 +50,26 @@ const subscribeMail: MailSubscribe = ((channel, listener) => {
   }
 }) as MailSubscribe
 
+const appearance: AppearanceBridge = {
+  get: invoke(AppearanceChannels.get),
+  set: invoke(AppearanceChannels.set),
+  subscribe: (listener) => {
+    const wrapped = (_event: unknown, snapshot: AppearanceSnapshot): void => {
+      listener(snapshot)
+    }
+    ipcRenderer.on(AppearanceChannels.changed, wrapped)
+    return () => {
+      ipcRenderer.removeListener(AppearanceChannels.changed, wrapped)
+    }
+  }
+}
+
 const api: RendererApi = {
   getAppInfo: invoke(Channels.AppInfo),
   pathForFile: (file: unknown) => webUtils.getPathForFile(file as File),
   mail,
   subscribeMail,
+  appearance,
 
   listProviders: invoke(Channels.ProvidersList),
   saveProvider: invoke(Channels.ProvidersSave),
@@ -70,6 +87,9 @@ const api: RendererApi = {
   stopChat: invoke(Channels.ChatStop),
   retryChat: invoke(Channels.ChatRetry),
   addMaterials: invoke(Channels.MaterialsAdd),
+  fetchUrlText: invoke(Channels.UrlFetch),
+  petGetScale: invoke(Channels.PetGetScale),
+  petSetScale: invoke(Channels.PetSetScale),
 
   getLatestAnalysis: invoke(Channels.AnalysesLatest),
   rerunAnalysis: invoke(Channels.AnalysesRerun),

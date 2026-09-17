@@ -7,6 +7,7 @@ import type {
   Material
 } from '../../../shared/types'
 import { fmtTime, nowLocalIso } from '../../../shared/dateUtils'
+import { extractUrls } from '../../../shared/urlText'
 import { Toast, useSubscribe, useToast } from '../../shared/util'
 
 interface Props {
@@ -148,6 +149,23 @@ export function ChatPage({ refreshKey, petAction, locateConversationId }: Props)
     const text = input.trim()
     if (!text || !activeId || streaming) return
     setInput('')
+    // 输入中带网页链接时,先抓取正文存为材料(如公众号推文),再带着原文发送
+    const urls = extractUrls(text).slice(0, 3)
+    let fetched = 0
+    for (const url of urls) {
+      try {
+        const page = await window.api.fetchUrlText(url)
+        await window.api.addMaterials({
+          conversationId: activeId,
+          texts: [{ name: page.title || url, content: page.text }],
+          autoRun: false
+        })
+        fetched++
+      } catch (err) {
+        showToast(`链接抓取失败:${err instanceof Error ? err.message : err}`)
+      }
+    }
+    if (fetched > 0) showToast(`已抓取 ${fetched} 个链接的正文,开始分析`)
     setStreaming(true)
     setStreamText('')
     try {

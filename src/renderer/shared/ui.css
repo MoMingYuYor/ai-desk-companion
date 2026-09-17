@@ -375,6 +375,26 @@ textarea {
   font-size: 12px;
   color: var(--text-2);
 }
+.cal-cell .d-row {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: 0;
+}
+.cal-cell .lunar {
+  font-size: 11px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cal-cell .lunar.festival {
+  color: var(--accent);
+  font-weight: 600;
+}
+.cal-cell .lunar.term {
+  color: var(--accent);
+}
 .chip {
   font-size: 11px;
   border-radius: 5px;

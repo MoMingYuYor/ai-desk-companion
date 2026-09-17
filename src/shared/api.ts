@@ -29,6 +29,12 @@ import type {
 } from './types'
 import type { PetActivitySnapshot } from './pet'
 import type { MailApi, MailSubscribe } from './mail'
+import type { AppearanceApi, AppearanceSnapshot } from './appearance'
+
+/** preload 暴露的外观桥:在 AppearanceApi 之上增加主进程广播订阅 */
+export interface AppearanceBridge extends AppearanceApi {
+  subscribe(listener: (snapshot: AppearanceSnapshot) => void): () => void
+}
 
 export const Channels = {
   // app
@@ -50,6 +56,7 @@ export const Channels = {
   ChatStop: 'chat:stop',
   ChatRetry: 'chat:retry',
   MaterialsAdd: 'materials:add',
+  UrlFetch: 'materials:fetch-url',
   // analysis
   AnalysesLatest: 'analyses:latest',
   AnalysesRerun: 'analyses:rerun',
@@ -97,6 +104,8 @@ export const Channels = {
   PetDragMove: 'pet:drag-move',
   PetDragEnd: 'pet:drag-end',
   PetOpenMenu: 'pet:open-menu',
+  PetGetScale: 'pet:get-scale',
+  PetSetScale: 'pet:set-scale',
   PetAction: 'pet:action',
   PetActivitySnapshot: 'pet:activity-snapshot',
   // backup
@@ -166,6 +175,7 @@ export interface RendererApi {
   stopChat(conversationId: string): Promise<void>
   retryChat(conversationId: string): Promise<void>
   addMaterials(input: MaterialIntakeInput): Promise<{ conversationId: string; materials: Material[] }>
+  fetchUrlText(url: string): Promise<{ title: string; text: string }>
   // analysis
   getLatestAnalysis(conversationId: string): Promise<Analysis | null>
   rerunAnalysis(conversationId: string): Promise<void>
@@ -214,6 +224,8 @@ export interface RendererApi {
   petDragEnd(): Promise<void>
   petOpenMenu(): Promise<void>
   petAction(action: string): Promise<void>
+  petGetScale(): Promise<number>
+  petSetScale(scale: number): Promise<void>
   getPetActivitySnapshot(): Promise<PetActivitySnapshot>
   // backup
   exportBackup(): Promise<string | null>
@@ -221,6 +233,8 @@ export interface RendererApi {
   // mail
   mail: MailApi
   subscribeMail: MailSubscribe
+  // appearance
+  appearance: AppearanceBridge
   // 事件订阅
   on(channel: string, listener: (...args: unknown[]) => void): () => void
 }

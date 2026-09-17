@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import type { SqliteDb } from './db/connection'
 import { getMeta, setMeta } from './db/dao'
 import { resolvePetPlacement, panelBoundsForPet } from './pet/geometry'
+import { clampPetScale } from '../shared/petScale'
 
 let workbenchWindow: BrowserWindow | null = null
 let petWindow: BrowserWindow | null = null
@@ -99,14 +100,41 @@ export function showWorkbench(db: SqliteDb): BrowserWindow {
 
 export const PET_WINDOW_SIZE = { width: 320, height: 400 } as const
 
+export function petScaleOf(db: SqliteDb): number {
+  const raw = getMeta(db, 'pet:scale')
+  const n = raw ? Number(raw) : 1
+  return Number.isFinite(n) && n > 0 ? clampPetScale(n) : 1
+}
+
+export function setPetScale(db: SqliteDb, scale: number): number {
+  const clamped = clampPetScale(scale)
+  setMeta(db, 'pet:scale', String(clamped))
+  const win = getPetWindow()
+  if (win && !win.isDestroyed()) {
+    const [x, y] = win.getPosition()
+    win.setBounds({
+      x,
+      y,
+      width: Math.round(PET_WINDOW_SIZE.width * clamped),
+      height: Math.round(PET_WINDOW_SIZE.height * clamped)
+    })
+  }
+  return clamped
+}
+
 export function createPetWindow(db: SqliteDb): BrowserWindow {
   if (petWindow && !petWindow.isDestroyed()) return petWindow
   const savedX = getMeta(db, 'pet:x')
   const savedY = getMeta(db, 'pet:y')
-  const { x, y } = resolvePetPlacement(savedX, savedY, PET_WINDOW_SIZE)
+  const scale = petScaleOf(db)
+  const size = {
+    width: Math.round(PET_WINDOW_SIZE.width * scale),
+    height: Math.round(PET_WINDOW_SIZE.height * scale)
+  }
+  const { x, y } = resolvePetPlacement(savedX, savedY, size)
   const win = new BrowserWindow({
-    width: PET_WINDOW_SIZE.width,
-    height: PET_WINDOW_SIZE.height,
+    width: size.width,
+    height: size.height,
     x,
     y,
     frame: false,
@@ -195,7 +223,7 @@ function positionPanelNearPet(win: BrowserWindow): void {
   if (!pet || pet.isDestroyed()) return
   const [px, py] = pet.getPosition()
   const panelBounds = win.getBounds()
-  const { x, y } = panelBoundsForPet({ x: px, y: py, width: PET_WINDOW_SIZE.width }, {
+  const { x, y } = panelBoundsForPet({ x: px, y: py, width: pet.getBounds().width }, {
     width: panelBounds.width,
     height: panelBounds.height
   })

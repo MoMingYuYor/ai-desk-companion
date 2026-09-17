@@ -3,13 +3,15 @@ import type {
   DragEvent as ReactDragEvent,
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
-  PointerEvent as ReactPointerEvent
+  PointerEvent as ReactPointerEvent,
+  WheelEvent as ReactWheelEvent
 } from 'react'
 import type { RendererApi } from '../../shared/api'
 import type { PetBubble, PetClock, PetMode, PetPort, PetViewState } from './contracts'
 import { initialPetState } from './model'
 import { createPetController } from './controller'
 import { createPetGesture } from './gesture'
+import { createPetZoom } from '../../shared/petScale'
 import { PetCharacter } from './PetCharacter'
 import { PetBubbles } from './PetBubbles'
 
@@ -38,6 +40,9 @@ export default function PetApp({ api }: PetAppProps = {}) {
   const [gestureState, setGestureState] = useState({ pressed: false, dragging: false, releaseKey: 0 })
   const [localBubble, setLocalBubble] = useState<PetBubble | null>(null)
   const [alertKey, setAlertKey] = useState(0)
+  const [scale, setScale] = useState(1)
+  const zoomRef = useRef(createPetZoom(1))
+  const scaleRef = useRef(1)
 
   const activePointerRef = useRef<number | null>(null)
   const localTimerRef = useRef<number | null>(null)
@@ -58,7 +63,9 @@ export default function PetApp({ api }: PetAppProps = {}) {
       petDragEnd: () => base.petDragEnd(),
       petOpenMenu: () => base.petOpenMenu(),
       on: (channel, listener) => base.on(channel, listener),
-      getPetActivitySnapshot: () => base.getPetActivitySnapshot()
+      getPetActivitySnapshot: () => base.getPetActivitySnapshot(),
+      petGetScale: () => Promise.resolve(base.petGetScale?.()),
+      petSetScale: (s) => Promise.resolve(base.petSetScale?.(s))
     }
   }, [api])
 
@@ -101,6 +108,33 @@ export default function PetApp({ api }: PetAppProps = {}) {
       void gesture.dispose()
     }
   }, [controller, gesture])
+
+  // 启动时读取已保存的缩放;主进程窗口已按该比例建窗,renderer 同步 zoom
+  useEffect(() => {
+    let cancelled = false
+    void Promise.resolve(port.petGetScale?.())
+      .then((s) => {
+        if (cancelled || typeof s !== 'number' || !Number.isFinite(s) || s <= 0) return
+        zoomRef.current.set(s)
+        scaleRef.current = s
+        setScale(s)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [port])
+
+  const applyScale = (next: number): void => {
+    if (scaleRef.current === next) return
+    scaleRef.current = next
+    setScale(next)
+    void port.petSetScale?.(next).catch(() => {})
+  }
+
+  const handleWheel = (e: ReactWheelEvent): void => {
+    applyScale(zoomRef.current.wheel(e.deltaY))
+  }
 
   // 提醒动画仅在进入 alert 或 alertSequence 变化时触发一次
   useEffect(() => {
@@ -230,6 +264,8 @@ export default function PetApp({ api }: PetAppProps = {}) {
   return (
     <div
       className="pet-root"
+      style={{ zoom: scale }}
+      onWheel={handleWheel}
       onDragOver={handleDragOver}
       onDrop={handleDrop}
       onContextMenu={handleContextMenu}

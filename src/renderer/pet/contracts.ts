@@ -6,6 +6,9 @@ export type PetPort = Pick<
   'getDayAgenda' | 'addMaterials' | 'pathForFile' | 'petDragStart' | 'petDragEnd' | 'petOpenMenu' | 'on'
 > & {
   getPetActivitySnapshot(): Promise<PetActivitySnapshot>
+  /** 桌宠缩放;可选以便旧测试替身不实现 */
+  petGetScale?(): Promise<number | undefined>
+  petSetScale?(scale: number): Promise<void>
 }
 
 export interface PetClock {

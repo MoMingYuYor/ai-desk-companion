@@ -1,6 +1,7 @@
 // IPC 注册:渲染进程可见 API 的全部处理入口
 import { BrowserWindow, Menu, app, clipboard, dialog, ipcMain } from 'electron'
 import type { SqliteDb } from './db/connection'
+import { createUrlFetcher } from './services/urlFetch'
 import {
   createConversation,
   createEvent,
@@ -65,8 +66,10 @@ import {
   getPetWindow,
   getWorkbenchWindow,
   markQuitting,
+  petScaleOf,
   savePetPosition,
   setPanelPinnedMeta,
+  setPetScale,
   togglePet,
   createPanelWindow
 } from './windows'
@@ -98,6 +101,7 @@ function broadcastDataChanged(): void {
 export function registerIpcHandlers(deps: IpcDeps): void {
   depsRef = deps
   const { db, engine, router, reminders, mail } = deps
+  const fetchUrlText = createUrlFetcher()
 
   const handle = (channel: string, fn: (...args: never[]) => unknown): void => {
     ipcMain.handle(channel, async (_event, ...args) => {
@@ -191,6 +195,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   handle(Channels.ChatStop, (conversationId: string) => engine.stop(conversationId))
   handle(Channels.ChatRetry, (conversationId: string) => engine.retry(conversationId))
   handle(Channels.MaterialsAdd, (input: MaterialIntakeInput) => engine.intakeMaterials(input))
+  handle(Channels.UrlFetch, (url: string) => fetchUrlText(url))
 
   // ---- analysis ----
   handle(Channels.AnalysesLatest, (conversationId: string) => latestAnalysis(db, conversationId) ?? null)
@@ -300,6 +305,8 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     savePetPosition(db)
   })
   handleFromPet(Channels.PetOpenMenu, () => openPetMenu())
+  handleFromPet(Channels.PetGetScale, () => petScaleOf(db))
+  handleFromPet(Channels.PetSetScale, (scale: number) => setPetScale(db, scale))
   handleFromPet(Channels.PetAction, (action: string) => runPetAction(action))
   handleFromPet(Channels.PetActivitySnapshot, () => deps.petActivity.snapshot())
 

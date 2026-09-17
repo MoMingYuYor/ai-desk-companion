@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { CalendarEvent, CourseOccurrence, DayAgenda, EventInput } from '../../../shared/types'
 import { fmtTime, toDateStr, weekdayCn } from '../../../shared/dateUtils'
+import { lunarInfo, lunarLabel } from '../../../shared/lunarDay'
 import { Toast, useSubscribe, useToast } from '../../shared/util'
 
 interface Props {
@@ -81,6 +82,12 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
     return out
   }, [cursor])
 
+  const selLunar = lunarInfo(
+    Number(selected.slice(0, 4)),
+    Number(selected.slice(5, 7)),
+    Number(selected.slice(8, 10))
+  )
+
   return (
     <div className="page" style={{ flexDirection: 'column' }}>
       <div className="row" style={{ marginBottom: 8 }}>
@@ -108,13 +115,24 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
               const cs = coursesByDay[d] ?? []
               const isToday = d === today
               const otherMonth = Number(d.slice(5, 7)) !== cursor.m
+              const lunar = lunarLabel(d)
+              const lunarCls = lunarInfo(
+                Number(d.slice(0, 4)),
+                Number(d.slice(5, 7)),
+                Number(d.slice(8, 10))
+              )
               return (
                 <div
                   key={d}
                   className={`cal-cell ${isToday ? 'today' : ''} ${otherMonth ? 'other-month' : ''}`}
                   onClick={() => setSelected(d)}
                 >
-                  <span className="d">{Number(d.slice(8, 10))}</span>
+                  <div className="d-row">
+                    <span className="d">{Number(d.slice(8, 10))}</span>
+                    <span className={`lunar ${lunarCls.festival ? 'festival' : ''} ${lunarCls.term ? 'term' : ''}`}>
+                      {lunar}
+                    </span>
+                  </div>
                   {cs.filter((c) => !c.cancelled).slice(0, 2).map((c, i) => (
                     <span key={'c' + i} className="chip course">
                       {c.startTime} {c.course.name}
@@ -137,6 +155,11 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
           <h3>
             {selected} {weekdayCn(dayOfWeek(selected))}
           </h3>
+          <div className="muted" style={{ marginTop: -4, marginBottom: 8 }}>
+            农历{selLunar.lunarMonthName}
+            {selLunar.lunarDayName}
+            {selLunar.festival ? ` · ${selLunar.festival}` : selLunar.term ? ` · ${selLunar.term}` : ''}
+          </div>
           {agenda && (
             <div className="column">
               {agenda.courses.map((c, i) => (
