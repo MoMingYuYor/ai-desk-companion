@@ -111,6 +111,13 @@ function bootstrap(): void {
     reminders.start()
     mail.start()
 
+    // 开发诊断:渲染进程崩溃转发到终端,便于定位白屏类问题
+    if (!app.isPackaged) {
+      app.on('render-process-gone', (_event, webContents, details) => {
+        console.error('[renderer-gone]', details.reason, 'exitCode=', details.exitCode, 'url=', webContents.getURL())
+      })
+    }
+
     powerMonitor.on('resume', () => {
       reminders?.tick()
       // 唤醒后立即补收到期同步

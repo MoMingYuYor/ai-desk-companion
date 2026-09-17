@@ -88,7 +88,15 @@ export function useMailbox(api: MailApi, subscribe: MailSubscribe): Mailbox {
         search: searchQueryRef.current.trim() || undefined,
         page
       }
-      const res = await api.list(query)
+      let res: Awaited<ReturnType<typeof api.list>>
+      try {
+        res = await api.list(query)
+      } catch (err) {
+        if (seq !== listSeqRef.current) return
+        setListLoading(false)
+        setError(err instanceof Error ? err.message : String(err))
+        return
+      }
       if (seq !== listSeqRef.current) return // 迟到的旧请求,不覆盖当前筛选结果
       setListLoading(false)
       if (!res.ok) {
@@ -108,7 +116,14 @@ export function useMailbox(api: MailApi, subscribe: MailSubscribe): Mailbox {
 
   const refreshAccounts = useCallback(async (): Promise<void> => {
     setAccountsLoading(true)
-    const res = await api.accounts()
+    let res: Awaited<ReturnType<typeof api.accounts>>
+    try {
+      res = await api.accounts()
+    } catch (err) {
+      setAccountsLoading(false)
+      setError(err instanceof Error ? err.message : String(err))
+      return
+    }
     setAccountsLoading(false)
     if (res.ok) setAccounts(res.value)
     else setError(res.message)
@@ -147,7 +162,15 @@ export function useMailbox(api: MailApi, subscribe: MailSubscribe): Mailbox {
       setActiveId(id)
       setDetail(null)
       setDetailLoading(true)
-      const res = await api.detail(id)
+      let res: Awaited<ReturnType<typeof api.detail>>
+      try {
+        res = await api.detail(id)
+      } catch (err) {
+        if (activeIdRef.current !== id) return
+        setDetailLoading(false)
+        setError(err instanceof Error ? err.message : String(err))
+        return
+      }
       if (activeIdRef.current !== id) return
       setDetailLoading(false)
       if (!res.ok) {
@@ -168,7 +191,13 @@ export function useMailbox(api: MailApi, subscribe: MailSubscribe): Mailbox {
     async (attachmentIds: string[]): Promise<void> => {
       const id = activeIdRef.current
       if (!id || attachmentIds.length === 0) return
-      const res = await api.analyze({ messageId: id, attachmentIds })
+      let res: Awaited<ReturnType<typeof api.analyze>>
+      try {
+        res = await api.analyze({ messageId: id, attachmentIds })
+      } catch (err) {
+        setError('分析请求失败:' + (err instanceof Error ? err.message : String(err)))
+        return
+      }
       if (activeIdRef.current !== id) return
       if (res.ok) setAnalysisStatus(id, res.value)
       else setError(res.message)
@@ -181,7 +210,13 @@ export function useMailbox(api: MailApi, subscribe: MailSubscribe): Mailbox {
     if (!id) return
     const status = statusMapRef.current.get(id)
     if (!status) return
-    const res = await api.cancelAnalysis(status.conversationId)
+    let res: Awaited<ReturnType<typeof api.cancelAnalysis>>
+    try {
+      res = await api.cancelAnalysis(status.conversationId)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      return
+    }
     if (!res.ok) setError(res.message)
   }, [api])
 

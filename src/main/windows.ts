@@ -32,6 +32,18 @@ function loadPage(win: BrowserWindow, page: string): void {
   const url = rendererUrl(page)
   if (process.env.ELECTRON_RENDERER_URL) {
     void win.loadURL(url)
+    // 开发诊断:渲染层 error 级日志转发到终端,便于定位白屏类问题
+    win.webContents.on('console-message', (...args: unknown[]) => {
+      const newForm = args[0] as { detail?: { level?: number; message?: string; sourceId?: string; lineNumber?: number } } | undefined
+      const detail = newForm?.detail
+      const level = detail?.level ?? (args[1] as number | undefined)
+      const message = detail?.message ?? (args[2] as string | undefined)
+      const source = detail?.sourceId ?? (args[4] as string | undefined)
+      const line = detail?.lineNumber ?? (args[3] as number | undefined)
+      if (typeof level === 'number' && level >= 3) {
+        console.error(`[renderer:${page}]`, message, `${String(source ?? '')}:${String(line ?? '')}`)
+      }
+    })
   } else {
     void win.loadFile(url)
   }
