@@ -357,6 +357,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   handle(Channels.MailDownload, (id: string) => mail.download(id))
   handle(Channels.MailSaveAttachment, (id: string) => mail.saveAttachment(id))
   handle(Channels.MailOpenLink, (messageId: string, url: string) => mail.openLink(messageId, url))
+  handle(Channels.MailOpenWebmail, (email: string) => mail.openWebmail(email))
   handle(Channels.MailAnalyze, (input: never) => mail.analyze(input as Parameters<MailService['analyze']>[0]))
   handle(Channels.MailAnalysisStatus, (messageId: string) => mail.analysisStatus(messageId))
   handle(Channels.MailCancelAnalysis, (conversationId: string) => mail.cancelAnalysis(conversationId))

@@ -125,6 +125,7 @@ export const Channels = {
   MailDownload: 'mail:download',
   MailSaveAttachment: 'mail:save-attachment',
   MailOpenLink: 'mail:open-link',
+  MailOpenWebmail: 'mail:open-webmail',
   MailAnalyze: 'mail:analyze',
   MailAnalysisStatus: 'mail:analysis-status',
   MailCancelAnalysis: 'mail:cancel-analysis',

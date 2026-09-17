@@ -16,6 +16,7 @@ import type {
   MailErrorCode
 } from '../../shared/mail'
 import { MAIL_LIMITS } from '../../shared/mail'
+import { webmailUrlFor } from '../../shared/webmail'
 import type { Engine } from '../services/engine'
 import { parseLocalFile } from '../services/materials'
 import { MailAccountStore } from './accounts'
@@ -247,6 +248,15 @@ export class MailService implements MailApi {
         throw new Error('INVALID_CONFIG: 仅允许 HTTP/HTTPS 链接')
       }
       await shell.openExternal(parsed.toString())
+    })
+  }
+
+  // 发件不走本地:用系统浏览器打开对应邮箱的网页版
+  async openWebmail(email: string): Promise<MailResult<void>> {
+    return toResultAsync(async () => {
+      const url = webmailUrlFor(email)
+      if (!url) throw new Error('INVALID_CONFIG: 邮箱地址无效,无法打开网页版')
+      await shell.openExternal(url)
     })
   }
 

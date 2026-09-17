@@ -8,18 +8,78 @@
   height: 100%;
   min-height: 0;
 }
+.mail-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.mail-toolbar .mail-search {
+  width: 220px;
+}
 .mail-columns {
   display: grid;
-  grid-template-columns: 240px 300px minmax(0, 1fr);
+  grid-template-columns: 320px minmax(0, 1fr);
   gap: 14px;
   flex: 1;
   min-height: 0;
+}
+.mail-manager-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.mail-manager-header h3 {
+  margin: 0;
+}
+.mail-manager {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 760px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.mail-manager-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mail-manager-form h3,
+.mail-manager-accounts h3 {
+  margin: 0;
+}
+.mail-manager-accounts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mail-manager-account {
+  border: 1px solid var(--border, #ddd);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mail-credential-help {
+  border: 1px dashed var(--border, #ddd);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.mail-list-footer {
+  display: flex;
+  gap: 8px;
+  padding: 8px;
+  border-top: 1px solid var(--border, #ddd);
 }
 .mail-error {
   display: flex;
   align-items: center;
   gap: 8px;
-  background: #fdebea;
+  background: var(--ui-error-surface);
   color: var(--danger);
   border-radius: 8px;
   padding: 6px 12px;
@@ -65,7 +125,7 @@
   display: flex;
   flex-direction: column;
   gap: 3px;
-  background: #fbfcff;
+  background: var(--ui-bg);
 }
 .mail-account-row:hover {
   border-color: var(--accent);
@@ -92,7 +152,7 @@
   font-size: 11px;
   border-radius: 6px;
   padding: 1px 6px;
-  background: #f0f1f5;
+  background: var(--ui-subtle-surface);
   color: var(--text-2);
   flex-shrink: 0;
 }
@@ -101,11 +161,11 @@
   color: var(--accent);
 }
 .mail-status-badge.paused {
-  background: #fff5e0;
+  background: var(--ui-warning-surface);
   color: var(--warn);
 }
 .mail-status-badge.error {
-  background: #fdebea;
+  background: var(--ui-error-surface);
   color: var(--danger);
 }
 .mail-account-actions {
@@ -125,7 +185,7 @@
 .mail-panel-message {
   font-size: 12px;
   color: var(--warn);
-  background: #fff5e0;
+  background: var(--ui-warning-surface);
   border-radius: 8px;
   padding: 6px 10px;
   line-height: 1.5;
@@ -188,7 +248,7 @@
   border-bottom: none;
 }
 .mail-item:hover {
-  background: #f2f4fa;
+  background: var(--ui-subtle-surface);
   border-color: var(--border);
   color: var(--text);
 }
@@ -292,7 +352,7 @@
   border-radius: 12px;
   border-bottom-left-radius: 3px;
   padding: 8px 12px;
-  background: #f2f4fa;
+  background: var(--ui-subtle-surface);
   font-size: 13px;
   display: flex;
   align-items: center;
@@ -306,15 +366,15 @@
   color: var(--accent);
 }
 .mail-analysis-bubble.done {
-  background: #e6f6ec;
+  background: var(--ui-success-surface);
   color: var(--ok);
 }
 .mail-analysis-bubble.failed {
-  background: #fdebea;
+  background: var(--ui-error-surface);
   color: var(--danger);
 }
 .mail-analysis-bubble.cancelled {
-  background: #f0f1f5;
+  background: var(--ui-subtle-surface);
   color: var(--text-2);
 }
 .mail-spin {
@@ -409,7 +469,7 @@
   gap: 8px;
 }
 .mail-history-summary {
-  background: #fbfcff;
+  background: var(--ui-bg);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 10px 12px;

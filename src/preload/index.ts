@@ -25,6 +25,7 @@ const mail: MailApi = {
   download: invoke(Channels.MailDownload),
   saveAttachment: invoke(Channels.MailSaveAttachment),
   openLink: invoke(Channels.MailOpenLink),
+  openWebmail: invoke(Channels.MailOpenWebmail),
   analyze: invoke(Channels.MailAnalyze),
   analysisStatus: invoke(Channels.MailAnalysisStatus),
   cancelAnalysis: invoke(Channels.MailCancelAnalysis),

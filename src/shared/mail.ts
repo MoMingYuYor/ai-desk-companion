@@ -137,6 +137,7 @@ export interface MailApi {
   download(id: string): Promise<MailResult<MailAttachmentInfo>>
   saveAttachment(id: string): Promise<MailResult<{ saved: boolean }>>
   openLink(messageId: string, url: string): Promise<MailResult<void>>
+  openWebmail(email: string): Promise<MailResult<void>>
   analyze(input: MailAnalysisRequest): Promise<MailResult<MailAnalysisStatus>>
   analysisStatus(messageId: string): Promise<MailResult<MailAnalysisStatus | null>>
   cancelAnalysis(conversationId: string): Promise<MailResult<void>>

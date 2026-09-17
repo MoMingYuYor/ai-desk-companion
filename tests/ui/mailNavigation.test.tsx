@@ -78,7 +78,8 @@ function detailFor(id: string): MailDetail {
   }
 }
 
-function makeEnv() {
+function makeEnv(opts: { accounts?: MailAccountInfo[] } = {}) {
+  const accountList = [...(opts.accounts ?? accounts)]
   let items: MailSummary[] = [
     summary('m1'),
     summary('m2', { accountId: 'a2', accountLabel: '工作邮箱', from: 'boss@example.com' })
@@ -89,7 +90,7 @@ function makeEnv() {
     analysisId: null,
     error: null
   }
-  const accountsFn = vi.fn(async () => ok(accounts))
+  const accountsFn = vi.fn(async () => ok(accountList))
   const preparingStatus: MailAnalysisStatus = {
     conversationId: 'conv-x',
     state: 'preparing',
@@ -119,6 +120,7 @@ function makeEnv() {
     ),
     saveAttachment: vi.fn(async () => ok({ saved: true })),
     openLink: vi.fn(async () => ok(undefined)),
+    openWebmail: vi.fn(async () => ok(undefined)),
     analyze: vi.fn(async () => ok(preparingStatus)),
     analysisStatus: analysisStatusFn,
     cancelAnalysis: cancelAnalysisFn,
@@ -140,6 +142,9 @@ function makeEnv() {
     api,
     subscribe,
     emit,
+    addAccount: (a: MailAccountInfo) => {
+      accountList.push(a)
+    },
     listFn,
     detailFn,
     analysisStatusFn,
@@ -185,6 +190,9 @@ describe('邮箱导航(useMailbox + MailPage)', () => {
     render(<MailPage api={env.api} subscribe={env.subscribe} />)
     await flush()
     await screen.findByText('通知 m1')
+    // 账号状态徽标在管理视图
+    fireEvent.click(screen.getByRole('button', { name: '管理邮箱' }))
+    await screen.findByText('已有账号')
     act(() => {
       env.emit('evt:mail-sync', {
         accountId: 'a1',
@@ -202,8 +210,8 @@ describe('邮箱导航(useMailbox + MailPage)', () => {
     render(<MailPage api={env.api} subscribe={env.subscribe} />)
     await flush()
     await screen.findByText('通知 m1')
-    // 账号行是唯一包含该邮箱地址的按钮(列表行徽标只显示 label)
-    fireEvent.click(screen.getByRole('button', { name: /work@163\.com/ }))
+    // 账号筛选现在是顶部工具行的下拉
+    fireEvent.change(screen.getByRole('combobox', { name: '账号筛选' }), { target: { value: 'a2' } })
     await waitFor(() =>
       expect(env.listFn.mock.calls[env.listFn.mock.calls.length - 1][0]).toEqual(
         expect.objectContaining({ accountId: 'a2' })
@@ -211,6 +219,74 @@ describe('邮箱导航(useMailbox + MailPage)', () => {
     )
     expect(screen.queryByText('通知 m1')).toBeNull()
     expect(screen.getByText('通知 m2')).toBeTruthy()
+  })
+
+  it('点击"管理邮箱"切换到管理视图,返回收件箱可切回', async () => {
+    const env = makeEnv()
+    render(<MailPage api={env.api} subscribe={env.subscribe} />)
+    await flush()
+    await screen.findByText('通知 m1')
+    fireEvent.click(screen.getByRole('button', { name: '管理邮箱' }))
+    expect(await screen.findByText('邮箱管理')).toBeTruthy()
+    // 授权码说明与管理表单都在管理视图内
+    expect(screen.getByText('授权码是什么?')).toBeTruthy()
+    expect(screen.getByLabelText('邮箱地址')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /返回收件箱/ }))
+    expect(await screen.findByText('通知 m1')).toBeTruthy()
+    expect(screen.queryByText('邮箱管理')).toBeNull()
+  })
+
+  it('没有账号时默认落在管理视图', async () => {
+    const env = makeEnv({ accounts: [] })
+    render(<MailPage api={env.api} subscribe={env.subscribe} />)
+    await flush()
+    expect(await screen.findByText('邮箱管理')).toBeTruthy()
+    expect(screen.queryByText('收件箱为空')).toBeNull()
+  })
+
+  it('保存成功后自动回到收件箱', async () => {
+    const env = makeEnv({ accounts: [] })
+    render(<MailPage api={env.api} subscribe={env.subscribe} />)
+    await flush()
+    await screen.findByText('邮箱管理')
+    const savedAccount: MailAccountInfo = {
+      id: 'a-new',
+      label: '新邮箱',
+      email: 'new@qq.com',
+      provider: 'qq',
+      host: 'imap.qq.com',
+      port: 993,
+      enabled: true,
+      hasCredential: true,
+      status: 'idle',
+      lastSuccessAt: null,
+      error: null
+    }
+    env.api.save = vi.fn(async () => {
+      env.addAccount(savedAccount)
+      return ok(savedAccount)
+    })
+    fireEvent.change(screen.getByLabelText('名称'), { target: { value: '新邮箱' } })
+    fireEvent.change(screen.getByLabelText('邮箱地址'), { target: { value: 'new@qq.com' } })
+    fireEvent.change(screen.getByLabelText('授权码'), { target: { value: 'authcode16' } })
+    fireEvent.click(screen.getByRole('button', { name: '测试并保存' }))
+    await waitFor(() => expect(env.api.save).toHaveBeenCalled())
+    // 回到收件箱:工具行可见,列表渲染桩数据中的邮件
+    expect(await screen.findByText('通知 m1')).toBeTruthy()
+    expect(screen.queryByText('邮箱管理')).toBeNull()
+  })
+
+  it('网页版按钮跟随当前账号;全部账号时禁用', async () => {
+    const env = makeEnv()
+    render(<MailPage api={env.api} subscribe={env.subscribe} />)
+    await flush()
+    await screen.findByText('通知 m1')
+    const btn = screen.getByRole('button', { name: /网页版邮箱/ }) as HTMLButtonElement
+    expect(btn.disabled).toBe(true)
+    fireEvent.change(screen.getByRole('combobox', { name: '账号筛选' }), { target: { value: 'a1' } })
+    await waitFor(() => expect(btn.disabled).toBe(false))
+    fireEvent.click(btn)
+    await waitFor(() => expect(env.api.openWebmail).toHaveBeenCalledWith('study@qq.com'))
   })
 
   it('点击"查看分析会话"触发 onOpenConversation 回调', async () => {

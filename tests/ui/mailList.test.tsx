@@ -33,9 +33,9 @@ function baseProps(over: Partial<Parameters<typeof MailList>[0]> = {}): Paramete
     hasMore: false,
     onLoadMore: vi.fn(),
     unreadOnly: false,
-    onToggleUnread: vi.fn(),
+
     search: '',
-    onSearch: vi.fn(),
+
     loading: false,
     ...over
   }
@@ -90,33 +90,9 @@ describe('MailList', () => {
     expect(screen.queryByRole('button', { name: '加载更多' })).toBeNull()
   })
 
-  it('搜索输入触发 onSearch', async () => {
-    const user = userEvent.setup()
-    const onSearch = vi.fn()
-    // 受控输入需要外层同步 state,模拟真实用法
-    function Harness(): JSX.Element {
-      const [search, setSearch] = useState('')
-      return (
-        <MailList
-          {...baseProps({
-            search,
-            onSearch: (s) => {
-              onSearch(s)
-              setSearch(s)
-            }
-          })}
-        />
-      )
-    }
-    render(<Harness />)
-    await user.type(screen.getByLabelText('搜索邮件'), '会议')
-    expect(onSearch).toHaveBeenLastCalledWith('会议')
-  })
-
-  it('未读筛选切换触发 onToggleUnread', () => {
-    const onToggleUnread = vi.fn()
-    render(<MailList {...baseProps({ onToggleUnread })} />)
-    fireEvent.click(screen.getByRole('checkbox', { name: '只看未读' }))
-    expect(onToggleUnread).toHaveBeenCalledTimes(1)
+  it('onLoadEarlier 提供时显示"加载更早邮件",禁用态给提示', () => {
+    render(<MailList {...baseProps({ onLoadEarlier: vi.fn(), loadEarlierDisabled: true })} />)
+    const btn = screen.getByRole('button', { name: '加载更早邮件' }) as HTMLButtonElement
+    expect(btn.disabled).toBe(true)
   })
 })
