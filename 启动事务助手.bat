@@ -12,6 +12,18 @@ if not exist node_modules (
   )
 )
 
-echo Starting AI Desk Companion...
-echo NOTE: To exit, use the tray menu. Closing this window will kill the app.
-call npm run dev
+rem Rebuild only when src/resources are newer than the build output
+node scripts\check-build.mjs
+if errorlevel 1 (
+  echo [Update] Building app, please wait...
+  call npm run build
+  if errorlevel 1 (
+    echo Build failed. Run "npm run build" to see details.
+    pause
+    exit /b 1
+  )
+)
+
+rem Launch detached GUI process: no console window stays open
+start "" "%~dp0node_modules\electron\dist\electron.exe" "%~dp0."
+exit /b 0
