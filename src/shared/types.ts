@@ -12,6 +12,8 @@ export interface ProviderInfo {
   models: string[]
   defaultModel: string
   supportsVision: boolean
+  /** 服务商支持 response_format json_object 结构化输出 */
+  supportsJsonMode: boolean
   isDefault: boolean
   sortOrder: number
   hasApiKey: boolean
@@ -28,6 +30,7 @@ export interface ProviderInput {
   models: string[]
   defaultModel: string
   supportsVision: boolean
+  supportsJsonMode?: boolean
   apiKey?: string
   isDefault?: boolean
   sortOrder?: number
@@ -108,6 +111,8 @@ export interface ActionCandidate {
   durationMinutes?: number | null
   notes?: string
   location?: string
+  /** 参与人物(确认落库时并入 notes) */
+  participants?: string[]
   sourceRef?: string
   confidence?: 'high' | 'medium' | 'low'
 }

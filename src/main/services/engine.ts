@@ -26,11 +26,14 @@ import type {
   ChatMessage,
   Conversation,
   Material,
-  ProfileFact
+  ProfileFact,
+  ProviderInfo
 } from '../../shared/types'
 import type { PetActivityChange } from '../../shared/pet'
+import { validateAnalysisPayload, repairFeedback } from '../../shared/extraction'
 import {
   ANALYSIS_SYSTEM_PROMPT,
+  ANALYSIS_FEWSHOT_BLOCK,
   CHAT_SYSTEM_PROMPT,
   SCHOOL_CALENDAR_SYSTEM_PROMPT,
   TIMETABLE_SYSTEM_PROMPT
@@ -40,6 +43,17 @@ import { fileToDataUrl, parseLocalFile } from './materials'
 import { ModelRouter, type LlmMessage, type RouterNotice } from './modelRouter'
 
 export type Broadcast = (channel: string, payload: unknown) => void
+
+/** 所有模型经修复后输出仍不合格 */
+export class AnalysisFormatError extends Error {
+  constructor(
+    message: string,
+    public readonly rawResponse: string
+  ) {
+    super(message)
+    this.name = 'AnalysisFormatError'
+  }
+}
 
 export interface EngineDeps {
   db: SqliteDb
@@ -140,6 +154,7 @@ export class Engine {
     this.aborts.set(conversationId, controller)
     let analysis: Analysis | null = null
     let outcome: 'done' | 'failed' | 'cancelled' = 'failed'
+    let rawText = ''
     try {
       const userText =
         `以下是本次事项的全部材料:\n\n` +
@@ -153,36 +168,134 @@ export class Engine {
           .join('\n\n') +
         `\n\n${buildFullContext(this.db)}\n\n请按系统要求输出 JSON 分析结果。`
       const { content: userContent, hasImages } = buildUserContent(userText, materials)
+      const baseMessages: LlmMessage[] = [
+        { role: 'system', content: ANALYSIS_SYSTEM_PROMPT + ANALYSIS_FEWSHOT_BLOCK },
+        { role: 'user', content: userContent }
+      ]
 
-      const { text: raw, label } = await this.callModel(
-        conversationId,
-        [
-          { role: 'system', content: ANALYSIS_SYSTEM_PROMPT },
-          { role: 'user', content: userContent }
-        ],
-        hasImages,
-        controller.signal
-      )
-      const payload = extractJsonPayload(raw)
-      analysis = payload
-        ? insertAnalysis(this.db, conversationId, payload, { rawResponse: raw, modelLabel: label })
-        : insertAnalysis(this.db, conversationId, {}, {
-            rawResponse: raw,
-            status: 'failed',
-            error: '模型输出无法解析为 JSON,可稍后重试或更换模型'
-          })
+      const outcome2 = await this.callModelWithRecovery(baseMessages, hasImages, controller.signal)
+      rawText = outcome2.raw
+      const payload = outcome2.payload
+      // 字段级降级说明并入 questions,用户可见"模型没给准的信息"
+      if (outcome2.warnings.length > 0) {
+        payload.questions = [...(payload.questions ?? []), ...outcome2.warnings]
+      }
+      analysis = insertAnalysis(this.db, conversationId, payload, {
+        rawResponse: rawText,
+        modelLabel: outcome2.label
+      })
       if (payload?.title) renameConversation(this.db, conversationId, payload.title.slice(0, 30))
-      outcome = payload ? 'done' : 'failed'
+      outcome = 'done'
     } catch (err) {
       const aborted = err instanceof Error && err.name === 'AbortError'
       outcome = aborted ? 'cancelled' : 'failed'
-      analysis = await this.recordFailure(conversationId, err)
+      analysis = await this.recordFailure(conversationId, err, rawText)
     } finally {
       this.aborts.delete(conversationId)
       this.deps.onPetActivity?.({ phase: 'finish', taskId, outcome })
     }
     this.deps.broadcast('evt:analysis-updated', { conversationId, analysisId: analysis?.id })
     return analysis
+  }
+
+  /**
+   * 三级自愈:调用 → 解析+校验 → 同模型修复一次 → 按备用顺序切换下一个模型。
+   * 网络/429/5xx 仍由 router 内部重试与切换;内容不合格由本方法推进游标。
+   */
+  private async callModelWithRecovery(
+    baseMessages: LlmMessage[],
+    needVision: boolean,
+    signal: AbortSignal
+  ): Promise<{ raw: string; label: string; payload: AnalysisPayload; warnings: string[] }> {
+    const providers = listProviders(this.db)
+    const failures: string[] = []
+    let cursor = 0
+    let lastRaw = ''
+
+    while (cursor < providers.length) {
+      const slice = providers.slice(cursor)
+      if (slice.length === 0) break
+      const first = await this.callModelForSlice(slice, baseMessages, needVision, signal)
+      lastRaw = first.text
+
+      const parsed = extractJsonPayload(first.text)
+      const validated = parsed
+        ? validateAnalysisPayload(parsed)
+        : { ok: false as const, errors: ['输出无法解析为 JSON'] }
+
+      if (validated.ok) {
+        return { raw: first.text, label: first.label, payload: validated.value, warnings: validated.warnings }
+      }
+
+      // 同一 provider 自修复一次(带上原始输出与错误反馈)
+      const usedIdx = providers.findIndex((p) => p.id === first.usedProviderId)
+      const repairMessages: LlmMessage[] = [
+        ...baseMessages,
+        { role: 'assistant', content: first.text },
+        { role: 'user', content: repairFeedback(validated.errors) }
+      ]
+      const repairSlice = providers.slice(Math.max(0, usedIdx))
+      const repaired = await this.callModelForSlice(repairSlice, repairMessages, needVision, signal)
+      lastRaw = repaired.text
+
+      const repairedPayload = extractJsonPayload(repaired.text)
+      const repairedValid = repairedPayload
+        ? validateAnalysisPayload(repairedPayload)
+        : { ok: false as const, errors: ['输出无法解析为 JSON'] }
+
+      if (repairedValid.ok) {
+        return {
+          raw: repaired.text,
+          label: repaired.label,
+          payload: repairedValid.value,
+          warnings: repairedValid.warnings
+        }
+      }
+
+      // 该模型救不活:记录原因,游标跳到实际使用 provider 之后
+      failures.push(`${repaired.label}: ${repairedValid.errors[0] ?? '输出不合格'}`)
+      const repairedIdx = providers.findIndex((p) => p.id === repaired.usedProviderId)
+      cursor = (repairedIdx >= 0 ? repairedIdx : 0) + 1
+      const next = providers[cursor]
+      if (next) {
+        this.deps.broadcast('evt:model-switched', {
+          from: repaired.label,
+          to: `${next.name} / ${next.defaultModel || next.models[0] || ''}`,
+          reason: '输出格式不合格,已切换备用模型'
+        })
+      }
+    }
+
+    throw new AnalysisFormatError(
+      failures.length > 0
+        ? `所有模型输出均不合格:${failures.join(';')}`
+        : '没有可用的模型服务',
+      lastRaw
+    )
+  }
+
+  private async callModelForSlice(
+    slice: ProviderInfo[],
+    messages: LlmMessage[],
+    needVision: boolean,
+    signal: AbortSignal
+  ): Promise<{ text: string; label: string; usedProviderId: string }> {
+    const result = await this.deps.router.call(slice, {
+      messages,
+      needVision,
+      signal,
+      onNotice: (n: RouterNotice) => {
+        if (n.type === 'switched') {
+          this.deps.notifyModelSwitch?.({ from: n.from, to: n.to, reason: n.reason })
+          this.deps.broadcast('evt:model-switched', { from: n.from, to: n.to, reason: n.reason })
+        }
+        if (n.type === 'exhausted') {
+          this.deps.notifyModelSwitch?.({ from: '默认模型', to: '无', reason: n.reason })
+          this.deps.broadcast('evt:model-switched', { from: '', to: '', reason: n.reason })
+        }
+      }
+    })
+    return { text: result.text, label: `${result.used.providerName} / ${result.used.model}`, usedProviderId: result.used.providerId }
   }
 
   // ---------- 课表 / 校历导入 ----------
@@ -404,10 +517,18 @@ export class Engine {
 
   // ---------- 内部 ----------
 
-  private async recordFailure(conversationId: string, err: unknown): Promise<Analysis> {
+  private async recordFailure(
+    conversationId: string,
+    err: unknown,
+    rawResponse = ''
+  ): Promise<Analysis> {
     const aborted = err instanceof Error && err.name === 'AbortError'
     const message = aborted ? '已取消' : err instanceof Error ? err.message : String(err)
-    const analysis = insertAnalysis(this.db, conversationId, {}, { status: 'failed', error: message })
+    const analysis = insertAnalysis(this.db, conversationId, {}, {
+      status: 'failed',
+      error: message,
+      rawResponse: rawResponse || (err instanceof AnalysisFormatError ? err.rawResponse : '')
+    })
     if (!aborted) this.deps.broadcast('evt:chat-error', { conversationId, error: message })
     return analysis
   }
@@ -514,6 +635,9 @@ export function normalizeCandidate(item: unknown): ActionCandidate & { reminderM
     durationMinutes: num(x.durationMinutes),
     notes: str(x.notes),
     location: str(x.location),
+    participants: Array.isArray(x.participants)
+      ? x.participants.filter((p): p is string => typeof p === 'string' && p.trim().length > 0)
+      : undefined,
     sourceRef: str(x.sourceRef),
     confidence: (['high', 'medium', 'low'] as const).includes(x.confidence as 'high')
       ? (x.confidence as 'high' | 'medium' | 'low')

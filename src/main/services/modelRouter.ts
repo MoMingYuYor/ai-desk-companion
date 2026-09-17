@@ -184,7 +184,13 @@ export class ModelRouter {
       }
     } else {
       path = '/chat/completions'
-      body = { model: attempt.model, stream: true, messages: options.messages }
+      body = {
+        model: attempt.model,
+        stream: true,
+        messages: options.messages,
+        // 声明支持 JSON 结构化输出的服务商启用 response_format;其余靠提示词约束
+        ...(provider.supportsJsonMode ? { response_format: { type: 'json_object' } } : {})
+      }
     }
 
     const res = await this.fetchImpl(joinUrl(provider.baseUrl, path), {

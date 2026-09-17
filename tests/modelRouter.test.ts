@@ -18,6 +18,7 @@ function provider(partial: Partial<ProviderInfo>): ProviderInfo {
     models: partial.models ?? ['m1'],
     defaultModel: partial.defaultModel ?? 'm1',
     supportsVision: partial.supportsVision ?? true,
+    supportsJsonMode: partial.supportsJsonMode ?? false,
     isDefault: partial.isDefault ?? false,
     sortOrder: partial.sortOrder ?? 0,
     hasApiKey: partial.hasApiKey ?? true,
@@ -147,5 +148,22 @@ describe('错误描述与重试判定', () => {
   it('错误信息说明原因', () => {
     expect(describeHttpError(401, '')).toContain('API Key')
     expect(describeHttpError(404, '')).toContain('接口地址')
+  })
+})
+
+describe('JSON 结构化输出能力', () => {
+  it('声明支持的 provider 注入 response_format,未声明的不注入', async () => {
+    const bodies: Array<Record<string, unknown>> = []
+    const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      bodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      const text = `data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' } }] })}\n\ndata: [DONE]\n\n`
+      return new Response(text, { status: 200 })
+    })
+    const router = new ModelRouter({ apiKeyOf: keyOf, fetchImpl: fetchImpl as unknown as typeof fetch })
+    const messages: LlmMessage[] = [{ role: 'user', content: 'x' }]
+    await router.call([provider({ id: 'on', supportsJsonMode: true })], { messages })
+    await router.call([provider({ id: 'off', supportsJsonMode: false })], { messages })
+    expect(bodies[0].response_format).toEqual({ type: 'json_object' })
+    expect(bodies[1].response_format).toBeUndefined()
   })
 })

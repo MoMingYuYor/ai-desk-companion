@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Engine } from '../../src/main/services/engine'
-import { createConversation, insertMaterial } from '../../src/main/db/dao'
+import { createConversation, insertMaterial, saveProvider } from '../../src/main/db/dao'
 import { makeTestDb } from '../helpers'
 import type { PetActivityChange } from '../../src/shared/pet'
 import type { ModelRouter } from '../../src/main/services/modelRouter'
@@ -9,7 +9,7 @@ function makeRouterStub(result: { text: string } | { error: Error }): ModelRoute
   return {
     call: async () => {
       if ('error' in result) throw result.error
-      return { text: result.text, used: { providerName: 'test', model: 'm' } }
+      return { text: result.text, used: { providerId: 'test', providerName: 'test', model: 'm' } }
     }
   } as unknown as ModelRouter
 }
@@ -17,6 +17,14 @@ function makeRouterStub(result: { text: string } | { error: Error }): ModelRoute
 describe('引擎活动通知(桌宠真值)', () => {
   it('分析成功发送 start 和 done', async () => {
     const db = await makeTestDb()
+    saveProvider(db, {
+      name: '测试模型',
+      baseUrl: 'https://api.example.com/v1',
+      protocol: 'chat-completions',
+      models: ['m'],
+      defaultModel: 'm',
+      supportsVision: true
+    })
     const changes: PetActivityChange[] = []
     const engine = new Engine({
       db,
@@ -38,6 +46,14 @@ describe('引擎活动通知(桌宠真值)', () => {
 
   it('模型失败发送 failed,取消发送 cancelled', async () => {
     const db = await makeTestDb()
+    saveProvider(db, {
+      name: '测试模型',
+      baseUrl: 'https://api.example.com/v1',
+      protocol: 'chat-completions',
+      models: ['m'],
+      defaultModel: 'm',
+      supportsVision: true
+    })
     const changes: PetActivityChange[] = []
     const engine = new Engine({
       db,

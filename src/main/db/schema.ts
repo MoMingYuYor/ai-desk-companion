@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS providers (
   models TEXT NOT NULL DEFAULT '[]',
   default_model TEXT NOT NULL DEFAULT '',
   supports_vision INTEGER NOT NULL DEFAULT 1,
+  supports_json_mode INTEGER NOT NULL DEFAULT 0,
   is_default INTEGER NOT NULL DEFAULT 0,
   sort_order INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,

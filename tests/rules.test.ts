@@ -95,3 +95,39 @@ describe('待办与手动创建', () => {
     expect(listEventsRange(db, '2026-09-16T00:00', '2026-09-16T23:59')).toHaveLength(1)
   })
 })
+
+describe('参与人物(确认落库并入 notes)', () => {
+  it('participants 写入待办/日程备注,不改表结构', async () => {
+    const db = await makeTestDb()
+    confirmCandidate(db, {
+      title: '小组讨论',
+      type: 'todo',
+      deadline: '2026-09-20T18:00',
+      notes: '带上笔记本',
+      participants: ['张三', '李四']
+    })
+    const todo = listTodos(db).find((t) => t.title === '小组讨论')!
+    expect(todo.notes).toContain('带上笔记本')
+    expect(todo.notes).toContain('参与人:张三、李四')
+
+    confirmCandidate(db, {
+      title: '项目评审',
+      type: 'event',
+      start: '2026-09-21T10:00',
+      durationMinutes: 60,
+      location: '会议室A',
+      participants: ['王五']
+    })
+    const ev = listEventsRange(db, '2026-09-21T00:00', '2026-09-21T23:59').find(
+      (e) => e.title === '项目评审'
+    )!
+    expect(ev.notes).toContain('参与人:王五')
+  })
+
+  it('无 participants 时不追加参与人行', async () => {
+    const db = await makeTestDb()
+    confirmCandidate(db, { title: '普通待办', type: 'todo', deadline: '2026-09-20T18:00', notes: '备注' })
+    const todo = listTodos(db).find((t) => t.title === '普通待办')!
+    expect(todo.notes).toBe('备注')
+  })
+})

@@ -48,8 +48,12 @@ export function initSchema(db: SqliteDb): void {
       if (currentVer > SCHEMA_VERSION) {
         throw new Error(`数据库版本 (${currentVer}) 高于当前支持的版本 (${SCHEMA_VERSION})`)
       }
-      if (currentVer < 2) {
-        migrateMailV2(db)
+      if (currentVer < 2) migrateMailV2(db)
+      if (currentVer < 3) {
+        // v3:providers 增加 JSON 结构化输出能力开关
+        db.run('ALTER TABLE providers ADD COLUMN supports_json_mode INTEGER NOT NULL DEFAULT 0')
+      }
+      if (currentVer < SCHEMA_VERSION) {
         db.run("UPDATE meta SET value = ? WHERE key = 'schema_version'", [String(SCHEMA_VERSION)])
       }
     }
@@ -110,6 +114,7 @@ interface ProviderRow {
   models: string
   default_model: string
   supports_vision: number
+  supports_json_mode: number
   is_default: number
   sort_order: number
   created_at: string
@@ -125,6 +130,7 @@ function providerToInfo(r: ProviderRow): ProviderInfo {
     models: JSON.parse(r.models || '[]'),
     defaultModel: r.default_model,
     supportsVision: !!r.supports_vision,
+    supportsJsonMode: !!r.supports_json_mode,
     isDefault: !!r.is_default,
     sortOrder: r.sort_order,
     hasApiKey: r.api_key_enc.length > 0,
@@ -159,6 +165,7 @@ export function saveProvider(
     models: string[]
     defaultModel: string
     supportsVision: boolean
+    supportsJsonMode?: boolean
     apiKeyEnc?: string
     isDefault?: boolean
     sortOrder?: number
@@ -170,13 +177,15 @@ export function saveProvider(
   const apiKeyEnc = input.apiKeyEnc !== undefined ? input.apiKeyEnc : (existing?.api_key_enc ?? '')
   const isDefault = input.isDefault ?? existing?.is_default === 1
   const sortOrder = input.sortOrder ?? existing?.sort_order ?? 0
+  const supportsJsonMode = input.supportsJsonMode ?? existing?.supports_json_mode === 1
   db.run(
-    `INSERT INTO providers (id, name, base_url, api_key_enc, protocol, models, default_model, supports_vision, is_default, sort_order, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO providers (id, name, base_url, api_key_enc, protocol, models, default_model, supports_vision, supports_json_mode, is_default, sort_order, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        name = excluded.name, base_url = excluded.base_url, api_key_enc = excluded.api_key_enc,
        protocol = excluded.protocol, models = excluded.models, default_model = excluded.default_model,
-       supports_vision = excluded.supports_vision, is_default = excluded.is_default,
+       supports_vision = excluded.supports_vision, supports_json_mode = excluded.supports_json_mode,
+       is_default = excluded.is_default,
        sort_order = excluded.sort_order, updated_at = excluded.updated_at`,
     [
       id,
@@ -187,6 +196,7 @@ export function saveProvider(
       JSON.stringify(input.models),
       input.defaultModel,
       input.supportsVision ? 1 : 0,
+      supportsJsonMode ? 1 : 0,
       isDefault ? 1 : 0,
       sortOrder,
       ts,
@@ -531,6 +541,12 @@ export function confirmCandidate(
   db: SqliteDb,
   item: ActionCandidate & { reminderMinutes?: number | null }
 ): { result: 'created' | 'duplicate'; refType: 'todo' | 'event'; refId: string } {
+  // 参与人物并入备注,不改表结构
+  const participantsNote =
+    item.participants && item.participants.length > 0
+      ? `${item.notes ? item.notes + '\n' : ''}参与人:${item.participants.join('、')}`
+      : item.notes
+  const notesWithParticipants = participantsNote
   if (item.type === 'event' && item.start) {
     const startAt = item.start
     const endAt = item.durationMinutes ? addMinutesIso(item.start, item.durationMinutes) : startAt
@@ -538,7 +554,7 @@ export function confirmCandidate(
     if (findDuplicateEvent(db, fp)) return { result: 'duplicate', refType: 'event', refId: '' }
     const ev = createEvent(
       db,
-      { title: item.title, startAt, endAt, location: item.location, notes: item.notes, sourceRef: item.sourceRef, reminderMinutes: item.reminderMinutes ?? null },
+      { title: item.title, startAt, endAt, location: item.location, notes: notesWithParticipants, sourceRef: item.sourceRef, reminderMinutes: item.reminderMinutes ?? null },
       'analysis'
     )
     return { result: 'created', refType: 'event', refId: ev.id }
@@ -548,7 +564,7 @@ export function confirmCandidate(
   if (findDuplicateTodo(db, fp)) return { result: 'duplicate', refType: 'todo', refId: '' }
   const todo = createTodo(
     db,
-    { title: item.title, notes: item.notes, dueAt: item.deadline ?? null, sourceRef: item.sourceRef },
+    { title: item.title, notes: notesWithParticipants, dueAt: item.deadline ?? null, sourceRef: item.sourceRef },
     'analysis'
   )
   if (item.start) {
@@ -558,7 +574,7 @@ export function confirmCandidate(
         title: `${item.title}(执行)`,
         startAt: item.start,
         endAt: item.durationMinutes ? addMinutesIso(item.start, item.durationMinutes) : item.start,
-        notes: item.notes,
+        notes: notesWithParticipants,
         sourceRef: item.sourceRef
       },
       'analysis'

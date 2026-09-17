@@ -150,6 +150,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       models: input.models,
       defaultModel: input.defaultModel,
       supportsVision: input.supportsVision,
+      supportsJsonMode: input.supportsJsonMode,
       apiKeyEnc,
       isDefault: input.isDefault,
       sortOrder: input.sortOrder

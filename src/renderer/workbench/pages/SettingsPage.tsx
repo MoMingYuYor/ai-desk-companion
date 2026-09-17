@@ -79,13 +79,14 @@ export function SettingsPage({ refreshKey }: Props): JSX.Element {
                     protocol: p.protocol,
                     models: p.models,
                     defaultModel: p.defaultModel,
-                    supportsVision: p.supportsVision,
-                    isDefault: p.isDefault
-                  })
-                }
-              >
-                编辑
-              </button>
+              supportsVision: p.supportsVision,
+              supportsJsonMode: p.supportsJsonMode,
+              isDefault: p.isDefault
+            })
+          }
+        >
+          编辑
+        </button>
               <button className="ghost danger" onClick={() => void del(p.id)}>
                 删除
               </button>
@@ -195,6 +196,12 @@ function ProviderEditor({
             type="checkbox"
             checked={form.supportsVision}
             onChange={(e) => setForm({ ...form, supportsVision: e.target.checked })}
+          />
+          <label>JSON 结构化输出</label>
+          <input
+            type="checkbox"
+            checked={!!form.supportsJsonMode}
+            onChange={(e) => setForm({ ...form, supportsJsonMode: e.target.checked })}
           />
           <label>模型列表</label>
           <textarea

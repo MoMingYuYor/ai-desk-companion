@@ -466,6 +466,15 @@ function CandidateCard({
         {item.title} <span className="tag">{item.type === 'event' ? '日程' : '待办'}</span>
         {item.confidence === 'low' && <span className="tag warn">低置信</span>}
       </div>
+      {item.participants && item.participants.length > 0 && (
+        <div className="title-line">
+          {item.participants.map((p) => (
+            <span key={p} className="tag gray">
+              👤 {p}
+            </span>
+          ))}
+        </div>
+      )}
       {editing ? (
         <div className="field-grid">
           <label>类型</label>
