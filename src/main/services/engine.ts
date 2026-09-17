@@ -28,6 +28,7 @@ import type {
   Material,
   ProfileFact
 } from '../../shared/types'
+import type { PetActivityChange } from '../../shared/pet'
 import {
   ANALYSIS_SYSTEM_PROMPT,
   CHAT_SYSTEM_PROMPT,
@@ -46,6 +47,7 @@ export interface EngineDeps {
   broadcast: Broadcast
   notifyModelSwitch?: (n: { from: string; to: string; reason: string }) => void
   onProfileSuggestion?: () => void
+  onPetActivity?: (change: PetActivityChange) => void
 }
 
 interface CallOutcome {
@@ -132,9 +134,12 @@ export class Engine {
     const materials = listMaterials(this.db, conversationId)
     if (materials.length === 0) return null
 
+    const taskId = `analysis:${conversationId}`
+    this.deps.onPetActivity?.({ phase: 'start', taskId })
     const controller = new AbortController()
     this.aborts.set(conversationId, controller)
     let analysis: Analysis | null = null
+    let outcome: 'done' | 'failed' | 'cancelled' = 'failed'
     try {
       const userText =
         `以下是本次事项的全部材料:\n\n` +
@@ -167,10 +172,14 @@ export class Engine {
             error: '模型输出无法解析为 JSON,可稍后重试或更换模型'
           })
       if (payload?.title) renameConversation(this.db, conversationId, payload.title.slice(0, 30))
+      outcome = payload ? 'done' : 'failed'
     } catch (err) {
+      const aborted = err instanceof Error && err.name === 'AbortError'
+      outcome = aborted ? 'cancelled' : 'failed'
       analysis = await this.recordFailure(conversationId, err)
     } finally {
       this.aborts.delete(conversationId)
+      this.deps.onPetActivity?.({ phase: 'finish', taskId, outcome })
     }
     this.deps.broadcast('evt:analysis-updated', { conversationId, analysisId: analysis?.id })
     return analysis
@@ -184,9 +193,12 @@ export class Engine {
     const materials = listMaterials(this.db, conversationId)
     if (materials.length === 0) return null
 
+    const taskId = `import:${conversationId}`
+    this.deps.onPetActivity?.({ phase: 'start', taskId })
     const controller = new AbortController()
     this.aborts.set(conversationId, controller)
     let analysis: Analysis | null = null
+    let outcome: 'done' | 'failed' | 'cancelled' = 'failed'
     try {
       const userText =
         `请提取以下材料中的${kind === 'timetable' ? '课程表' : '校历'}信息:\n\n` +
@@ -220,10 +232,14 @@ export class Engine {
             status: 'failed',
             error: '模型输出无法解析为 JSON,可稍后重试'
           })
+      outcome = payload ? 'done' : 'failed'
     } catch (err) {
+      const aborted = err instanceof Error && err.name === 'AbortError'
+      outcome = aborted ? 'cancelled' : 'failed'
       analysis = await this.recordFailure(conversationId, err)
     } finally {
       this.aborts.delete(conversationId)
+      this.deps.onPetActivity?.({ phase: 'finish', taskId, outcome })
     }
     this.deps.broadcast('evt:analysis-updated', { conversationId, analysisId: analysis?.id })
     return analysis
@@ -339,6 +355,21 @@ export class Engine {
 
   stop(conversationId: string): void {
     this.aborts.get(conversationId)?.abort()
+  }
+
+  /** 邮箱分析材料注入:直接写入材料表,不触发自动分析(由邮箱服务控制时序) */
+  insertMailMaterial(input: {
+    conversationId: string
+    name: string
+    type: Material['type']
+    content: string
+  }): string {
+    return insertMaterial(this.db, {
+      conversationId: input.conversationId,
+      name: input.name,
+      type: input.type,
+      content: input.content
+    }).id
   }
 
   async retry(conversationId: string): Promise<void> {

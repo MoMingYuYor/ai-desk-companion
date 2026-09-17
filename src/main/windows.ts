@@ -3,6 +3,7 @@ import { BrowserWindow, screen } from 'electron'
 import { join } from 'node:path'
 import type { SqliteDb } from './db/connection'
 import { getMeta, setMeta } from './db/dao'
+import { resolvePetPlacement, panelBoundsForPet } from './pet/geometry'
 
 let workbenchWindow: BrowserWindow | null = null
 let petWindow: BrowserWindow | null = null
@@ -25,6 +26,15 @@ function rendererUrl(page: string): string {
     return `${process.env.ELECTRON_RENDERER_URL}/${page}.html`
   }
   return join(__dirname, '../renderer/', `${page}.html`)
+}
+
+function loadPage(win: BrowserWindow, page: string): void {
+  const url = rendererUrl(page)
+  if (process.env.ELECTRON_RENDERER_URL) {
+    void win.loadURL(url)
+  } else {
+    void win.loadFile(url)
+  }
 }
 
 // ---------- 工作台 ----------
@@ -59,7 +69,7 @@ export function createWorkbenchWindow(db: SqliteDb): BrowserWindow {
   win.on('closed', () => {
     workbenchWindow = null
   })
-  win.loadURL(rendererUrl('workbench'))
+  loadPage(win, 'workbench')
   if (getMeta(db, 'ui:workbench-maximized') === '1') win.maximize()
   workbenchWindow = win
   return win
@@ -75,18 +85,16 @@ export function showWorkbench(db: SqliteDb): BrowserWindow {
 
 // ---------- 桌宠 ----------
 
+export const PET_WINDOW_SIZE = { width: 320, height: 400 } as const
+
 export function createPetWindow(db: SqliteDb): BrowserWindow {
   if (petWindow && !petWindow.isDestroyed()) return petWindow
-  const { width: sw, height: sh } = screen.getPrimaryDisplay().workAreaSize
   const savedX = getMeta(db, 'pet:x')
   const savedY = getMeta(db, 'pet:y')
-  const petW = 150
-  const petH = 170
-  const x = savedX ? Number(savedX) : sw - petW - 24
-  const y = savedY ? Number(savedY) : sh - petH - 24
+  const { x, y } = resolvePetPlacement(savedX, savedY, PET_WINDOW_SIZE)
   const win = new BrowserWindow({
-    width: petW,
-    height: petH,
+    width: PET_WINDOW_SIZE.width,
+    height: PET_WINDOW_SIZE.height,
     x,
     y,
     frame: false,
@@ -107,7 +115,7 @@ export function createPetWindow(db: SqliteDb): BrowserWindow {
   })
   win.setAlwaysOnTop(true, 'screen-saver')
   win.setVisibleOnAllWorkspaces(true)
-  win.loadURL(rendererUrl('pet'))
+  loadPage(win, 'pet')
   petWindow = win
   return win
 }
@@ -163,7 +171,7 @@ export function createPanelWindow(db: SqliteDb): BrowserWindow {
   win.on('blur', () => {
     if (getMeta(db, 'panel:pinned') !== '1' && win.isVisible()) win.hide()
   })
-  win.loadURL(rendererUrl('panel'))
+  loadPage(win, 'panel')
   positionPanelNearPet(win)
   win.show()
   panelWindow = win
@@ -175,12 +183,11 @@ function positionPanelNearPet(win: BrowserWindow): void {
   if (!pet || pet.isDestroyed()) return
   const [px, py] = pet.getPosition()
   const panelBounds = win.getBounds()
-  let x = px - panelBounds.width - 12
-  let y = py
-  const { width: sw, height: sh } = screen.getPrimaryDisplay().workAreaSize
-  if (x < 8) x = px + 160
-  if (y + panelBounds.height > sh) y = sh - panelBounds.height - 8
-  win.setPosition(Math.max(8, x), Math.max(8, y))
+  const { x, y } = panelBoundsForPet({ x: px, y: py, width: PET_WINDOW_SIZE.width }, {
+    width: panelBounds.width,
+    height: panelBounds.height
+  })
+  win.setPosition(x, y)
 }
 
 export function getPanelWindow(): BrowserWindow | null {

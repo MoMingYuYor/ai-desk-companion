@@ -12,9 +12,11 @@ import { Toast, useSubscribe, useToast } from '../../shared/util'
 interface Props {
   refreshKey: number
   petAction: { action: string; at: number } | null
+  /** 邮箱页等外部入口定位到指定分析会话 */
+  locateConversationId?: { id: string; at: number } | null
 }
 
-export function ChatPage({ refreshKey, petAction }: Props): JSX.Element {
+export function ChatPage({ refreshKey, petAction, locateConversationId }: Props): JSX.Element {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
   const [messages, setMessages] = useState<ChatMessage[]>([])
@@ -43,6 +45,11 @@ export function ChatPage({ refreshKey, petAction }: Props): JSX.Element {
   useEffect(() => {
     if (!activeId && conversations.length > 0) setActiveId(conversations[0].id)
   }, [activeId, conversations])
+
+  // 外部定位(邮箱页"查看分析会话"):按时间戳去重,只响应最新一次请求
+  useEffect(() => {
+    if (locateConversationId?.id) setActiveId(locateConversationId.id)
+  }, [locateConversationId?.at, locateConversationId?.id])
 
   useEffect(() => {
     if (!activeId) {
@@ -389,7 +396,14 @@ function AnalysisItems({
           <h3>📌 候选事项(确认后才会加入)</h3>
           <div className="column">
             {(p.actionItems ?? []).map((item, i) => (
-              <CandidateCard key={i} item={item} analysisId={analysis.id} onToast={onToast} refresh={refresh} />
+              <CandidateCard
+                key={i}
+                item={item}
+                candidateIndex={i}
+                analysisId={analysis.id}
+                onToast={onToast}
+                refresh={refresh}
+              />
             ))}
           </div>
         </div>
@@ -406,11 +420,13 @@ function AnalysisItems({
 
 function CandidateCard({
   item: initial,
+  candidateIndex,
   analysisId,
   onToast,
   refresh
 }: {
   item: ActionCandidate
+  candidateIndex: number
   analysisId: string
   onToast: (s: string) => void
   refresh: () => void
@@ -420,7 +436,8 @@ function CandidateCard({
   const [done, setDone] = useState<null | 'created' | 'duplicate'>(null)
 
   const confirm = async (): Promise<void> => {
-    const r = await window.api.confirmAnalysisItem(analysisId, item)
+    // candidateIndex 供邮箱分析确认幂等映射使用;普通分析不受影响
+    const r = await window.api.confirmAnalysisItem(analysisId, { ...item, candidateIndex })
     setDone(r.result)
     onToast(r.result === 'duplicate' ? '该事项已存在,未重复添加' : r.refType === 'event' ? '已加入日历' : '已加入待办')
     refresh()

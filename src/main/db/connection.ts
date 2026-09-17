@@ -64,6 +64,19 @@ export class SqliteDb {
     }
     this.persist.schedule()
   }
+
+  flush(): void {
+    this.persist.flush()
+  }
+
+  close(): void {
+    this.persist.flush()
+    try {
+      this.db.close()
+    } catch {
+      // ignore
+    }
+  }
 }
 
 export async function openDatabase(

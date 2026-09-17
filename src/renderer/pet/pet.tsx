@@ -1,253 +1,260 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import '../shared/ui.css'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type {
+  DragEvent as ReactDragEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent
+} from 'react'
+import type { RendererApi } from '../../shared/api'
+import type { PetBubble, PetClock, PetMode, PetPort, PetViewState } from './contracts'
+import { initialPetState } from './model'
+import { createPetController } from './controller'
+import { createPetGesture } from './gesture'
+import { PetCharacter } from './PetCharacter'
+import { PetBubbles } from './PetBubbles'
 
-type PetState = 'idle' | 'busy' | 'alert'
-
-interface Bubble {
-  id: number
-  text: string
-}
-
-let bubbleSeq = 1
-
-export default function PetApp(): JSX.Element {
-  const [state, setState] = useState<PetState>('idle')
-  const [bubbles, setBubbles] = useState<Bubble[]>([])
-  const [hover, setHover] = useState(false)
-  const [bounce, setBounce] = useState(false)
-  const dragRef = useRef<{ active: boolean; moved: boolean; startX: number; startY: number } | null>(null)
-
-  const pushBubble = useCallback((text: string, ttl = 5000): void => {
-    const b = { id: bubbleSeq++, text }
-    setBubbles((prev) => [...prev.slice(-2), b])
-    setTimeout(() => {
-      setBubbles((prev) => prev.filter((x) => x.id !== b.id))
-    }, ttl)
-  }, [])
-
-  useEffect(() => {
-    const offs = [
-      window.api.on('evt:pet-bubble', (p) => {
-        const { text } = p as { text: string }
-        if (text) pushBubble(text)
-      }),
-      window.api.on('evt:pet-state', (p) => {
-        const { state: s } = p as { state: PetState }
-        setState(s)
-      }),
-      window.api.on('evt:reminder-fired', (p) => {
-        const { title } = p as { title: string }
-        pushBubble('⏰ ' + title, 8000)
-        setState('alert')
-        setTimeout(() => setState('idle'), 8000)
-      }),
-      window.api.on('evt:model-switched', (p) => {
-        const { from, to, reason } = p as { from: string; to: string; reason: string }
-        if (from && to) pushBubble(`🔀 ${reason}:${to}`, 6000)
-        else if (reason) pushBubble(`⚠ ${reason}`, 8000)
-      }),
-      window.api.on('evt:materials-accepted', () => {
-        setState('busy')
-        pushBubble('收到材料,分析中…')
-      }),
-      window.api.on('evt:analysis-updated', () => {
-        setState('idle')
-        pushBubble('分析完成,打开工作台查看结果')
-      })
-    ]
-    return () => offs.forEach((off) => off())
-  }, [pushBubble])
-
-  const onDrop = async (e: React.DragEvent): Promise<void> => {
-    e.preventDefault()
-    setHover(false)
-    const files: string[] = []
-    for (const f of Array.from(e.dataTransfer.files)) {
-      const p = window.api.pathForFile(f)
-      if (p) files.push(p)
-    }
-    const text = e.dataTransfer.getData('text/plain') ?? ''
-    if (files.length === 0 && !text.trim()) {
-      pushBubble('没有可识别的内容')
-      return
-    }
-    try {
-      await window.api.addMaterials({
-        files,
-        texts: text.trim() ? [{ name: '拖入的通知文本', content: text }] : []
-      })
-    } catch {
-      pushBubble('接收材料失败')
-    }
-  }
-
-  const onMouseDown = (e: React.MouseEvent): void => {
-    if (e.button !== 0) return
-    dragRef.current = { active: true, moved: false, startX: e.screenX, startY: e.screenY }
-    void window.api.petDragStart()
-  }
-
-  const onMouseMove = (e: React.MouseEvent): void => {
-    const d = dragRef.current
-    if (!d?.active) return
-    if (!d.moved && Math.abs(e.screenX - d.startX) + Math.abs(e.screenY - d.startY) > 5) {
-      d.moved = true
-      void window.api.petDragMove()
-    }
-  }
-
-  const onMouseUp = (): void => {
-    const d = dragRef.current
-    dragRef.current = null
-    void window.api.petDragEnd()
-    if (d && !d.moved) {
-      // 点击互动:蹦一下,并提示今日要点
-      setBounce(true)
-      setTimeout(() => setBounce(false), 600)
-      void window.api.getDayAgenda(todayStr()).then((a) => {
-        const count = a.events.length + a.courses.filter((c) => !c.cancelled).length
-        const todo = a.todos.length
-        pushBubble(
-          count === 0 && todo === 0
-            ? '今天没有安排,好好休息~'
-            : `今天有 ${a.courses.filter((c) => !c.cancelled).length} 节课、${a.events.length} 个日程` + (todo ? `,${todo} 项待办到期` : '')
-        )
-      })
-    }
-  }
-
-  const eyeShift = state === 'busy' ? 2 : 0
-
-  return (
-    <div
-      style={{
-        width: '100vw',
-        height: '100vh',
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        justifyContent: 'flex-end',
-        background: 'transparent',
-        userSelect: 'none',
-        WebkitAppRegion: 'no-drag'
-      } as React.CSSProperties}
-      onDragOver={(e) => {
-        e.preventDefault()
-        setHover(true)
-      }}
-      onDragLeave={() => setHover(false)}
-      onDrop={(e) => void onDrop(e)}
-      onContextMenu={(e) => {
-        e.preventDefault()
-        void window.api.petOpenMenu()
-      }}
-    >
-      {/* 气泡 */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'center', marginBottom: 4 }}>
-        {bubbles.map((b) => (
-          <div
-            key={b.id}
-            style={{
-              background: 'rgba(35, 42, 59, 0.92)',
-              color: '#fff',
-              padding: '6px 12px',
-              borderRadius: 10,
-              fontSize: 12,
-              maxWidth: 260,
-              lineHeight: 1.5,
-              boxShadow: '0 4px 14px rgba(0,0,0,.25)'
-            }}
-          >
-            {b.text}
-          </div>
-        ))}
-      </div>
-
-      {/* 桌宠本体 */}
-      <div
-        style={{
-          width: 110,
-          height: 110,
-          position: 'relative',
-          cursor: 'grab',
-          transform: hover ? 'scale(1.06)' : bounce ? 'translateY(-10px)' : 'none',
-          transition: 'transform .18s ease',
-          animation: state === 'busy' ? 'pet-wobble 1s ease-in-out infinite' : 'pet-bob 3.2s ease-in-out infinite'
-        }}
-        onMouseDown={onMouseDown}
-        onMouseMove={onMouseMove}
-        onMouseUp={onMouseUp}
-      >
-        {hover && (
-          <div
-            style={{
-              position: 'absolute',
-              inset: -8,
-              border: '2px dashed #4f7cff',
-              borderRadius: '50%'
-            }}
-          />
-        )}
-        <svg viewBox="0 0 110 110" width="110" height="110">
-          <defs>
-            <radialGradient id="bodyGrad" cx="35%" cy="30%">
-              <stop offset="0%" stopColor={state === 'alert' ? '#ffb199' : '#9db9ff'} />
-              <stop offset="100%" stopColor={state === 'alert' ? '#e5534b' : '#4f7cff'} />
-            </radialGradient>
-          </defs>
-          <ellipse cx="55" cy="60" rx="44" ry="40" fill="url(#bodyGrad)" />
-          {/* 耳朵 */}
-          <circle cx="26" cy="26" r="12" fill="#4f7cff" />
-          <circle cx="84" cy="26" r="12" fill="#4f7cff" />
-          <circle cx="26" cy="26" r="6" fill="#ffd9e8" />
-          <circle cx="84" cy="26" r="6" fill="#ffd9e8" />
-          {/* 眼睛 */}
-          {state === 'busy' ? (
-            <>
-              <path d="M32 52 q6 -6 12 0" stroke="#1e2a4a" strokeWidth="3" fill="none" strokeLinecap="round" />
-              <path d="M66 52 q6 -6 12 0" stroke="#1e2a4a" strokeWidth="3" fill="none" strokeLinecap="round" />
-            </>
-          ) : (
-            <>
-              <circle cx="38" cy={52 + eyeShift} r="5.5" fill="#1e2a4a" />
-              <circle cx="72" cy={52 + eyeShift} r="5.5" fill="#1e2a4a" />
-              <circle cx={40 + eyeShift} cy={50 + eyeShift} r="1.8" fill="#fff" />
-              <circle cx={74 + eyeShift} cy={50 + eyeShift} r="1.8" fill="#fff" />
-            </>
-          )}
-          {/* 腮红 */}
-          <ellipse cx="27" cy="64" rx="6" ry="3.5" fill="#ff9db1" opacity="0.7" />
-          <ellipse cx="83" cy="64" rx="6" ry="3.5" fill="#ff9db1" opacity="0.7" />
-          {/* 嘴 */}
-          {state === 'alert' ? (
-            <ellipse cx="55" cy="72" rx="5" ry="6" fill="#1e2a4a" />
-          ) : (
-            <path d="M46 70 q9 8 18 0" stroke="#1e2a4a" strokeWidth="3" fill="none" strokeLinecap="round" />
-          )}
-          {state === 'alert' && (
-            <text x="94" y="20" fontSize="22" fontWeight="700" fill="#e5534b">
-              !
-            </text>
-          )}
-        </svg>
-      </div>
-
-      <style>{`
-        @keyframes pet-bob {
-          0%, 100% { transform: translateY(0); }
-          50% { transform: translateY(-5px); }
-        }
-        @keyframes pet-wobble {
-          0%, 100% { transform: rotate(-4deg); }
-          50% { transform: rotate(4deg); }
-        }
-      `}</style>
-    </div>
-  )
+const systemClock: PetClock = {
+  now: () => Date.now(),
+  setTimeout: (fn, ms) => window.setTimeout(fn, ms),
+  clearTimeout: (id) => window.clearTimeout(id)
 }
 
 function todayStr(): string {
   const d = new Date()
   const pad = (n: number): string => (n < 10 ? '0' + n : String(n))
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+export interface PetAppProps {
+  /** 测试或宿主可直接注入端口;缺省使用 window.api(本组件是唯一全局注入点) */
+  api?: PetPort
+}
+
+export default function PetApp({ api }: PetAppProps = {}) {
+  const [view, setView] = useState<{ state: PetViewState; mode: PetMode }>(() => ({
+    state: initialPetState(),
+    mode: 'idle'
+  }))
+  const [gestureState, setGestureState] = useState({ pressed: false, dragging: false, releaseKey: 0 })
+  const [localBubble, setLocalBubble] = useState<PetBubble | null>(null)
+  const [alertKey, setAlertKey] = useState(0)
+
+  const activePointerRef = useRef<number | null>(null)
+  const localTimerRef = useRef<number | null>(null)
+  const localSeqRef = useRef(10000)
+  const lastLocalRef = useRef<{ text: string; at: number } | null>(null)
+  const alertSeqRef = useRef(view.state.alertSequence)
+  const prevModeRef = useRef<PetMode>('idle')
+
+  // 唯一 window.api 注入点;为 getDayAgenda 补上本地时区今日日期。
+  // 显式类型读取,避免依赖 node 工程里被 index.ts 遮蔽的 preload 全局声明。
+  const port = useMemo<PetPort>(() => {
+    const base = api ?? (window as unknown as { api: RendererApi }).api
+    return {
+      getDayAgenda: () => base.getDayAgenda(todayStr()),
+      addMaterials: (input) => base.addMaterials(input),
+      pathForFile: (file) => base.pathForFile(file),
+      petDragStart: () => base.petDragStart(),
+      petDragEnd: () => base.petDragEnd(),
+      petOpenMenu: () => base.petOpenMenu(),
+      on: (channel, listener) => base.on(channel, listener),
+      getPetActivitySnapshot: () => base.getPetActivitySnapshot()
+    }
+  }, [api])
+
+  const controller = useMemo(
+    () => createPetController(port, systemClock, (state, mode) => setView({ state, mode })),
+    [port]
+  )
+
+  const pushLocalBubble = useCallback((text: string): void => {
+    const now = Date.now()
+    const last = lastLocalRef.current
+    // 去抖:同一文本 1.5 秒内只弹一次
+    if (last && last.text === text && now - last.at < 1500) return
+    lastLocalRef.current = { text, at: now }
+    if (localTimerRef.current !== null) window.clearTimeout(localTimerRef.current)
+    localSeqRef.current += 1
+    setLocalBubble({ id: localSeqRef.current, text, expiresAt: now + 5000 })
+    localTimerRef.current = window.setTimeout(() => {
+      localTimerRef.current = null
+      setLocalBubble(null)
+    }, 5000)
+  }, [])
+
+  const gesture = useMemo(
+    () =>
+      createPetGesture(port, {
+        click: () => {
+          void controller.showToday()
+        },
+        change: (value) => setGestureState(value),
+        error: () => pushLocalBubble('拖动操作失败,请重试')
+      }),
+    [port, controller, pushLocalBubble]
+  )
+
+  useEffect(() => {
+    controller.start()
+    return () => {
+      controller.dispose()
+      void gesture.dispose()
+    }
+  }, [controller, gesture])
+
+  // 提醒动画仅在进入 alert 或 alertSequence 变化时触发一次
+  useEffect(() => {
+    let bump = false
+    if (view.mode === 'alert') {
+      if (prevModeRef.current !== 'alert') bump = true
+      if (view.state.alertSequence !== alertSeqRef.current) bump = true
+    }
+    prevModeRef.current = view.mode
+    alertSeqRef.current = view.state.alertSequence
+    if (bump) setAlertKey((k) => k + 1)
+  }, [view])
+
+  // 窗口隐藏时停止拖动手势;动画由 CSS/隐藏窗口自然停止
+  useEffect(() => {
+    const onVisibilityChange = (): void => {
+      if (document.hidden) {
+        activePointerRef.current = null
+        gesture.cancel()
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange)
+  }, [gesture])
+
+  useEffect(
+    () => () => {
+      if (localTimerRef.current !== null) window.clearTimeout(localTimerRef.current)
+    },
+    []
+  )
+
+  const handlePointerDown = (e: ReactPointerEvent<HTMLButtonElement>): void => {
+    if (e.button !== 0 || !e.isPrimary) return
+    if (activePointerRef.current !== null) return
+    activePointerRef.current = e.pointerId
+    gesture.down({ x: e.screenX, y: e.screenY })
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId)
+    } catch {
+      // 无法捕获时本轮手势作废,避免窗口外拖动失控
+      activePointerRef.current = null
+      gesture.cancel()
+    }
+  }
+
+  const handlePointerMove = (e: ReactPointerEvent<HTMLButtonElement>): void => {
+    if (activePointerRef.current !== e.pointerId) return
+    gesture.move({ x: e.screenX, y: e.screenY })
+  }
+
+  const handlePointerUp = (e: ReactPointerEvent<HTMLButtonElement>): void => {
+    if (activePointerRef.current !== e.pointerId) return
+    activePointerRef.current = null
+    gesture.up()
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId)
+    } catch {
+      // capture 已失效,忽略
+    }
+  }
+
+  const handlePointerCancel = (e: ReactPointerEvent<HTMLButtonElement>): void => {
+    if (activePointerRef.current !== null && activePointerRef.current !== e.pointerId) return
+    activePointerRef.current = null
+    gesture.cancel()
+  }
+
+  const handleLostPointerCapture = (e: ReactPointerEvent<HTMLButtonElement>): void => {
+    if (activePointerRef.current !== null && activePointerRef.current !== e.pointerId) return
+    activePointerRef.current = null
+    gesture.cancel()
+  }
+
+  const handleBlur = (): void => {
+    if (activePointerRef.current === null) return
+    activePointerRef.current = null
+    gesture.cancel()
+  }
+
+  // 键盘激活与 pointerup 互斥:Enter/Space 走这里,detail===0 的原生 click 不再处理
+  const handleKeyDown = (e: ReactKeyboardEvent<HTMLButtonElement>): void => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      void controller.showToday()
+      return
+    }
+    if ((e.key === 'F10' && e.shiftKey) || e.key === 'ContextMenu') {
+      e.preventDefault()
+      void port.petOpenMenu()
+    }
+  }
+
+  const handleContextMenu = (e: ReactMouseEvent): void => {
+    e.preventDefault()
+    if (activePointerRef.current !== null) {
+      activePointerRef.current = null
+      gesture.cancel()
+    }
+    void port.petOpenMenu()
+  }
+
+  const handleDragOver = (e: ReactDragEvent): void => {
+    e.preventDefault()
+  }
+
+  const handleDrop = (e: ReactDragEvent): void => {
+    e.preventDefault()
+    const files: string[] = []
+    for (const file of Array.from(e.dataTransfer.files)) {
+      const path = port.pathForFile(file)
+      if (path) files.push(path)
+    }
+    const text = e.dataTransfer.getData('text/plain') ?? ''
+    if (files.length === 0 && !text.trim()) {
+      pushLocalBubble('没有可识别的内容')
+      return
+    }
+    void controller.acceptDrop({
+      files,
+      texts: text.trim() ? [{ name: '拖入的通知文本', content: text }] : []
+    })
+  }
+
+  const bubbles = localBubble ? [...view.state.bubbles, localBubble] : view.state.bubbles
+
+  return (
+    <div
+      className="pet-root"
+      onDragOver={handleDragOver}
+      onDrop={handleDrop}
+      onContextMenu={handleContextMenu}
+    >
+      <PetBubbles items={bubbles} />
+      <button
+        type="button"
+        className="pet-character-button"
+        aria-label="坐姿桌宠"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerCancel}
+        onLostPointerCapture={handleLostPointerCapture}
+        onBlur={handleBlur}
+        onKeyDown={handleKeyDown}
+      >
+        <PetCharacter
+          mode={view.mode}
+          pressed={gestureState.pressed}
+          dragging={gestureState.dragging}
+          releaseKey={gestureState.releaseKey}
+          alertKey={alertKey}
+        />
+      </button>
+    </div>
+  )
 }

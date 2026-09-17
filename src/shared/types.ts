@@ -97,6 +97,7 @@ export interface MaterialIntakeInput {
 export type CandidateType = 'todo' | 'event'
 
 export interface ActionCandidate {
+  candidateId?: string
   title: string
   type: CandidateType
   /** 截止时间(待办) */

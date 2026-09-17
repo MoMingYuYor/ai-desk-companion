@@ -2,15 +2,57 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import { Channels } from '../shared/api'
 import type { RendererApi } from '../shared/api'
+import type { MailApi, MailSubscribe, MailEventMap } from '../shared/mail'
 
 const invoke =
   <A extends unknown[], R>(channel: string) =>
   async (...args: A): Promise<R> =>
     (await ipcRenderer.invoke(channel, ...args)) as R
 
+const mail: MailApi = {
+  accounts: invoke(Channels.MailAccounts),
+  test: invoke(Channels.MailTest),
+  save: invoke(Channels.MailSave),
+  setEnabled: invoke(Channels.MailSetEnabled),
+  remove: invoke(Channels.MailRemove),
+  sync: invoke(Channels.MailSync),
+  earlier: invoke(Channels.MailEarlier),
+  list: invoke(Channels.MailList),
+  detail: invoke(Channels.MailDetail),
+  markRead: invoke(Channels.MailMarkRead),
+  download: invoke(Channels.MailDownload),
+  saveAttachment: invoke(Channels.MailSaveAttachment),
+  openLink: invoke(Channels.MailOpenLink),
+  analyze: invoke(Channels.MailAnalyze),
+  analysisStatus: invoke(Channels.MailAnalysisStatus),
+  cancelAnalysis: invoke(Channels.MailCancelAnalysis),
+  source: invoke(Channels.MailSource)
+}
+
+const MAIL_EVENT_CHANNELS: ReadonlyArray<keyof MailEventMap> = [
+  'evt:mail-sync',
+  'evt:mail-changed',
+  'evt:mail-analysis'
+]
+
+const subscribeMail: MailSubscribe = ((channel, listener) => {
+  if (!MAIL_EVENT_CHANNELS.includes(channel)) {
+    throw new Error(`不允许订阅通道:${String(channel)}`)
+  }
+  const wrapped = (_event: unknown, ...args: unknown[]): void => {
+    listener(...(args as Parameters<typeof listener>))
+  }
+  ipcRenderer.on(channel, wrapped as never)
+  return () => {
+    ipcRenderer.removeListener(channel, wrapped as never)
+  }
+}) as MailSubscribe
+
 const api: RendererApi = {
   getAppInfo: invoke(Channels.AppInfo),
   pathForFile: (file: unknown) => webUtils.getPathForFile(file as File),
+  mail,
+  subscribeMail,
 
   listProviders: invoke(Channels.ProvidersList),
   saveProvider: invoke(Channels.ProvidersSave),
@@ -76,6 +118,7 @@ const api: RendererApi = {
   petDragEnd: invoke(Channels.PetDragEnd),
   petOpenMenu: invoke(Channels.PetOpenMenu),
   petAction: invoke(Channels.PetAction),
+  getPetActivitySnapshot: invoke(Channels.PetActivitySnapshot),
 
   exportBackup: invoke(Channels.BackupExport),
   importBackup: invoke(Channels.BackupImport),

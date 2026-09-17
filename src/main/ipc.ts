@@ -71,12 +71,17 @@ import {
   createPanelWindow
 } from './windows'
 import { markPetBubble } from './petBridge'
+import { createPetDragService } from './pet/drag'
+import type { PetActivityRegistry } from './pet/activity'
+import type { MailService } from './mail/service'
 
 export interface IpcDeps {
   db: SqliteDb
   engine: Engine
   router: ModelRouter
   reminders: ReminderService
+  petActivity: PetActivityRegistry
+  mail: MailService
 }
 
 let depsRef: IpcDeps | null = null
@@ -92,10 +97,27 @@ function broadcastDataChanged(): void {
 
 export function registerIpcHandlers(deps: IpcDeps): void {
   depsRef = deps
-  const { db, engine, router, reminders } = deps
+  const { db, engine, router, reminders, mail } = deps
 
   const handle = (channel: string, fn: (...args: never[]) => unknown): void => {
     ipcMain.handle(channel, async (_event, ...args) => {
+      try {
+        return await fn(...(args as never[]))
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        console.error(`[ipc:${channel}]`, message)
+        throw new Error(message)
+      }
+    })
+  }
+
+  // 桌宠通道:仅接受桌宠窗口主 frame 的调用,防止其他页面调用原生拖动/快照
+  const handleFromPet = (channel: string, fn: (...args: never[]) => unknown): void => {
+    ipcMain.handle(channel, async (event, ...args) => {
+      const pet = getPetWindow()
+      if (!pet || pet.isDestroyed() || event.sender.id !== pet.webContents.id || event.senderFrame && !event.senderFrame.parent) {
+        throw new Error('FORBIDDEN: 桌宠通道来源无效')
+      }
       try {
         return await fn(...(args as never[]))
       } catch (err) {
@@ -169,7 +191,14 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   // ---- analysis ----
   handle(Channels.AnalysesLatest, (conversationId: string) => latestAnalysis(db, conversationId) ?? null)
   handle(Channels.AnalysesRerun, (conversationId: string) => engine.retry(conversationId))
-  handle(Channels.AnalysisConfirmItem, (analysisId: string, item: unknown) => engine.confirmItem(analysisId, item))
+  handle(Channels.AnalysisConfirmItem, (analysisId: string, item: unknown) => {
+    // 邮箱候选(携带 candidateIndex)走幂等映射;普通分析走原确认流程
+    const idx = (item as { candidateIndex?: number } | null)?.candidateIndex
+    if (typeof idx === 'number') {
+      return mail.confirmation.confirm(analysisId, idx, item as never)
+    }
+    return engine.confirmItem(analysisId, item)
+  })
   handle(Channels.AnalysisDeferItem, (analysisId: string, item: unknown) => ({
     pendingId: engine.deferItem(analysisId, item)
   }))
@@ -257,17 +286,18 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     setPanelPinnedMeta(db, pinned)
   })
   handle(Channels.PanelGetPinned, () => getMeta(db, 'panel:pinned') === '1')
-  handle(Channels.PetDragStart, () => {
+  handleFromPet(Channels.PetDragStart, () => {
     const pet = getPetWindow()
-    if (pet) startPetDrag(pet)
+    if (pet) petDrag.start(pet)
   })
-  handle(Channels.PetDragMove, () => movePetDrag())
-  handle(Channels.PetDragEnd, () => {
-    stopPetDrag()
+  handleFromPet(Channels.PetDragMove, () => movePetDrag())
+  handleFromPet(Channels.PetDragEnd, () => {
+    petDrag.end()
     savePetPosition(db)
   })
-  handle(Channels.PetOpenMenu, () => openPetMenu())
-  handle(Channels.PetAction, (action: string) => runPetAction(action))
+  handleFromPet(Channels.PetOpenMenu, () => openPetMenu())
+  handleFromPet(Channels.PetAction, (action: string) => runPetAction(action))
+  handleFromPet(Channels.PetActivitySnapshot, () => deps.petActivity.snapshot())
 
   // ---- backup ----
   handle(Channels.BackupExport, async () => {
@@ -289,48 +319,45 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       properties: ['openFile']
     })
     if (r.canceled || r.filePaths.length === 0) return false
-    importBackup(db, r.filePaths[0])
+    // 阻止在途邮件分析写入,导入完成后恢复
+    const resume = await mail.quiesceForBackup()
+    try {
+      importBackup(db, r.filePaths[0])
+    } finally {
+      resume()
+    }
     reminders.tick()
     broadcastDataChanged()
     markPetBubble('备份已恢复,数据已更新')
     return true
   })
+
+  // ---- mail ----
+  handle(Channels.MailAccounts, () => mail.accounts())
+  handle(Channels.MailTest, (input: never) => mail.test(input as Parameters<MailService['test']>[0]))
+  handle(Channels.MailSave, (input: never) => mail.save(input as Parameters<MailService['save']>[0]))
+  handle(Channels.MailSetEnabled, (id: string, enabled: boolean) => mail.setEnabled(id, enabled))
+  handle(Channels.MailRemove, (id: string) => mail.remove(id))
+  handle(Channels.MailSync, (id: string) => mail.sync(id))
+  handle(Channels.MailEarlier, (id: string) => mail.earlier(id))
+  handle(Channels.MailList, (query: never) => mail.list(query as Parameters<MailService['list']>[0]))
+  handle(Channels.MailDetail, (id: string) => mail.detail(id))
+  handle(Channels.MailMarkRead, (id: string, read: boolean) => mail.markRead(id, read))
+  handle(Channels.MailDownload, (id: string) => mail.download(id))
+  handle(Channels.MailSaveAttachment, (id: string) => mail.saveAttachment(id))
+  handle(Channels.MailOpenLink, (messageId: string, url: string) => mail.openLink(messageId, url))
+  handle(Channels.MailAnalyze, (input: never) => mail.analyze(input as Parameters<MailService['analyze']>[0]))
+  handle(Channels.MailAnalysisStatus, (messageId: string) => mail.analysisStatus(messageId))
+  handle(Channels.MailCancelAnalysis, (conversationId: string) => mail.cancelAnalysis(conversationId))
+  handle(Channels.MailSource, (sourceKey: string) => mail.source(sourceKey))
 }
 
 // ---------- 桌宠拖动(主进程轮询光标) ----------
 
-let dragState: {
-  win: Electron.BrowserWindow
-  offset: { x: number; y: number }
-  timer: NodeJS.Timeout
-} | null = null
-
-function startPetDrag(win: Electron.BrowserWindow): void {
-  if (dragState) return
-  const { screen } = require('electron') as typeof import('electron')
-  const [wx, wy] = win.getPosition()
-  const cursor = screen.getCursorScreenPoint()
-  const offset = { x: cursor.x - wx, y: cursor.y - wy }
-  const timer = setInterval(() => {
-    if (!dragState || win.isDestroyed()) {
-      stopPetDrag()
-      return
-    }
-    const c = screen.getCursorScreenPoint()
-    win.setPosition(c.x - dragState.offset.x, c.y - dragState.offset.y)
-  }, 16)
-  dragState = { win, offset, timer }
-}
+const petDrag = createPetDragService()
 
 function movePetDrag(): void {
   /* 轮询模式无需处理 */
-}
-
-function stopPetDrag(): void {
-  if (dragState) {
-    clearInterval(dragState.timer)
-    dragState = null
-  }
 }
 
 // ---------- 桌宠右键菜单 ----------

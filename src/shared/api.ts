@@ -27,6 +27,8 @@ import type {
   Todo,
   TodoInput
 } from './types'
+import type { PetActivitySnapshot } from './pet'
+import type { MailApi, MailSubscribe } from './mail'
 
 export const Channels = {
   // app
@@ -96,9 +98,28 @@ export const Channels = {
   PetDragEnd: 'pet:drag-end',
   PetOpenMenu: 'pet:open-menu',
   PetAction: 'pet:action',
+  PetActivitySnapshot: 'pet:activity-snapshot',
   // backup
   BackupExport: 'backup:export',
   BackupImport: 'backup:import',
+  // mail
+  MailAccounts: 'mail:accounts',
+  MailTest: 'mail:test',
+  MailSave: 'mail:save',
+  MailSetEnabled: 'mail:set-enabled',
+  MailRemove: 'mail:remove',
+  MailSync: 'mail:sync',
+  MailEarlier: 'mail:earlier',
+  MailList: 'mail:list',
+  MailDetail: 'mail:detail',
+  MailMarkRead: 'mail:mark-read',
+  MailDownload: 'mail:download',
+  MailSaveAttachment: 'mail:save-attachment',
+  MailOpenLink: 'mail:open-link',
+  MailAnalyze: 'mail:analyze',
+  MailAnalysisStatus: 'mail:analysis-status',
+  MailCancelAnalysis: 'mail:cancel-analysis',
+  MailSource: 'mail:source',
 
   // main -> renderer 事件
   EventChatDelta: 'evt:chat-delta',
@@ -109,7 +130,8 @@ export const Channels = {
   EventMaterialsAccepted: 'evt:materials-accepted',
   EventReminderFired: 'evt:reminder-fired',
   EventModelSwitched: 'evt:model-switched',
-  EventDataChanged: 'evt:data-changed'
+  EventDataChanged: 'evt:data-changed',
+  EventPetActivity: 'evt:pet-activity'
 } as const
 
 export interface AnalysisDeferResult {
@@ -192,9 +214,13 @@ export interface RendererApi {
   petDragEnd(): Promise<void>
   petOpenMenu(): Promise<void>
   petAction(action: string): Promise<void>
+  getPetActivitySnapshot(): Promise<PetActivitySnapshot>
   // backup
   exportBackup(): Promise<string | null>
   importBackup(): Promise<boolean>
+  // mail
+  mail: MailApi
+  subscribeMail: MailSubscribe
   // 事件订阅
   on(channel: string, listener: (...args: unknown[]) => void): () => void
 }

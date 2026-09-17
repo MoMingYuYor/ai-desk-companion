@@ -4,6 +4,7 @@ import {
   SCHEMA_SQL,
   SCHEMA_VERSION
 } from '../db/schema'
+import { migrateMailV2 } from '../mail/schema'
 import type {
   ActionCandidate,
   Analysis,
@@ -34,12 +35,23 @@ export function uid(): string {
 }
 
 export function initSchema(db: SqliteDb): void {
+  // PRAGMA foreign_keys 在事务外执行
+  db.run('PRAGMA foreign_keys = ON')
   db.transaction(() => {
-    db.run('PRAGMA foreign_keys = ON')
     db.run(SCHEMA_SQL)
     const row = db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'schema_version'")
     if (!row) {
+      migrateMailV2(db)
       db.run("INSERT INTO meta (key, value) VALUES ('schema_version', ?)", [String(SCHEMA_VERSION)])
+    } else {
+      const currentVer = parseInt(row.value, 10)
+      if (currentVer > SCHEMA_VERSION) {
+        throw new Error(`数据库版本 (${currentVer}) 高于当前支持的版本 (${SCHEMA_VERSION})`)
+      }
+      if (currentVer < 2) {
+        migrateMailV2(db)
+        db.run("UPDATE meta SET value = ? WHERE key = 'schema_version'", [String(SCHEMA_VERSION)])
+      }
     }
   })
 }

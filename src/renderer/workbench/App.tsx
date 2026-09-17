@@ -6,13 +6,15 @@ import { PendingPage } from './pages/PendingPage'
 import { TimetablePage } from './pages/TimetablePage'
 import { ProfilePage } from './pages/ProfilePage'
 import { SettingsPage } from './pages/SettingsPage'
+import { MailPage } from './mail/MailPage'
 import { useSubscribe } from '../shared/util'
 import type { PendingItem } from '../../shared/types'
 
-type PageName = 'chat' | 'calendar' | 'todos' | 'pending' | 'timetable' | 'profile' | 'settings'
+type PageName = 'chat' | 'mail' | 'calendar' | 'todos' | 'pending' | 'timetable' | 'profile' | 'settings'
 
 const NAV: Array<{ key: PageName; icon: string; label: string }> = [
   { key: 'chat', icon: '💬', label: '工作台' },
+  { key: 'mail', icon: '📧', label: '邮箱' },
   { key: 'calendar', icon: '📅', label: '日历' },
   { key: 'todos', icon: '✅', label: '待办' },
   { key: 'pending', icon: '📥', label: '待处理' },
@@ -26,6 +28,7 @@ export default function App(): JSX.Element {
   const [pendingCount, setPendingCount] = useState(0)
   const [refreshKey, setRefreshKey] = useState(0)
   const [petAction, setPetAction] = useState<{ action: string; at: number } | null>(null)
+  const [locateConversation, setLocateConversation] = useState<{ id: string; at: number } | null>(null)
 
   const refreshPending = useCallback((): void => {
     void window.api.listPending().then((items: PendingItem[]) => setPendingCount(items.length))
@@ -67,7 +70,19 @@ export default function App(): JSX.Element {
         </div>
       </div>
       <div className="main">
-        {page === 'chat' && <ChatPage refreshKey={refreshKey} petAction={petAction} />}
+        {page === 'chat' && (
+          <ChatPage refreshKey={refreshKey} petAction={petAction} locateConversationId={locateConversation} />
+        )}
+        {page === 'mail' && (
+          <MailPage
+            api={window.api.mail}
+            subscribe={window.api.subscribeMail}
+            onOpenConversation={(conversationId) => {
+              setLocateConversation({ id: conversationId, at: Date.now() })
+              setPage('chat')
+            }}
+          />
+        )}
         {page === 'calendar' && <CalendarPage refreshKey={refreshKey} petAction={petAction} />}
         {page === 'todos' && <TodosPage refreshKey={refreshKey} petAction={petAction} />}
         {page === 'pending' && <PendingPage refreshKey={refreshKey} />}

@@ -1,5 +1,5 @@
 // 应用入口:数据库、引擎、提醒、窗口、托盘与单实例锁
-import { app, BrowserWindow, Notification, powerMonitor } from 'electron'
+import { app, BrowserWindow, Notification } from 'electron'
 import { join } from 'node:path'
 import { openDatabase } from './db/connection'
 import { getProviderApiKey, initSchema } from './db/dao'
@@ -11,6 +11,17 @@ import { registerIpcHandlers, setDataChangedListener } from './ipc'
 import { createPetWindow, createWorkbenchWindow, broadcastToAll, isQuitting, markQuitting } from './windows'
 import { createTray, destroyTray } from './tray'
 import { markPetBubble, markPetState } from './petBridge'
+import { createPetActivityRegistry } from './pet/activity'
+import type { PetActivityNotice } from '../shared/pet'
+import { MailService } from './mail/service'
+import type { CredentialStorage } from './mail/credentials'
+import { safeStorage, powerMonitor } from 'electron'
+
+const safeStorageAdapter: CredentialStorage = {
+  isEncryptionAvailable: () => safeStorage.isEncryptionAvailable(),
+  encryptString: (value: string) => safeStorage.encryptString(value),
+  decryptString: (value: Buffer) => safeStorage.decryptString(value)
+}
 
 // 单实例锁:避免重复启动造成多份托盘/桌宠
 const gotLock = app.requestSingleInstanceLock()
@@ -18,6 +29,10 @@ if (!gotLock) {
   app.quit()
 } else {
   bootstrap()
+}
+
+function broadcastPetActivity(notice: PetActivityNotice): void {
+  broadcastToAll('evt:pet-activity', notice)
 }
 
 function bootstrap(): void {
@@ -38,6 +53,8 @@ function bootstrap(): void {
 
     initSchema(db)
 
+    const petActivity = createPetActivityRegistry(broadcastPetActivity)
+
     const router = new ModelRouter({
       apiKeyOf: (providerId) => {
         const enc = getProviderApiKey(db, providerId)
@@ -53,7 +70,8 @@ function bootstrap(): void {
         markPetBubble(`${n.reason}:${n.from} → ${n.to}`)
         markPetState('alert')
         setTimeout(() => markPetState('idle'), 6000)
-      }
+      },
+      onPetActivity: (change) => petActivity.apply(change)
     })
 
     reminders = new ReminderService({
@@ -71,7 +89,15 @@ function bootstrap(): void {
       }
     })
 
-    registerIpcHandlers({ db, engine, router, reminders })
+    const mail = new MailService({
+      db,
+      engine,
+      storage: safeStorageAdapter,
+      cacheDir: join(app.getPath('userData'), 'mail'),
+      broadcast: (channel, payload) => broadcastToAll(channel, payload)
+    })
+
+    registerIpcHandlers({ db, engine, router, reminders, petActivity, mail })
     setDataChangedListener(() => {
       broadcastToAll('evt:data-changed', { at: Date.now() })
     })
@@ -83,11 +109,17 @@ function bootstrap(): void {
       app.quit()
     })
     reminders.start()
+    mail.start()
 
-    powerMonitor.on('resume', () => reminders?.tick())
+    powerMonitor.on('resume', () => {
+      reminders?.tick()
+      // 唤醒后立即补收到期同步
+      mail.runDueNow().catch((err) => console.error('[mail] resume sync failed:', err))
+    })
 
     app.on('before-quit', () => {
       markQuitting()
+      void mail.stop()
     })
     app.on('will-quit', () => {
       try {

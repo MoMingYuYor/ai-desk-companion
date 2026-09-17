@@ -3,3 +3,7 @@ out/
 dist/
 *.log
 .DS_Store
+
+# 工具会话缓存,不入库
+.superpowers/
+.zcode/

@@ -17,7 +17,12 @@ const BACKUP_TABLES = [
   'courses',
   'course_overrides',
   'school_events',
-  'profile_facts'
+  'profile_facts',
+  // 邮箱业务数据:保留已分析来源/版本/确认映射;
+  // 账号、凭据、游标、收件缓存(mail_accounts/mail_sync_state/mail_messages/mail_attachments)不导出
+  'mail_analysis_links',
+  'mail_analysis_versions',
+  'mail_confirmations'
 ] as const
 
 const TABLE_COLUMNS: Record<string, string[]> = {
@@ -38,7 +43,10 @@ const TABLE_COLUMNS: Record<string, string[]> = {
   courses: ['id', 'semester_id', 'name', 'weekday', 'start_time', 'end_time', 'weeks', 'location', 'teacher', 'created_at'],
   course_overrides: ['id', 'course_id', 'date', 'kind', 'new_start_time', 'new_end_time', 'new_location', 'note', 'created_at'],
   school_events: ['id', 'semester_id', 'type', 'title', 'start_date', 'end_date', 'note', 'created_at'],
-  profile_facts: ['id', 'category', 'key', 'value', 'source', 'status', 'created_at', 'updated_at']
+  profile_facts: ['id', 'category', 'key', 'value', 'source', 'status', 'created_at', 'updated_at'],
+  mail_analysis_links: ['source_key', 'message_id', 'conversation_id', 'snapshot', 'last_material_ids', 'status', 'last_error'],
+  mail_analysis_versions: ['analysis_id', 'source_key', 'material_ids'],
+  mail_confirmations: ['analysis_id', 'candidate_index', 'source_key', 'ref_type', 'ref_id']
 }
 
 export function exportBackup(db: SqliteDb, filePath: string): void {
@@ -78,6 +86,11 @@ export function importBackup(db: SqliteDb, filePath: string): { imported: Record
       }
       imported[table] = rows.length
     }
+    // 修复引用:备份不包含收件缓存,来源里的 message_id 若已无对应邮件则置空,
+    // 保留"账号已移除/缓存不存在"的来源记录(分析快照仍在)
+    db.run(
+      'UPDATE mail_analysis_links SET message_id = NULL WHERE message_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM mail_messages WHERE id = mail_analysis_links.message_id)'
+    )
   })
   return { imported }
 }
