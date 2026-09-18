@@ -8,26 +8,48 @@ import { TimetablePage } from './pages/TimetablePage'
 import { ProfilePage } from './pages/ProfilePage'
 import { SettingsPage } from './pages/SettingsPage'
 import { MailPage } from './mail/MailPage'
+import { TopBar } from './TopBar'
 import { useSubscribe } from '../shared/util'
-import type { PendingItem } from '../../shared/types'
+import type { PendingItem, Todo } from '../../shared/types'
 
 type PageName = 'overview' | 'chat' | 'mail' | 'calendar' | 'todos' | 'pending' | 'timetable' | 'profile' | 'settings'
 
-const NAV: Array<{ key: PageName; icon: string; label: string }> = [
-  { key: 'overview', icon: '🏠', label: '今日概览' },
-  { key: 'chat', icon: '💬', label: '工作台' },
-  { key: 'mail', icon: '📧', label: '邮箱' },
-  { key: 'calendar', icon: '📅', label: '日历' },
-  { key: 'todos', icon: '✅', label: '待办' },
-  { key: 'pending', icon: '📥', label: '待处理' },
-  { key: 'timetable', icon: '🎓', label: '课表' },
-  { key: 'profile', icon: '👤', label: '画像' },
-  { key: 'settings', icon: '⚙️', label: '设置' }
+interface NavItem {
+  key: PageName
+  icon: string
+  label: string
+}
+
+// 侧栏信息架构:我的空间(核心工作区) / 个人设置,对齐初版手账设计
+const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
+  {
+    label: '我的空间',
+    items: [
+      { key: 'overview', icon: '🏠', label: '今日概览' },
+      { key: 'chat', icon: '💬', label: 'AI 工作台' },
+      { key: 'mail', icon: '📧', label: '邮箱' },
+      { key: 'calendar', icon: '📅', label: '日历' },
+      { key: 'todos', icon: '✅', label: '待办' },
+      { key: 'pending', icon: '📥', label: '待处理' },
+      { key: 'timetable', icon: '🎓', label: '课表' }
+    ]
+  },
+  {
+    label: '个人设置',
+    items: [{ key: 'profile', icon: '👤', label: '个人资料' }]
+  }
 ]
+
+const ALL_NAV: NavItem[] = NAV_GROUPS.flatMap((g) => g.items)
+const PAGE_GROUP = new Map<PageName, string>(NAV_GROUPS.flatMap((g) => g.items.map((i) => [i.key, g.label] as const)))
+const PAGE_LABEL = new Map<PageName, string>(ALL_NAV.map((i) => [i.key, i.label]))
 
 export default function App(): JSX.Element {
   const [page, setPage] = useState<PageName>('overview')
   const [pendingCount, setPendingCount] = useState(0)
+  const [mailUnread, setMailUnread] = useState<number | null>(null)
+  const [mailUnreadMore, setMailUnreadMore] = useState(false)
+  const [openTodos, setOpenTodos] = useState(0)
   const [refreshKey, setRefreshKey] = useState(0)
   const [petAction, setPetAction] = useState<{ action: string; at: number } | null>(null)
   const [locateConversation, setLocateConversation] = useState<{ id: string; at: number } | null>(null)
@@ -36,13 +58,34 @@ export default function App(): JSX.Element {
     void window.api.listPending().then((items: PendingItem[]) => setPendingCount(items.length))
   }, [])
 
+  const refreshMailUnread = useCallback((): void => {
+    void window.api.mail
+      .list({ unreadOnly: true, page: 0 })
+      .then((res) => {
+        if (!res.ok) return
+        setMailUnread(res.value.items.length)
+        setMailUnreadMore(res.value.hasMore)
+      })
+      .catch(() => {})
+  }, [])
+
+  const refreshTodos = useCallback((): void => {
+    void window.api
+      .listTodos()
+      .then((items: Todo[]) => setOpenTodos(items.filter((t) => !t.completedAt).length))
+      .catch(() => {})
+  }, [])
+
   useEffect(() => {
     refreshPending()
-  }, [refreshPending, refreshKey])
+    refreshMailUnread()
+    refreshTodos()
+  }, [refreshPending, refreshMailUnread, refreshTodos, refreshKey])
 
   useSubscribe('evt:data-changed', useCallback(() => {
     setRefreshKey((k) => k + 1)
   }, []))
+  useSubscribe('evt:mail-changed', useCallback(() => refreshMailUnread(), [refreshMailUnread]))
 
   useSubscribe('evt:pet-action', useCallback((payload: unknown) => {
     const { action } = payload as { action: string }
@@ -51,27 +94,63 @@ export default function App(): JSX.Element {
     if (action === 'new-todo') setPage('todos')
   }, []))
 
+  const searchSources = {
+    mails: (term: string) =>
+      window.api.mail
+        .list({ search: term, page: 0 })
+        .then((r) => (r.ok ? r.value.items : []))
+        .catch(() => []),
+    todos: () => window.api.listTodos().catch(() => []),
+    events: () => {
+      const now = new Date()
+      const from = `${now.getFullYear() - 1}-01-01T00:00`
+      const to = `${now.getFullYear() + 1}-12-31T23:59`
+      return window.api.listEvents(from, to).catch(() => [])
+    },
+    conversations: () => window.api.listConversations().catch(() => []),
+    pendings: () => window.api.listPending().catch(() => [])
+  }
+
   return (
     <div className="app">
       <div className="sidebar">
-        <div className="logo">事务助手</div>
-        {NAV.map((n) => (
-          <div
-            key={n.key}
-            className={`nav-item ${page === n.key ? 'active' : ''}`}
-            onClick={() => setPage(n.key)}
-          >
-            <span>{n.icon}</span>
-            <span>{n.label}</span>
-            {n.key === 'pending' && pendingCount > 0 && <span className="badge">{pendingCount}</span>}
+        <div className="logo">✨ 事务助手</div>
+        {NAV_GROUPS.map((group) => (
+          <div key={group.label} className="nav-group">
+            <div className="nav-group-label">{group.label}</div>
+            {group.items.map((n) => (
+              <div
+                key={n.key}
+                className={`nav-item ${page === n.key ? 'active' : ''}`}
+                onClick={() => setPage(n.key)}
+              >
+                <span>{n.icon}</span>
+                <span>{n.label}</span>
+                <span className="spacer" />
+                {n.key === 'mail' && (mailUnread ?? 0) > 0 && (
+                  <span className="badge">{mailUnreadMore ? `${mailUnread}+` : mailUnread}</span>
+                )}
+                {n.key === 'todos' && openTodos > 0 && <span className="badge">{openTodos}</span>}
+                {n.key === 'pending' && pendingCount > 0 && <span className="badge">{pendingCount}</span>}
+              </div>
+            ))}
           </div>
         ))}
         <div className="spacer" />
-        <div className="sidebar-hint">
-          把通知或文件拖给<br />桌宠即可开始分析
+        <div className={`nav-item ${page === 'settings' ? 'active' : ''}`} onClick={() => setPage('settings')}>
+          <span>⚙️</span>
+          <span>偏好设置</span>
         </div>
+        <div className="sidebar-footer">● 本机工作空间</div>
       </div>
       <div className="main">
+        <TopBar
+          group={PAGE_GROUP.get(page) ?? '我的空间'}
+          pageLabel={PAGE_LABEL.get(page) ?? '今日概览'}
+          pendingCount={pendingCount}
+          onNavigate={setPage}
+          searchSources={searchSources}
+        />
         {page === 'overview' && <OverviewPage refreshKey={refreshKey} onNavigate={setPage} />}
         {page === 'chat' && (
           <ChatPage refreshKey={refreshKey} petAction={petAction} locateConversationId={locateConversation} />

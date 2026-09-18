@@ -52,6 +52,18 @@
 }
 
 /* 欢迎卡:纸胶带 + 角色,装饰只用语义变量 */
+/* 纸胶带装饰:贴在英雄卡顶沿,呼应手账质感 */
+.ov-hero::before {
+  content: '';
+  position: absolute;
+  top: -10px;
+  left: 34px;
+  width: 96px;
+  height: 20px;
+  background: var(--ui-tape);
+  transform: rotate(-3deg);
+  border-radius: 2px;
+}
 .ov-hero {
   position: relative;
   display: flex;
