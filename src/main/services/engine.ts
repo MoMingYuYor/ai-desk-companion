@@ -31,6 +31,8 @@ import type {
 } from '../../shared/types'
 import type { PetActivityChange } from '../../shared/pet'
 import { validateAnalysisPayload, validateImportPayload, repairFeedback } from '../../shared/extraction'
+import { extractUrls } from '../../shared/urlText'
+import { createUrlFetcher } from './urlFetch'
 import {
   ANALYSIS_SYSTEM_PROMPT,
   ANALYSIS_FEWSHOT_BLOCK,
@@ -62,6 +64,8 @@ export interface EngineDeps {
   notifyModelSwitch?: (n: { from: string; to: string; reason: string }) => void
   onProfileSuggestion?: () => void
   onPetActivity?: (change: PetActivityChange) => void
+  /** 网页链接抓取;缺省用内置实现,测试可注入替身 */
+  fetchLink?: (url: string) => Promise<{ title: string; text: string }>
 }
 
 interface CallOutcome {
@@ -75,8 +79,11 @@ type PayloadValidator = (
 
 export class Engine {
   private aborts = new Map<string, AbortController>()
+  private readonly linkFetcher: (url: string) => Promise<{ title: string; text: string }>
 
-  constructor(private deps: EngineDeps) {}
+  constructor(private deps: EngineDeps) {
+    this.linkFetcher = deps.fetchLink ?? createUrlFetcher()
+  }
 
   private get db(): SqliteDb {
     return this.deps.db
@@ -232,6 +239,10 @@ export class Engine {
     const materials = listMaterials(this.db, conversationId)
     if (materials.length === 0) return null
 
+    // 材料里出现网页链接:先把链接正文抓下来作为材料,分析才不会只盯着链接字符串
+    await this.appendLinkContents(conversationId, materials)
+    const effectiveMaterials = listMaterials(this.db, conversationId)
+
     const taskId = `analysis:${conversationId}`
     this.deps.onPetActivity?.({ phase: 'start', taskId })
     const controller = new AbortController()
@@ -242,7 +253,7 @@ export class Engine {
     try {
       const userText =
         `以下是本次事项的全部材料:\n\n` +
-        materials
+        effectiveMaterials
           .map((m) => {
             const head = `【材料:${m.name}(${m.type})】`
             if (m.parseError) return `${head}\n(未能读取:${m.parseError})`
@@ -251,7 +262,7 @@ export class Engine {
           })
           .join('\n\n') +
         `\n\n${buildFullContext(this.db)}\n\n请按系统要求输出 JSON 分析结果。`
-      const { content: userContent, hasImages } = buildUserContent(userText, materials)
+      const { content: userContent, hasImages } = buildUserContent(userText, effectiveMaterials)
       const baseMessages: LlmMessage[] = [
         { role: 'system', content: ANALYSIS_SYSTEM_PROMPT + ANALYSIS_FEWSHOT_BLOCK },
         { role: 'user', content: userContent }
@@ -280,6 +291,46 @@ export class Engine {
     }
     this.deps.broadcast('evt:analysis-updated', { conversationId, analysisId: analysis?.id })
     return analysis
+  }
+
+  /**
+   * 材料文本中出现的网页链接:抓取正文并作为新材料入库。
+   * 已成功抓取过的链接(重试/追问场景)不重复抓取;抓取失败写入说明材料,
+   * 让模型把该链接列入 questions 而不是当作通知内容分析。每次最多抓 3 个新链接。
+   */
+  private async appendLinkContents(conversationId: string, materials: Material[]): Promise<void> {
+    const allUrls = new Set<string>()
+    for (const m of materials) {
+      if (m.content) {
+        for (const url of extractUrls(m.content)) allUrls.add(url)
+      }
+    }
+    if (allUrls.size === 0) return
+    const fetched = new Set<string>()
+    for (const m of materials) {
+      if (m.name.startsWith('链接正文:')) {
+        for (const url of extractUrls(m.content ?? '')) fetched.add(url)
+      }
+    }
+    const pending = [...allUrls].filter((url) => !fetched.has(url)).slice(0, 3)
+    for (const url of pending) {
+      try {
+        const page = await this.linkFetcher(url)
+        insertMaterial(this.db, {
+          conversationId,
+          name: `链接正文:${(page.title || url).slice(0, 40)}`,
+          type: 'text',
+          content: `来源:${url}\n\n${page.text}`
+        })
+      } catch (error) {
+        insertMaterial(this.db, {
+          conversationId,
+          name: `链接读取失败:${url.slice(0, 60)}`,
+          type: 'text',
+          content: `链接 ${url} 读取失败:${error instanceof Error ? error.message : String(error)}。请把该链接列入 questions 提醒用户手动查看。`
+        })
+      }
+    }
   }
 
   /**
