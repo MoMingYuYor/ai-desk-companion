@@ -100,6 +100,12 @@ function broadcastDataChanged(): void {
   dataChangedListener?.()
 }
 
+/** 数据变更后通知全部窗口刷新(侧栏角标/概览聚合等监听方) */
+function notifyChange<T>(value: T): T {
+  broadcastDataChanged()
+  return value
+}
+
 export function registerIpcHandlers(deps: IpcDeps): void {
   depsRef = deps
   const { db, engine, router, reminders, mail } = deps
@@ -216,23 +222,23 @@ export function registerIpcHandlers(deps: IpcDeps): void {
 
   // ---- events / todos ----
   handle(Channels.EventsRange, (from: string, to: string) => listEventsRange(db, from, to))
-  handle(Channels.EventsCreate, (input: EventInput) => createEvent(db, input))
-  handle(Channels.EventsUpdate, (id: string, patch: Partial<EventInput>) => updateEvent(db, id, patch))
-  handle(Channels.EventsDelete, (id: string) => deleteEvent(db, id))
+  handle(Channels.EventsCreate, (input: EventInput) => notifyChange(createEvent(db, input)))
+  handle(Channels.EventsUpdate, (id: string, patch: Partial<EventInput>) => notifyChange(updateEvent(db, id, patch)))
+  handle(Channels.EventsDelete, (id: string) => notifyChange(deleteEvent(db, id)))
   handle(Channels.TodosList, () => listTodos(db))
-  handle(Channels.TodosCreate, (input: TodoInput) => createTodo(db, input))
-  handle(Channels.TodosUpdate, (id: string, patch: Partial<TodoInput>) => updateTodo(db, id, patch))
-  handle(Channels.TodosDelete, (id: string) => deleteTodo(db, id))
+  handle(Channels.TodosCreate, (input: TodoInput) => notifyChange(createTodo(db, input)))
+  handle(Channels.TodosUpdate, (id: string, patch: Partial<TodoInput>) => notifyChange(updateTodo(db, id, patch)))
+  handle(Channels.TodosDelete, (id: string) => notifyChange(deleteTodo(db, id)))
   handle(Channels.TodosLinkEvent, (todoId: string, eventId: string | null) =>
-    updateTodo(db, todoId, { linkedEventId: eventId })
+    notifyChange(updateTodo(db, todoId, { linkedEventId: eventId }))
   )
 
   // ---- pending ----
   handle(Channels.PendingList, () => listPending(db))
   handle(Channels.PendingUpdate, (id: string, patch: { status?: 'open' | 'handled' | 'dismissed'; title?: string; notes?: string }) =>
-    updatePending(db, id, patch)
+    notifyChange(updatePending(db, id, patch))
   )
-  handle(Channels.PendingDelete, (id: string) => deletePending(db, id))
+  handle(Channels.PendingDelete, (id: string) => notifyChange(deletePending(db, id)))
 
   // ---- timetable ----
   handle(Channels.SemestersList, () => listSemesters(db))
