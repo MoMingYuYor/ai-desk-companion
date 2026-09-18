@@ -65,7 +65,7 @@ Q 版桌宠常驻桌面,承担信息入口与状态反馈双重职责:拖入材�
 
 ### 普通用户(Windows 便携版)
 
-1. 从 [Releases](../../releases) 下载 `事务助手-*-portable-x64.zip`
+1. 从 [Releases](../../releases) 下载 `ai-desk-companion-*-portable-x64.zip`
 2. 解压到任意目录(无需安装、无需管理员权限)
 3. 双击 `事务助手.exe` 即可使用
 
