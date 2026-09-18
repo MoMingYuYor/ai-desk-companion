@@ -16,17 +16,40 @@
       "out/**",
       "package.json"
     ],
+    "asarUnpack": [
+      "node_modules/sql.js/dist/**"
+    ],
     "extraResources": [
-      "resources/**"
+      {
+        "from": "resources",
+        "to": "resources"
+      },
+      {
+        "from": "node_modules/pdfjs-dist/cmaps",
+        "to": "cmaps"
+      },
+      {
+        "from": "node_modules/pdfjs-dist/standard_fonts",
+        "to": "standard_fonts"
+      }
     ],
     "win": {
-      "target": "nsis",
-      "icon": "resources/tray.ico"
+      "target": [
+        {
+          "target": "zip",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "resources/icon.png",
+      "artifactName": "${productName}-${version}-portable-${arch}.${ext}"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
-      "shortcutName": "事务助手"
+      "shortcutName": "事务助手",
+      "perMachine": false,
+      "deleteAppDataOnUninstall": false,
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
     }
   },
   "scripts": {
@@ -38,7 +61,7 @@
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
     "test": "vitest run",
     "gen:assets": "node scripts/gen-assets.mjs",
-    "dist": "electron-vite build && electron-builder --win nsis"
+    "dist": "electron-vite build && electron-builder --win"
   },
   "dependencies": {
     "html-to-text": "^10.0.1",
@@ -46,13 +69,11 @@
     "mailparser": "^3.9.27",
     "mammoth": "^1.12.3",
     "pdfjs-dist": "^4.10.38",
-    "react": "^19.1.0",
-    "react-dom": "^19.1.0",
     "sanitize-html": "^2.17.7",
     "solarlunar": "^3.1.0",
     "sql.js": "^1.13.0",
     "word-extractor": "^1.0.4",
-    "xlsx": "^0.18.5"
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "devDependencies": {
     "@testing-library/react": "^16.3.3",
@@ -69,6 +90,8 @@
     "electron-builder": "^26.0.0",
     "electron-vite": "^4.0.0",
     "jsdom": "^26.1.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
     "typescript": "^5.8.0",
     "vite": "^7.0.0",
     "vitest": "^3.2.0"

@@ -16,11 +16,11 @@
 
 ## 2. 已确认素材及使用边界
 
-原始参考：`D:/Administrator/Pictures/5e184c0271cf0ec5f2585088e56cee1f.jpg`。
+原始参考：`<本地参考图>(路径已省略)`。
 
 用户确认的生成图：
 
-`C:/Users/Administrator/.codex/generated_images/01a0a0b3-ee1d-7911-a341-6a1a5d232fee/exec-f9cc1c7c-109d-4fb6-bb04-ef2866c05b34.png`
+`<生成图路径>(已省略)`
 
 2026-09-15 只读核验：1254 × 1254，1,051,731 字节，Format32bppArgb，左上角 alpha=0；此检查证明文件含透明像素，不替代浅色/深色背景的边缘视觉验收。
 

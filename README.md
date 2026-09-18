@@ -11,7 +11,7 @@
 ![Electron](https://img.shields.io/badge/Electron-37-47848F?logo=electron&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-231%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-419%20passing-brightgreen)
 ![Local First](https://img.shields.io/badge/data-local%20--first-orange)
 
 [下载安装包](../../releases) · [本地开发](#本地开发) · [Roadmap](#roadmap)
@@ -63,9 +63,15 @@ Q 版桌宠常驻桌面,承担信息入口与状态反馈双重职责:拖入材�
 
 ## 安装
 
-### 普通用户(Windows)
+### 普通用户(Windows 便携版)
 
-从 [Releases](../../releases) 下载安装包(NSIS 安装向导),按提示完成安装。
+1. 从 [Releases](../../releases) 下载 `事务助手-*-portable-x64.zip`
+2. 解压到任意目录(无需安装、无需管理员权限)
+3. 双击 `事务助手.exe` 即可使用
+
+- 数据(日程、待办、邮箱凭据等)全部保存在本机 `%APPDATA%\事务助手\`,删除应用不影响数据
+- 首次使用请在「设置 → 模型服务」配置一个 OpenAI 兼容的模型接口
+- 未做代码签名,首次运行如遇 SmartScreen 提示,选择「仍要运行」即可
 
 ### 本地开发
 
@@ -74,9 +80,9 @@ git clone <repo-url>
 cd 待办
 npm install        # 安装依赖
 npm run dev        # 开发模式启动
-npm test           # 运行测试(231 例)
+npm test           # 运行测试(419 例)
 npm run build      # 构建到 out/
-npm run dist       # 打包 Windows 安装包
+npm run dist       # 打包 Windows 便携 zip
 ```
 
 > 若 Electron 二进制下载失败,执行 `node node_modules/electron/install.js` 后重试。
@@ -108,11 +114,13 @@ Electron 37 · React 19 · TypeScript 5 · sql.js (SQLite/WASM)
 └─ 共享层  类型化 IPC 契约 · 提取 schema · 邮箱 DTO · 日期工具
 ```
 
-测试基于 Vitest,共 29 个文件、231 个用例,覆盖协议集成、业务规则(去重/降级/自愈)与界面组件三个层面。
+测试基于 Vitest,共 69 个文件、419 个用例,覆盖协议集成、业务规则(去重/降级/自愈)与界面组件三个层面。
 
-## 许可证
+## 许可证与版权
 
-代码许可证将于正式发布时在此注明。桌宠形象素材为用户授权内容,公开分发前需单独核实其许可状态(见 [ASSET-SOURCES.md](src/renderer/pet/assets/ASSET-SOURCES.md))。
+**本项目代码版权归作者(MoMingYuYor)所有,保留所有权利。本仓库公开仅用于展示与分发官方构建产物,不构成开源许可:未经作者书面许可,不得复制、修改、再分发本仓库代码及其衍生作品。**
+
+应用内使用的第三方库版权归各自作者所有(sql.js、pdfjs-dist、SheetJS、mammoth、word-extractor、imapflow、mailparser 等,均为 MIT/Apache-2.0 许可)。桌宠形象素材为用户授权内容(见 [ASSET-SOURCES.md](src/renderer/pet/assets/ASSET-SOURCES.md))。
 
 ---
 
