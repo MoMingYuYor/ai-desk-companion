@@ -6,6 +6,7 @@ import { useMailbox } from './useMailbox'
 import { MailManagerView } from './MailManagerView'
 import { MailList } from './MailList'
 import { MailDetailView } from './MailDetailView'
+import { Toast, useToast } from '../../shared/util'
 import './mail.css'
 
 interface Props {
@@ -25,6 +26,7 @@ export function MailPage({ api, subscribe, onOpenConversation, historyApi, onOpe
   const mb = useMailbox(api, subscribe)
   const [view, setView] = useState<MailView>('inbox')
   const [history, setHistory] = useState<Analysis[]>([])
+  const [toast, showToast] = useToast()
 
   // 历史分析版本:会话确定或新一轮分析完成后加载
   useEffect(() => {
@@ -78,8 +80,14 @@ useEffect(() => {
 
   const loadEarlier = async (): Promise<void> => {
     if (mb.accountIdFilter === 'all') return
-    const res = await api.earlier(mb.accountIdFilter)
-    if (res.ok) handleAccountsChanged()
+    // 加载更早邮件失败要给出提示,不能裸 await 静默吞掉
+    try {
+      const res = await api.earlier(mb.accountIdFilter)
+      if (res.ok) handleAccountsChanged()
+      else showToast(`加载更早邮件失败:${res.message}`)
+    } catch (err) {
+      showToast(`加载更早邮件失败:${err instanceof Error ? err.message : String(err)}`)
+    }
   }
 
   const selectedAccount = mb.accounts.find((a) => a.id === mb.accountIdFilter) ?? null
@@ -192,6 +200,7 @@ useEffect(() => {
           onOpenSource={(sourceKey) => onOpenSource?.(sourceKey)}
         />
       </div>
+      <Toast text={toast} />
     </div>
   )
 }

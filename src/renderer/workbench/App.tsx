@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import type { KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { OverviewPage } from './pages/OverviewPage'
 import { ChatPage } from './pages/ChatPage'
 import { CalendarPage } from './pages/CalendarPage'
@@ -41,8 +42,25 @@ const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
 ]
 
 const ALL_NAV: NavItem[] = NAV_GROUPS.flatMap((g) => g.items)
-const PAGE_GROUP = new Map<PageName, string>(NAV_GROUPS.flatMap((g) => g.items.map((i) => [i.key, g.label] as const)))
-const PAGE_LABEL = new Map<PageName, string>(ALL_NAV.map((i) => [i.key, i.label]))
+// settings 入口单独挂在侧栏底部,不在 NAV_GROUPS 里,面包屑映射要补上,否则顶栏显示错路径
+const PAGE_GROUP = new Map<PageName, string>([
+  ...NAV_GROUPS.flatMap((g) => g.items.map((i) => [i.key, g.label] as const)),
+  ['settings', '个人设置'] as const
+])
+const PAGE_LABEL = new Map<PageName, string>([
+  ...ALL_NAV.map((i) => [i.key, i.label] as const),
+  ['settings', '偏好设置'] as const
+])
+
+/** 侧栏导航项键盘可达:Enter / 空格触发,与点击行为一致 */
+function navKeyDown(handler: () => void): (e: ReactKeyboardEvent) => void {
+  return (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      handler()
+    }
+  }
+}
 
 export default function App(): JSX.Element {
   const [page, setPage] = useState<PageName>('overview')
@@ -55,7 +73,10 @@ export default function App(): JSX.Element {
   const [locateConversation, setLocateConversation] = useState<{ id: string; at: number } | null>(null)
 
   const refreshPending = useCallback((): void => {
-    void window.api.listPending().then((items: PendingItem[]) => setPendingCount(items.length))
+    void window.api
+      .listPending()
+      .then((items: PendingItem[]) => setPendingCount(items.length))
+      .catch(() => {})
   }, [])
 
   const refreshMailUnread = useCallback((): void => {
@@ -122,7 +143,10 @@ export default function App(): JSX.Element {
               <div
                 key={n.key}
                 className={`nav-item ${page === n.key ? 'active' : ''}`}
+                role="button"
+                tabIndex={0}
                 onClick={() => setPage(n.key)}
+                onKeyDown={navKeyDown(() => setPage(n.key))}
               >
                 <span>{n.icon}</span>
                 <span>{n.label}</span>
@@ -137,7 +161,13 @@ export default function App(): JSX.Element {
           </div>
         ))}
         <div className="spacer" />
-        <div className={`nav-item ${page === 'settings' ? 'active' : ''}`} onClick={() => setPage('settings')}>
+        <div
+          className={`nav-item ${page === 'settings' ? 'active' : ''}`}
+          role="button"
+          tabIndex={0}
+          onClick={() => setPage('settings')}
+          onKeyDown={navKeyDown(() => setPage('settings'))}
+        >
           <span>⚙️</span>
           <span>偏好设置</span>
         </div>

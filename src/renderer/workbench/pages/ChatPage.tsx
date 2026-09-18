@@ -28,6 +28,8 @@ export function ChatPage({ refreshKey, petAction, locateConversationId }: Props)
   const [streamText, setStreamText] = useState('')
   const [toast, showToast] = useToast()
   const messagesRef = useRef<HTMLDivElement>(null)
+  // 会话内容加载序号:切换会话后只应用最新一次请求,迟到的旧响应直接丢弃(参照 useMailbox 的 listSeqRef)
+  const listSeqRef = useRef(0)
 
   const reloadConversations = useCallback((): void => {
     void window.api.listConversations().then(setConversations)
@@ -35,8 +37,15 @@ export function ChatPage({ refreshKey, petAction, locateConversationId }: Props)
 
   const reloadActive = useCallback((): void => {
     if (!activeId) return
-    void window.api.listMessages(activeId).then(setMessages)
-    void window.api.getLatestAnalysis(activeId).then((a) => setAnalysis(a ?? null))
+    const seq = ++listSeqRef.current
+    void window.api.listMessages(activeId).then((ms) => {
+      if (seq !== listSeqRef.current) return
+      setMessages(ms)
+    })
+    void window.api.getLatestAnalysis(activeId).then((a) => {
+      if (seq !== listSeqRef.current) return
+      setAnalysis(a ?? null)
+    })
   }, [activeId])
 
   useEffect(() => {
@@ -57,17 +66,20 @@ export function ChatPage({ refreshKey, petAction, locateConversationId }: Props)
       setMessages([])
       setAnalysis(null)
       setMaterials([])
+      setStreaming(false)
+      setStreamText('')
       return
     }
-    void window.api.listMessages(activeId).then(setMessages)
-    void window.api.getLatestAnalysis(activeId).then((a) => setAnalysis(a ?? null))
-    const conv = conversations.find((c) => c.id === activeId)
-    void conv
+    // 切换会话:重置流式状态,避免上一会话的流式文本串台
+    setStreaming(false)
+    setStreamText('')
+    reloadActive()
     // 材料列表通过消息列表附带展示,不单独拉取(简化)
-  }, [activeId, conversations])
+  }, [activeId, conversations, reloadActive])
 
   useEffect(() => {
-    messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight })
+    // jsdom 等环境没有 Element.scrollTo,可选调用避免崩溃
+    messagesRef.current?.scrollTo?.({ top: messagesRef.current.scrollHeight })
   }, [messages, streamText])
 
   // 流式事件
@@ -415,7 +427,8 @@ function AnalysisItems({
           <div className="column">
             {(p.actionItems ?? []).map((item, i) => (
               <CandidateCard
-                key={i}
+                // key 用业务标识(title)+ 序号:纯序号会在列表项增删后错位复用编辑状态
+                key={`${item.title}-${i}`}
                 item={item}
                 candidateIndex={i}
                 analysisId={analysis.id}

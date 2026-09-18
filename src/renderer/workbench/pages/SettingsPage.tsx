@@ -173,17 +173,22 @@ function ProviderEditor({
   const [modelsText, setModelsText] = useState(initial.models.join('\n'))
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<ProviderTestResult | null>(null)
+  const [toast, showToast] = useToast()
   // 默认模型下拉与模型列表文本框保持实时同步,自动获取后无需保存重进即可选择
   const parsedModels = modelsText.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
 
   const submit = async (): Promise<void> => {
-    await window.api.saveProvider({
-      ...form,
-      models: parsedModels,
-      defaultModel: form.defaultModel || parsedModels[0] || '',
-      apiKey: apiKey || undefined
-    })
-    onSaved()
+    try {
+      await window.api.saveProvider({
+        ...form,
+        models: parsedModels,
+        defaultModel: form.defaultModel || parsedModels[0] || '',
+        apiKey: apiKey || undefined
+      })
+      onSaved()
+    } catch (err) {
+      showToast('保存失败:' + (err instanceof Error ? err.message : String(err)))
+    }
   }
 
   return (
@@ -261,6 +266,9 @@ function ProviderEditor({
               try {
                 const r = await window.api.testProvider({ ...form, models: parsedModels, defaultModel: form.defaultModel || parsedModels[0] || '', apiKey: apiKey || undefined })
                 setTestResult(r)
+              } catch (err) {
+                // IPC 调用本身失败(超时/网络异常等)也要给出可见错误,而不是静默卡死
+                setTestResult({ ok: false, error: err instanceof Error ? err.message : String(err) })
               } finally {
                 setTesting(false)
               }
@@ -282,6 +290,7 @@ function ProviderEditor({
           </button>
         </div>
       </div>
+      <Toast text={toast} />
     </div>
   )
 }

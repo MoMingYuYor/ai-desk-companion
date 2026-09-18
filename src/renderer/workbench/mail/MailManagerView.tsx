@@ -74,24 +74,29 @@ export function MailManagerView({ api, accounts, loading, onAccountsChanged, onS
       port: provider === 'custom' ? Number(port) || PRESETS.custom.port : PRESETS[provider].port,
       credential
     }
-    const testRes = await api.test(input)
-    if (!testRes.ok) {
+    // 测试/保存任一步抛异常都不能让按钮永久卡在禁用态,finally 恢复 busy
+    try {
+      const testRes = await api.test(input)
+      if (!testRes.ok) {
+        setMessage(`连接测试失败:${testRes.message}`)
+        return
+      }
+      const saveRes = await api.save(input)
+      if (!saveRes.ok) {
+        setMessage(`保存失败:${saveRes.message}`)
+        return
+      }
+      setLabel('')
+      setEmail('')
+      setCredential('')
+      setMessage(`已添加账号「${saveRes.value.label}」`)
+      onAccountsChanged()
+      onSaved()
+    } catch (err) {
+      setMessage(`添加失败:${err instanceof Error ? err.message : String(err)}`)
+    } finally {
       setBusy(false)
-      setMessage(`连接测试失败:${testRes.message}`)
-      return
     }
-    const saveRes = await api.save(input)
-    setBusy(false)
-    if (!saveRes.ok) {
-      setMessage(`保存失败:${saveRes.message}`)
-      return
-    }
-    setLabel('')
-    setEmail('')
-    setCredential('')
-    setMessage(`已添加账号「${saveRes.value.label}」`)
-    onAccountsChanged()
-    onSaved()
   }
 
   const sync = async (id: string): Promise<void> => {

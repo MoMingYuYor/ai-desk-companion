@@ -1,5 +1,5 @@
 // 渲染端公共工具:事件订阅与轻提示
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 export function useSubscribe(channel: string, handler: (...args: unknown[]) => void): void {
   useEffect(() => {
@@ -10,10 +10,22 @@ export function useSubscribe(channel: string, handler: (...args: unknown[]) => v
 
 export function useToast(): [string | null, (msg: string) => void] {
   const [toast, setToast] = useState<string | null>(null)
-  const show = (msg: string): void => {
+  // 持有 timer:连续 show 时先清掉旧 timer,避免上一次的到点回调把新消息提前清空
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(
+    () => () => {
+      if (timerRef.current !== null) clearTimeout(timerRef.current)
+    },
+    []
+  )
+  const show = useCallback((msg: string): void => {
+    if (timerRef.current !== null) clearTimeout(timerRef.current)
     setToast(msg)
-    setTimeout(() => setToast(null), 2600)
-  }
+    timerRef.current = setTimeout(() => {
+      timerRef.current = null
+      setToast(null)
+    }, 2600)
+  }, [])
   return [toast, show]
 }
 

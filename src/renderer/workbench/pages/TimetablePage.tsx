@@ -18,7 +18,9 @@ interface Props {
 
 export function TimetablePage({ refreshKey }: Props): JSX.Element {
   const [semesters, setSemesters] = useState<Semester[]>([])
-  const [activeSem, setActiveSem] = useState<Semester | null>(null)
+  // 用学期 id(string)做激活态:对象引用每次拉取都会变,id 稳定,避免 reload 自触发死循环
+  const [activeSemId, setActiveSemId] = useState<string | null>(null)
+  const activeSem = semesters.find((s) => s.id === activeSemId) ?? null
   const [courses, setCourses] = useState<Course[]>([])
   const [overrides, setOverrides] = useState<Array<{ courseId: string; date: string; kind: 'cancel' | 'edit'; newStartTime?: string | null; newEndTime?: string | null; newLocation?: string | null }>>([])
   const [schoolEvents, setSchoolEvents] = useState<SchoolEvent[]>([])
@@ -38,8 +40,8 @@ export function TimetablePage({ refreshKey }: Props): JSX.Element {
       const w = weekOfDate(s.startDate, today)
       return w >= 1 && w <= s.weeks
     })
-    const sem = sems.find((s) => s.id === activeSem?.id) ?? active ?? sems[0] ?? null
-    setActiveSem(sem)
+    const sem = sems.find((s) => s.id === activeSemId) ?? active ?? sems[0] ?? null
+    setActiveSemId(sem?.id ?? null)
     if (sem) {
       setCourses(await window.api.listCourses(sem.id))
       setSchoolEvents(await window.api.listSchoolEvents(sem.id))
@@ -49,7 +51,7 @@ export function TimetablePage({ refreshKey }: Props): JSX.Element {
       setSchoolEvents([])
       setOverrides([])
     }
-  }, [activeSem])
+  }, [activeSemId])
 
   const reloadPending = useCallback((): void => {
     void window.api.listPendingImports().then(setPendingImports)
@@ -96,7 +98,7 @@ export function TimetablePage({ refreshKey }: Props): JSX.Element {
           value={activeSem?.id ?? ''}
           onChange={(e) => {
             const s = semesters.find((x) => x.id === e.target.value) ?? null
-            setActiveSem(s)
+            setActiveSemId(s?.id ?? null)
           }}
         >
           {semesters.length === 0 && <option value="">未设置学期</option>}

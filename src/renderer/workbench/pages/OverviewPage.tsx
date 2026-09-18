@@ -1,5 +1,5 @@
 // 今日概览:综合面板;聚合日程/待办/待处理/邮箱的真实数据,不接示例数字
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { DayAgenda, PendingItem, Todo } from '../../../shared/types'
 import type { MailAccountInfo, MailSummary } from '../../../shared/mail'
 import { fmtTime, nowLocalIso, toDateStr, weekdayCn } from '../../../shared/dateUtils'
@@ -75,6 +75,8 @@ export function OverviewPage({ refreshKey, onNavigate }: Props): JSX.Element {
   const [todos, setTodos] = useState<Todo[]>([])
   const [pending, setPending] = useState<PendingItem[]>([])
   const [mailAccounts, setMailAccounts] = useState<MailAccountInfo[] | null>(null)
+  // 邮箱数据是否完成首次加载:区分"加载中"与"未配置邮箱"
+  const [mailLoaded, setMailLoaded] = useState(false)
   const [recentMails, setRecentMails] = useState<MailSummary[]>([])
   const [unread, setUnread] = useState<{ count: number; more: boolean }>({ count: 0, more: false })
   const [eventDays, setEventDays] = useState<Set<string>>(new Set())
@@ -99,6 +101,8 @@ export function OverviewPage({ refreshKey, onNavigate }: Props): JSX.Element {
         if (unreadList.ok) setUnread({ count: unreadList.value.items.length, more: unreadList.value.hasMore })
       } catch {
         // 邮箱未配置或同步失败时,概览其余部分照常工作
+      } finally {
+        setMailLoaded(true)
       }
     })()
   }, [today])
@@ -117,7 +121,17 @@ export function OverviewPage({ refreshKey, onNavigate }: Props): JSX.Element {
   }, [monthCursor, refreshKey])
 
   useSubscribe('evt:mail-changed', useCallback(() => reload(), [reload]))
-  useSubscribe('evt:mail-sync', useCallback(() => reload(), [reload]))
+  // mail-sync 事件高频到达,全页 reload 做 3 秒节流,避免同步过程中的状态通知反复重拉
+  const lastMailSyncReloadRef = useRef(0)
+  useSubscribe(
+    'evt:mail-sync',
+    useCallback(() => {
+      const now = Date.now()
+      if (now - lastMailSyncReloadRef.current < 3000) return
+      lastMailSyncReloadRef.current = now
+      reload()
+    }, [reload])
+  )
 
   const timeline = useMemo(() => buildTimeline(agenda), [agenda])
   const nowMinutes = new Date().getHours() * 60 + new Date().getMinutes()
@@ -217,7 +231,11 @@ export function OverviewPage({ refreshKey, onNavigate }: Props): JSX.Element {
               <span className="ov-stat-label">✉️ 未读邮件</span>
               <span className="ov-stat-num">{mailAccounts === null ? '—' : `${unread.count}${unread.more ? '+' : ''}`}</span>
               <span className="ov-stat-sub">
-                {mailAccounts === null ? '邮箱未配置' : `来自 ${enabledAccounts.length} 个邮箱`}
+                {!mailLoaded
+                  ? '正在加载…'
+                  : mailAccounts === null
+                    ? '邮箱未配置'
+                    : `来自 ${enabledAccounts.length} 个邮箱`}
               </span>
             </button>
           </div>
