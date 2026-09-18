@@ -5,9 +5,11 @@ import type { CredentialStorage } from '../../src/main/mail/credentials'
 import { MailError } from '../../src/main/mail/errors'
 import {
   DEFAULT_BACKOFF_DELAYS,
+  DEFAULT_MAX_ATTEMPTS,
   MailScheduler,
   retryDelay,
-  todayLocalDay
+  todayLocalDay,
+  withBackoff
 } from '../../src/main/mail/scheduler'
 import type { MailSyncWorker } from '../../src/main/mail/sync'
 import type { SyncRequestMode, SyncRunResult } from '../../src/main/mail/sync'
@@ -94,6 +96,47 @@ describe('retryDelay', () => {
   })
 })
 
+describe('withBackoff', () => {
+  it('NETWORK 连续失败达到 maxAttempts 后放弃并抛出最后一次错误', async () => {
+    const err = new MailError('NETWORK', '断网')
+    let calls = 0
+    await expect(
+      withBackoff(
+        () => {
+          calls += 1
+          return Promise.reject(err)
+        },
+        { delays: [0, 0], maxAttempts: 3 }
+      )
+    ).rejects.toBe(err)
+    expect(calls).toBe(3)
+
+    // 默认上限 5 次
+    calls = 0
+    await expect(
+      withBackoff(() => {
+        calls += 1
+        return Promise.reject(new MailError('NETWORK', '断网'))
+      }, { delays: [0, 0] })
+    ).rejects.toMatchObject({ code: 'NETWORK' })
+    expect(calls).toBe(DEFAULT_MAX_ATTEMPTS)
+  })
+
+  it('连续失败达到上限前成功则正常返回', async () => {
+    let calls = 0
+    const result = await withBackoff(
+      () => {
+        calls += 1
+        if (calls < 3) return Promise.reject(new MailError('NETWORK', '抖动'))
+        return Promise.resolve('ok')
+      },
+      { delays: [0, 0], maxAttempts: 5 }
+    )
+    expect(result).toBe('ok')
+    expect(calls).toBe(3)
+  })
+})
+
 describe('MailScheduler', () => {
   it('同账号互斥:并发第二次抛 BUSY,结束后可再次同步', async () => {
     const { accounts, a, notices } = await setup()
@@ -166,6 +209,32 @@ describe('MailScheduler', () => {
     expect(fake.calls).toHaveLength(3)
     expect(accounts.get(a.id)?.status).toBe('idle')
     expect(notices.at(-1)).toMatchObject({ status: 'idle', loaded: 1 })
+  })
+
+  // 回归背景:NETWORK 曾无限重试,手动同步断网时 IPC 永不返回(2026-09-18)。
+  it('NETWORK 连续失败达到 maxAttempts 后放弃,账号标记 error 且互斥释放', async () => {
+    const { accounts, a, notices } = await setup()
+    const fake = new FakeWorker()
+    fake.error = new MailError('NETWORK', '连接超时')
+    fake.failFirst = 99
+    const scheduler = new MailScheduler(fake as unknown as MailSyncWorker, accounts, { onNotice: (n) => notices.push(n) }, {
+      backoffDelays: [0, 0],
+      maxAttempts: 3
+    })
+
+    await expect(scheduler.syncAccount(a.id, 'refresh', new AbortController().signal)).rejects.toMatchObject({
+      code: 'NETWORK'
+    })
+    expect(fake.calls.filter((call) => call.id === a.id)).toHaveLength(3)
+    expect(accounts.get(a.id)).toMatchObject({ status: 'error', error: { code: 'NETWORK', message: '连接超时' } })
+    expect(notices.at(-1)).toMatchObject({ accountId: a.id, status: 'error', error: { code: 'NETWORK' } })
+
+    // 放弃后 mutex 已释放:可再次发起同步(此时假件放行成功)
+    fake.failFirst = 0
+    await expect(scheduler.syncAccount(a.id, 'refresh', new AbortController().signal)).resolves.toMatchObject({
+      added: 1
+    })
+    expect(accounts.get(a.id)?.status).toBe('idle')
   })
 
   it('AUTH 失败不重试,账号标记 error 并发出通知', async () => {

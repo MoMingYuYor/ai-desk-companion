@@ -50,6 +50,34 @@ function loadPage(win: BrowserWindow, page: string): void {
   }
 }
 
+// ---------- WebContents 安全加固 ----------
+
+/** 开发态允许 dev server(ELECTRON_RENDERER_URL)前缀,生产态允许 file: 协议(loadFile 的页面),其余视为外源 */
+function isSameOriginUrl(url: string): boolean {
+  const devUrl = process.env.ELECTRON_RENDERER_URL
+  if (devUrl && url.startsWith(devUrl)) return true
+  return url.startsWith('file:')
+}
+
+/** 加固所需的最小 webContents 形状(不依赖 BrowserWindow,便于单测注入假对象) */
+export interface HardenableWebContents {
+  setWindowOpenHandler(handler: (details: unknown) => { action: 'deny' }): unknown
+  on(event: string, listener: (...args: never[]) => void): unknown
+}
+
+/**
+ * 统一窗口安全边界:拦截 window.open / target=_blank 新开窗口,
+ * 并把整窗导航限制为同源(拖拽链接等任意外站跳转一律阻止)。
+ * 工作台/桌宠/面板三个窗口共用。
+ */
+export function hardenWebContents(wc: HardenableWebContents): void {
+  wc.setWindowOpenHandler(() => ({ action: 'deny' }))
+  wc.on('will-navigate', (event: { preventDefault(): void }, url: string) => {
+    if (isSameOriginUrl(url)) return
+    event.preventDefault()
+  })
+}
+
 // ---------- 工作台 ----------
 
 export function createWorkbenchWindow(db: SqliteDb): BrowserWindow {
@@ -66,12 +94,15 @@ export function createWorkbenchWindow(db: SqliteDb): BrowserWindow {
     show: false,
     title: '事务助手',
     autoHideMenuBar: true,
+    // 固定浅色纸面底色,避免暗色主题下启动闪白;动态主题底色待外观服务接入后处理
+    backgroundColor: '#f5f1e9',
     webPreferences: {
       preload: preloadPath(),
       contextIsolation: true,
       nodeIntegration: false
     }
   })
+  hardenWebContents(win.webContents)
   win.on('ready-to-show', () => win.show())
   win.on('close', (e) => {
     if (!quitting) {
@@ -153,6 +184,8 @@ export function createPetWindow(db: SqliteDb): BrowserWindow {
       nodeIntegration: false
     }
   })
+  // 透明桌宠:绝不设置底色,仅做导航安全加固
+  hardenWebContents(win.webContents)
   win.setAlwaysOnTop(true, 'screen-saver')
   win.setVisibleOnAllWorkspaces(true)
   loadPage(win, 'pet')
@@ -201,13 +234,15 @@ export function createPanelWindow(db: SqliteDb): BrowserWindow {
     alwaysOnTop: pinned,
     show: false,
     transparent: false,
-    backgroundColor: '#f6f7fb',
+    // 固定浅色纸面底色(与工作台一致),避免暗色主题下启动闪白;动态主题底色待外观服务接入后处理
+    backgroundColor: '#f5f1e9',
     webPreferences: {
       preload: preloadPath(),
       contextIsolation: true,
       nodeIntegration: false
     }
   })
+  hardenWebContents(win.webContents)
   win.on('blur', () => {
     if (getMeta(db, 'panel:pinned') !== '1' && win.isVisible()) win.hide()
   })

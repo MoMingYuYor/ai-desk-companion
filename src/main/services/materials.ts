@@ -1,5 +1,5 @@
 // 材料接收与解析:文本、图片、PDF(版面文本/扫描件内嵌图)、Excel、Word;能解析的都交给 AI
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, extname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import zlib from 'node:zlib'
@@ -301,6 +301,35 @@ export function extractEmbeddedImages(filePath: string, maxImages = 5): Extracte
     writeFileSync(path, img.bytes)
     return { path, mime: img.mime }
   })
+}
+
+/** 默认保留 7 天:近期会话仍可能引用提取出的页面图片路径 */
+const PDF_TEMP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+
+/**
+ * 清理扫描件提取(extractEmbeddedImages)遗留在系统临时目录的 pdf-scan- 前缀目录:
+ * 只删除 mtime 超过 maxAgeMs 且匹配前缀的目录,不碰临时目录里的其他内容。
+ */
+export function sweepStalePdfTemp(maxAgeMs = PDF_TEMP_MAX_AGE_MS): void {
+  let entries: string[]
+  try {
+    entries = readdirSync(tmpdir())
+  } catch {
+    return // 临时目录不可读时静默跳过,清理失败不影响主流程
+  }
+  const now = Date.now()
+  for (const name of entries) {
+    if (!name.startsWith('pdf-scan-')) continue
+    const dir = join(tmpdir(), name)
+    try {
+      const st = statSync(dir)
+      if (st.isDirectory() && now - st.mtimeMs > maxAgeMs) {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    } catch {
+      // 单个目录清理失败(被占用等)不影响其余目录
+    }
+  }
 }
 
 function skipSpace(buf: Buffer, from: number): number {

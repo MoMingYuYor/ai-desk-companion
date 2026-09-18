@@ -5,6 +5,7 @@ import { openDatabase } from './db/connection'
 import { getProviderApiKey, initSchema } from './db/dao'
 import { decryptApiKey } from './keys'
 import { Engine } from './services/engine'
+import { sweepStalePdfTemp } from './services/materials'
 import { ModelRouter } from './services/modelRouter'
 import { ReminderService } from './services/reminder'
 import { registerIpcHandlers, setDataChangedListener } from './ipc'
@@ -60,6 +61,15 @@ function bootstrap(): void {
   })
 
   app.whenReady().then(async () => {
+    // 后台清理历史扫描件提取的临时目录:fire-and-forget,失败仅记录
+    setTimeout(() => {
+      try {
+        sweepStalePdfTemp()
+      } catch (err) {
+        console.error('[materials] 清理扫描件临时目录失败:', err)
+      }
+    }, 0)
+
     // 外观服务必须先于任何窗口创建:nativeTheme.themeSource 决定窗口初始配色
     const appearanceWarnings: string[] = []
     const store = createAppearanceStore(join(app.getPath('userData'), 'appearance.json'), (message) => {
@@ -212,6 +222,11 @@ function bootstrap(): void {
       }
       destroyTray()
     })
+  }).catch((err) => {
+    // 数据库/WASM 等启动期致命失败:弹窗告知并退出,避免静默僵尸进程(whenReady 之后 dialog 可用)
+    console.error('[bootstrap] 启动失败:', err)
+    dialog.showErrorBox('事务助手启动失败', err instanceof Error ? err.message : String(err))
+    app.exit(1)
   })
 
   app.on('window-all-closed', () => {

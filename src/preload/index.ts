@@ -38,6 +38,11 @@ const MAIL_EVENT_CHANNELS: ReadonlyArray<keyof MailEventMap> = [
   'evt:mail-analysis'
 ]
 
+// 通用事件订阅白名单:仅开放 evt: 前缀(主进程 → 渲染层广播的命名空间)。
+// 桌宠气泡/状态/动作等直发事件(evt:pet-bubble / evt:pet-state / evt:pet-action)未收录进
+// Channels 常量,故用前缀校验而非精确枚举;invoke 类通道与任意自定义通道一律拒绝。
+const EVENT_CHANNEL_PREFIX = 'evt:'
+
 const subscribeMail: MailSubscribe = ((channel, listener) => {
   if (!MAIL_EVENT_CHANNELS.includes(channel)) {
     throw new Error(`不允许订阅通道:${String(channel)}`)
@@ -147,6 +152,9 @@ const api: RendererApi = {
   importBackup: invoke(Channels.BackupImport),
 
   on: (channel, listener) => {
+    if (!channel.startsWith(EVENT_CHANNEL_PREFIX)) {
+      throw new Error(`不允许订阅通道:${String(channel)}`)
+    }
     const wrapped = (_event: unknown, ...args: unknown[]): void => {
       listener(...args)
     }

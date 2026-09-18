@@ -92,7 +92,7 @@ export interface IpcDeps {
 let depsRef: IpcDeps | null = null
 let dataChangedListener: (() => void) | null = null
 
-export function setDataChangedListener(fn: () => void): void {
+export function setDataChangedListener(fn: (() => void) | null): void {
   dataChangedListener = fn
 }
 
@@ -155,8 +155,9 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   // ---- providers ----
   handle(Channels.ProvidersList, (): ProviderInfo[] => listProviders(db))
   handle(Channels.ProvidersSave, (input: ProviderInput) => {
+    // undefined=不修改密钥;''=用户清空,删除已存密钥;非空=更换密文
     const apiKeyEnc =
-      input.apiKey !== undefined && input.apiKey !== '' ? encryptApiKey(input.apiKey) : undefined
+      input.apiKey === undefined ? undefined : input.apiKey === '' ? '' : encryptApiKey(input.apiKey)
     const id = saveProvider(db, {
       id: input.id,
       name: input.name,
@@ -409,7 +410,13 @@ export function runPetAction(action: string): void {
     case 'analyze-clipboard': {
       const text = clipboard.readText() ?? ''
       if (text.trim()) {
-        void engine.intakeMaterials({ texts: [{ name: '剪贴板通知', content: text }], autoRun: true })
+        void engine
+          .intakeMaterials({ texts: [{ name: '剪贴板通知', content: text }], autoRun: true })
+          .catch((err: unknown) => {
+            // 失败气泡此时已提示"已开始分析",必须兜底,避免 unhandledrejection
+            console.error('[pet:analyze-clipboard]', err instanceof Error ? err.message : String(err))
+            markPetBubble('剪贴板分析失败,请重试')
+          })
         markPetBubble('已开始分析剪贴板通知…')
       } else {
         markPetBubble('剪贴板没有文本内容')

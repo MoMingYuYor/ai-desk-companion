@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import {
   createConversation,
+  deleteMessagesFrom,
   insertAnalysis,
   insertMessage,
+  lastAssistantMessage,
   latestAnalysis,
   listConversations,
   listMessages,
@@ -51,5 +53,40 @@ describe('dao 行映射:蛇形列名 → 驼峰接口', () => {
     expect(analysis!.modelLabel).toBe('doubao-pro')
     expect(analysis!.createdAt).toBeTruthy()
     expect(analysis!.payload).toEqual({ summary: '摘要' })
+  })
+
+  // 回归背景:重试时 engine 依赖 last.createdAt 调 deleteMessagesFrom,
+  // lastAssistantMessage 未走 mapMessage 导致 createdAt 为 undefined,旧回复删不掉(2026-09-18)。
+  it('lastAssistantMessage 返回驼峰行,createdAt 可用于 deleteMessagesFrom 删除旧回复', async () => {
+    const db = await makeTestDb()
+    const conv = createConversation(db, 'chat', '重试会话')
+    insertMessage(db, {
+      conversationId: conv.id,
+      role: 'user',
+      content: '问题',
+      createdAt: '2026-09-18T10:00:00.000Z'
+    })
+    insertMessage(db, {
+      conversationId: conv.id,
+      role: 'assistant',
+      content: '旧回复',
+      modelLabel: 'doubao-pro',
+      createdAt: '2026-09-18T10:00:05.000Z'
+    })
+
+    const last = lastAssistantMessage(db, conv.id)
+    expect(last).toBeDefined()
+    expect(last!.id).toBeTruthy()
+    expect(last!.conversationId).toBe(conv.id)
+    expect(last!.role).toBe('assistant')
+    expect(last!.modelLabel).toBe('doubao-pro')
+    expect(last!.createdAt).toBe('2026-09-18T10:00:05.000Z')
+
+    // engine.retry:deleteMessagesFrom(conv, last.createdAt, 'assistant') 应删掉助手消息
+    deleteMessagesFrom(db, conv.id, last!.createdAt, 'assistant')
+    const rest = listMessages(db, conv.id)
+    expect(rest).toHaveLength(1)
+    expect(rest[0].role).toBe('user')
+    expect(rest[0].createdAt).toBe('2026-09-18T10:00:00.000Z')
   })
 })

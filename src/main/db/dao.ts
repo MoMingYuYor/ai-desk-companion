@@ -153,7 +153,8 @@ export function getProviderRow(db: SqliteDb, id: string): ProviderRow | undefine
 export function getProviderApiKey(db: SqliteDb, id: string): string | null {
   const row = getProviderRow(db, id)
   if (!row || !row.api_key_enc) return null
-  return row.api_key_enc.startsWith('plain:') ? row.api_key_enc.slice(6) : row.api_key_enc
+  // 原样返回存储串('plain:xxx' 前缀明文或 safeStorage 密文),解密职责完全在 decryptApiKey
+  return row.api_key_enc
 }
 
 export function saveProvider(
@@ -167,6 +168,7 @@ export function saveProvider(
     defaultModel: string
     supportsVision: boolean
     supportsJsonMode?: boolean
+    /** undefined = 保留已存密钥;'' = 用户清空 → 删除已存密钥;非空 = 新密文 */
     apiKeyEnc?: string
     isDefault?: boolean
     sortOrder?: number
@@ -290,7 +292,7 @@ export function deleteConversation(db: SqliteDb, id: string): void {
     db.run('DELETE FROM messages WHERE conversation_id = ?', [id])
     db.run('DELETE FROM materials WHERE conversation_id = ?', [id])
     db.run('DELETE FROM analyses WHERE conversation_id = ?', [id])
-    db.run('UPDATE pending_items SET status = "dismissed" WHERE conversation_id = ? AND status = "open"', [id])
+    db.run("UPDATE pending_items SET status = 'dismissed' WHERE conversation_id = ? AND status = 'open'", [id])
     db.run('DELETE FROM conversations WHERE id = ?', [id])
   })
 }
@@ -358,10 +360,11 @@ export function deleteMessagesFrom(db: SqliteDb, conversationId: string, created
 }
 
 export function lastAssistantMessage(db: SqliteDb, conversationId: string): ChatMessage | undefined {
-  return db.get<ChatMessage>(
+  const r = db.get<MessageRow>(
     "SELECT * FROM messages WHERE conversation_id = ? AND role = 'assistant' ORDER BY created_at DESC, rowid DESC LIMIT 1",
     [conversationId]
-  ) as ChatMessage | undefined
+  ) as MessageRow | undefined
+  return r ? mapMessage(r) : undefined
 }
 
 // ---------- materials ----------

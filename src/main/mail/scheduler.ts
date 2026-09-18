@@ -7,6 +7,9 @@ import type { MailSyncWorker } from './sync'
 
 export const DEFAULT_BACKOFF_DELAYS: readonly number[] = [30_000, 60_000, 120_000, 300_000]
 
+/** NETWORK 连续失败达到该次数(含首次)后放弃重试,抛出最后一次错误 */
+export const DEFAULT_MAX_ATTEMPTS = 5
+
 /** NETWORK 按退避间隔重试;AUTH/TLS/CRYPTO 等不可恢复错误返回 null(直接抛出) */
 export function retryDelay(
   attempt: number,
@@ -38,19 +41,21 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
-/** 指数退避封装:仅 NETWORK 错误重试,间隔由 delays 注入(测试可传 0) */
+/** 指数退避封装:仅 NETWORK 错误重试,间隔由 delays 注入(测试可传 0);
+ *  连续失败达到 maxAttempts(含首次)后放弃并抛出最后一次错误 */
 export async function withBackoff<T>(
   fn: () => Promise<T>,
-  opts?: { delays?: readonly number[]; signal?: AbortSignal }
+  opts?: { delays?: readonly number[]; signal?: AbortSignal; maxAttempts?: number }
 ): Promise<T> {
   const delays = opts?.delays ?? DEFAULT_BACKOFF_DELAYS
+  const maxAttempts = Math.max(1, opts?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS)
   for (let attempt = 0; ; attempt += 1) {
     try {
       return await fn()
     } catch (err) {
       const code = isMailError(err) ? err.code : classifyError(err).code
       const delay = retryDelay(attempt, code, delays)
-      if (delay == null || opts?.signal?.aborted) throw err
+      if (delay == null || opts?.signal?.aborted || attempt + 1 >= maxAttempts) throw err
       await sleep(delay, opts?.signal)
     }
   }
@@ -69,16 +74,20 @@ export interface MailSchedulerHooks {
 export interface MailSchedulerOptions {
   /** 退避间隔注入点;默认 30s → 1m → 2m → 5m */
   backoffDelays?: number[]
+  /** NETWORK 连续失败多少次后放弃(含首次);默认 5。后台 lane 与手动同步共用同一上限 */
+  maxAttempts?: number
 }
 
 /**
  * 同步调度器:同账号互斥串行(并发第二次抛 BUSY),
- * runDue 最多 2 个账号并发,NETWORK 失败按退避重试。
+ * runDue 最多 2 个账号并发,NETWORK 失败按退避重试,
+ * 连续失败达 maxAttempts(默认 5)后放弃并标记账号 error。
  */
 export class MailScheduler {
   private readonly mutex = new Map<string, Promise<SyncRunResult>>()
   private readonly controllers = new Map<string, AbortController>()
   private readonly backoffDelays: readonly number[]
+  private readonly maxAttempts: number
 
   constructor(
     private readonly worker: MailSyncWorker,
@@ -87,6 +96,7 @@ export class MailScheduler {
     options?: MailSchedulerOptions
   ) {
     this.backoffDelays = options?.backoffDelays ?? DEFAULT_BACKOFF_DELAYS
+    this.maxAttempts = Math.max(1, options?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS)
   }
 
   private emit(
@@ -111,7 +121,8 @@ export class MailScheduler {
     try {
       const result = await withBackoff(() => this.worker.run(id, mode, todayLocalDay(), signal), {
         delays: this.backoffDelays,
-        signal
+        signal,
+        maxAttempts: this.maxAttempts
       })
       this.accounts.updateSuccess(id)
       this.emit(id, 'idle', result.added)
