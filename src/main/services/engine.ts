@@ -30,7 +30,7 @@ import type {
   ProviderInfo
 } from '../../shared/types'
 import type { PetActivityChange } from '../../shared/pet'
-import { validateAnalysisPayload, repairFeedback } from '../../shared/extraction'
+import { validateAnalysisPayload, validateImportPayload, repairFeedback } from '../../shared/extraction'
 import {
   ANALYSIS_SYSTEM_PROMPT,
   ANALYSIS_FEWSHOT_BLOCK,
@@ -39,7 +39,7 @@ import {
   TIMETABLE_SYSTEM_PROMPT
 } from './prompts'
 import { buildFullContext } from './context'
-import { fileToDataUrl, parseLocalFile } from './materials'
+import { fileToDataUrl, parseLocalFile, type ParsedFile } from './materials'
 import { ModelRouter, type LlmMessage, type RouterNotice } from './modelRouter'
 
 export type Broadcast = (channel: string, payload: unknown) => void
@@ -69,6 +69,10 @@ interface CallOutcome {
   label: string
 }
 
+type PayloadValidator = (
+  raw: unknown
+) => { ok: true; value: AnalysisPayload; warnings: string[] } | { ok: false; errors: string[] }
+
 export class Engine {
   private aborts = new Map<string, AbortController>()
 
@@ -87,9 +91,16 @@ export class Engine {
     files?: string[]
     autoRun?: boolean
   }): Promise<{ conversationId: string; materials: Material[] }> {
+    // 桌宠拖放等未指定会话类型的入口:先解析文件再侦测类型(课表/校历自动路由)
+    const parsedFiles = []
+    for (const f of input.files ?? []) {
+      parsedFiles.push(await parseLocalFile(f))
+    }
+    const kind =
+      input.kind ?? (input.conversationId ? 'analysis' : await this.detectMaterialKind(parsedFiles, input.texts ?? []))
     let conv = input.conversationId ? getConversation(this.db, input.conversationId) : undefined
     if (!conv) {
-      conv = createConversation(this.db, input.kind ?? 'analysis', '新分析')
+      conv = createConversation(this.db, kind, '新分析')
     }
     const materials: Material[] = []
     for (const t of input.texts ?? []) {
@@ -102,8 +113,7 @@ export class Engine {
         })
       )
     }
-    for (const f of input.files ?? []) {
-      const parsed = await parseLocalFile(f)
+    for (const parsed of parsedFiles) {
       materials.push(
         insertMaterial(this.db, {
           conversationId: conv.id,
@@ -116,6 +126,18 @@ export class Engine {
           parseError: parsed.parseError
         })
       )
+      // 扫描版 PDF 提取出的其余页面图片(第一张已作为主材料)
+      for (const [k, imgPath] of (parsed.extraImagePaths ?? []).entries()) {
+        materials.push(
+          insertMaterial(this.db, {
+            conversationId: conv.id,
+            name: `${parsed.name}(第 ${k + 2} 页)`,
+            type: 'image',
+            mime: 'image/png',
+            path: imgPath
+          })
+        )
+      }
     }
     const firstName = materials[0]?.name
     if (conv.title === '新分析' && firstName) {
@@ -138,6 +160,68 @@ export class Engine {
     this.deps.broadcast('evt:materials-accepted', { conversationId: conv.id, count: materials.length })
     this.deps.broadcast('evt:conversation-changed', { conversationId: conv.id })
     return { conversationId: conv.id, materials }
+  }
+
+  // ---------- 材料类型侦测(桌宠拖放自动路由) ----------
+
+  /** 未指定类型的新材料:文件名/文本特征识别课表与校历;图片用一次视觉分类兜底 */
+  private async detectMaterialKind(
+    parsedFiles: ParsedFile[],
+    texts: Array<{ name: string; content: string }>
+  ): Promise<Conversation['kind']> {
+    const names = parsedFiles.map((m) => m.name).join('\n')
+    if (/课表|课程表|timetable|schedule/i.test(names)) return 'timetable'
+    if (/校历/.test(names)) return 'school-calendar'
+
+    const text = [...texts.map((t) => t.content), ...parsedFiles.filter((m) => m.content).map((m) => m.content!)]
+      .join('\n')
+      .slice(0, 6000)
+    if (text) {
+      const hits = [
+        /星期[一二三四五六日天]/,
+        /第\s*[一二三四五六七八九十\d]+\s*节/,
+        /周次|教学周|单周|双周|第\s*\d{1,2}\s*[-–—]\s*\d{1,2}\s*周/,
+        /\d{1,2}:\d{2}\s*[-–—~至]\s*\d{1,2}:\d{2}/
+      ].filter((re) => re.test(text)).length
+      if (hits >= 2) return 'timetable'
+    }
+
+    const imagePaths = parsedFiles.filter((m) => m.type === 'image' && m.path).map((m) => m.path!)
+    if (imagePaths.length > 0) {
+      const detected = await this.classifyImageKind(imagePaths)
+      if (detected) return detected
+    }
+    return 'analysis'
+  }
+
+  /** 图片内容分类:课表/校历/其他;任何失败都回退通用分析,不阻断接收 */
+  private async classifyImageKind(imagePaths: string[]): Promise<'timetable' | 'school-calendar' | null> {
+    try {
+      const images = imagePaths.map((p) => fileToDataUrl(p)).filter((u): u is string => !!u)
+      if (images.length === 0) return null
+      const result = await this.deps.router.call(listProviders(this.db), {
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: '判断这张图片的内容类型。如果主体是排课表(有星期/节次/课程名)回答"课表";如果主体是学期日历(放假/开学/考试周安排)回答"校历";否则回答"其他"。只输出这一个词。'
+              },
+              ...images.slice(0, 2).map((url) => ({ type: 'image_url' as const, image_url: { url } }))
+            ]
+          }
+        ],
+        needVision: true,
+        timeoutMs: 20000
+      })
+      const t = result.text.trim()
+      if (t.includes('课表') || /timetable/i.test(t)) return 'timetable'
+      if (t.includes('校历') || /calendar/i.test(t)) return 'school-calendar'
+      return null
+    } catch {
+      return null
+    }
   }
 
   // ---------- 通知分析 ----------
@@ -200,12 +284,13 @@ export class Engine {
 
   /**
    * 三级自愈:调用 → 解析+校验 → 同模型修复一次 → 按备用顺序切换下一个模型。
-   * 网络/429/5xx 仍由 router 内部重试与切换;内容不合格由本方法推进游标。
+   * 校验器按业务传入(通知分析/课表/校历),网络/429/5xx 仍由 router 内部重试与切换。
    */
   private async callModelWithRecovery(
     baseMessages: LlmMessage[],
     needVision: boolean,
-    signal: AbortSignal
+    signal: AbortSignal,
+    validate: PayloadValidator = validateAnalysisPayload
   ): Promise<{ raw: string; label: string; payload: AnalysisPayload; warnings: string[] }> {
     const providers = listProviders(this.db)
     const failures: string[] = []
@@ -220,7 +305,7 @@ export class Engine {
 
       const parsed = extractJsonPayload(first.text)
       const validated = parsed
-        ? validateAnalysisPayload(parsed)
+        ? validate(parsed)
         : { ok: false as const, errors: ['输出无法解析为 JSON'] }
 
       if (validated.ok) {
@@ -240,7 +325,7 @@ export class Engine {
 
       const repairedPayload = extractJsonPayload(repaired.text)
       const repairedValid = repairedPayload
-        ? validateAnalysisPayload(repairedPayload)
+        ? validate(repairedPayload)
         : { ok: false as const, errors: ['输出无法解析为 JSON'] }
 
       if (repairedValid.ok) {
@@ -306,8 +391,24 @@ export class Engine {
     const materials = listMaterials(this.db, conversationId)
     if (materials.length === 0) return null
 
+    // 全部材料都不可读时调用模型只会得到空结果,直接给出可诊断的失败原因
+    const usable = materials.filter((m) => !m.parseError && (m.content || m.type === 'image'))
+    if (usable.length === 0) {
+      const reasons = materials.map((m) => `${m.name}:${m.parseError ?? '内容为空'}`).join(';')
+      const failed = insertAnalysis(this.db, conversationId, {}, {
+        status: 'failed',
+        error: `材料无法读取:${reasons}`
+      })
+      this.deps.broadcast('evt:analysis-updated', { conversationId, analysisId: failed.id })
+      return failed
+    }
+
     const taskId = `import:${conversationId}`
     this.deps.onPetActivity?.({ phase: 'start', taskId })
+    // 后台提取开始:桌宠气泡告知,用户无需停留在导入窗口等待
+    this.deps.broadcast('evt:pet-bubble', {
+      text: kind === 'timetable' ? '正在提取课表,完成后会提醒你' : '正在提取校历,完成后会提醒你'
+    })
     const controller = new AbortController()
     this.aborts.set(conversationId, controller)
     let analysis: Analysis | null = null
@@ -325,8 +426,7 @@ export class Engine {
           .join('\n\n')
       const { content: userContent, hasImages } = buildUserContent(userText, materials)
 
-      const { text: raw, label } = await this.callModel(
-        conversationId,
+      const recovered = await this.callModelWithRecovery(
         [
           {
             role: 'system',
@@ -335,17 +435,26 @@ export class Engine {
           { role: 'user', content: userContent }
         ],
         hasImages,
-        controller.signal
+        controller.signal,
+        (raw) => validateImportPayload(raw, kind)
       )
-      const payload = extractJsonPayload(raw)
-      analysis = payload
-        ? insertAnalysis(this.db, conversationId, payload, { rawResponse: raw, modelLabel: label })
-        : insertAnalysis(this.db, conversationId, {}, {
-            rawResponse: raw,
-            status: 'failed',
-            error: '模型输出无法解析为 JSON,可稍后重试'
-          })
-      outcome = payload ? 'done' : 'failed'
+      const payload = recovered.payload
+      // 字段级降级说明并入 questions,确认页会展示给用户核对
+      if (recovered.warnings.length > 0) {
+        payload.questions = [...(payload.questions ?? []), ...recovered.warnings]
+      }
+      analysis = insertAnalysis(this.db, conversationId, payload, {
+        rawResponse: recovered.raw,
+        modelLabel: recovered.label
+      })
+      outcome = 'done'
+      const count = kind === 'timetable' ? (payload.courses?.length ?? 0) : (payload.schoolEvents?.length ?? 0)
+      this.deps.broadcast('evt:pet-bubble', {
+        text:
+          kind === 'timetable'
+            ? `课表提取完成,共 ${count} 门课程,请到课表页确认导入`
+            : `校历提取完成,共 ${count} 条,请到课表页确认导入`
+      })
     } catch (err) {
       const aborted = err instanceof Error && err.name === 'AbortError'
       outcome = aborted ? 'cancelled' : 'failed'

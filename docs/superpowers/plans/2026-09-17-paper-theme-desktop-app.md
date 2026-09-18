@@ -61,6 +61,8 @@
 
 工作区同时存在邮箱、桌宠及共享入口的开发改动，package.json 已列出邮箱与 UI 测试依赖。此事实只表明文件已有变更，不代表安装、测试、构建或功能完成。本计划中的测试命令均为待执行步骤；实施者需依据当时实际依赖和代码建立基线。
 
+只读接缝核查还发现：当前三个窗口的生产页面路径需要区分loadFile与开发loadURL；sql.js的生产WASM读取路径与打包复制规则需要闭合；现有ICO生成仅包含32px图像；second-instance回调需要保护数据库尚未初始化的情况。新桌宠组件已出现在工作区，但入口尚不能据此认定完成接入。任务6—8将这些作为明确检查项，若并行开发已修复则复用其实现和证据，不能再按旧代码重复改写。
+
 | 文件或模块 | 责任 | 所有者 |
 | --- | --- | --- |
 | `src/shared/appearance.ts` | 偏好/快照/返回值类型和通道常量 | R 共用接口 |
@@ -77,6 +79,7 @@
 | `src/main/{index,windows,ipc,tray}.ts` | 初始化、背景色、资源加载、窗口和退出 | R 统一集成 |
 | `src/shared/api.ts`、`src/preload/index.ts` | AppearanceApi 桥接 | R |
 | `package.json`、lock、构建/测试配置 | 资源打包和共用脚本 | P0/R |
+| `build/installer.nsh`、`scripts/gen-assets.mjs`、`resources/tray.ico` | 限定当前用户安装及多尺寸应用图标 | R；图标美术另行确认 |
 | `tests/appearance/`、`tests/ui/appearance/` | 服务/状态/组件测试 | 对应 U 区作者 |
 | `tests/desktop/`、`scripts/verify-desktop-artifact.mjs` | 产物静态验证，不做自动卸载/删数据 | R |
 | `docs/日夜主题与桌面交付验收.md` | 实施阶段填写的真实证据 | R |
@@ -158,6 +161,7 @@ export interface NativeThemePort {
 export interface AppearanceService {
   get(): AppearanceSnapshot
   set(mode: ThemeMode): Promise<AppearanceResult>
+  drain(): Promise<void>
   dispose(): void
 }
 export function createAppearanceService(deps: {
@@ -312,6 +316,7 @@ function set(mode: ThemeMode): Promise<AppearanceResult> {
 ```
 
 `commitMode(mode: ThemeMode): Promise<AppearanceResult>` 在 service 内定义：运行时校验 → 相同偏好返回当前快照 → await store.write → 设置 native.themeSource → 读取 shouldUseDarkColors → revision+1 → 广播。处理 native setter 自触发 updated 时做去重/暂缓，不能一次保存广播两次。通知消费者抛错只记录，不让已成功保存变成业务失败；dispose停止新set并退订原生事件。
+- [ ] 覆盖写盘成功但原生主题设置异常的部分失败：暂不发布新快照，尝试恢复旧native值与旧偏好文件；恢复成功返回UNAVAILABLE并保留旧快照，恢复也失败则进入可见的故障状态、停止后续写入并提示重启恢复，不能继续宣称已保存为旧主题。store读取告警由主进程暂存，首个工作台就绪后展示一次，不在尚未创建窗口时丢失。退出先等待已接收的保存队列，再dispose；通过AppearanceService的 `drain(): Promise<void>` 显式等待队列，未处理的保存故障必须反馈给退出协调者。
 - [ ] 补测试：首次默认system、显式light/dark不随系统变、system即时跟随、快速dark/light串行且最终值正确、相同mode不重复写、损坏配置保留、未知版本回退、临时写入/rename失败、重启read回保存值、dispose无残留监听。所有磁盘测试使用独立临时目录，不读真实userData。
 - [ ] 运行 `npm.cmd test -- tests/appearance/store.test.ts tests/appearance/service.test.ts` 和节点类型检查，通过后提交 `feat(appearance): persist and broadcast desktop theme preference`。
 
@@ -319,7 +324,7 @@ function set(mode: ThemeMode): Promise<AppearanceResult> {
 
 Files：Create renderer/shared/theme/controller.ts、bootstrap.ts、AppearanceSettings.tsx、`tests/appearance/controller.test.ts`、`tests/ui/appearance/settings.test.tsx`。
 
-Interfaces：实现 AppearanceClientPort/Controller；导出 `applyAppearance(root: HTMLElement, snapshot: AppearanceSnapshot): void`；组件 `AppearanceSettings({ api }: { api: AppearanceClientPort }): JSX.Element`。组件只接收API，不自己读写文件或决定窗口尺寸。
+Interfaces：实现 AppearanceClientPort/Controller；导出 `applyAppearance(root: HTMLElement, snapshot: AppearanceSnapshot): void`、`bootstrapAppearance(api: AppearanceClientPort, root: HTMLElement, unavailable: () => void): () => void`，后者返回清理函数；组件 `AppearanceSettings({ api }: { api: AppearanceClientPort }): JSX.Element`。组件只接收API，不自己读写文件或决定窗口尺寸。
 
 - [ ] 写乱序快照测试，先失败再实现：
 
@@ -399,6 +404,8 @@ Interfaces：导出 `registerAppearanceIpc(service: AppearanceService, trusted: 
 
 - [ ] 添加主进程IPC测试：主窗口可set、面板/桌宠可get、子frame/外部来源/非法mode拒绝；get/set payload只含主题字段，不泄漏filePath。`npm.cmd test -- tests/appearance/ipc.test.ts`先因未注册失败，再最小接入。
 - [ ] 在app ready之后、任何窗口创建之前初始化store/service并设置nativeTheme；注入监听适配器并保存dispose。shared/api与preload同一提交新增appearance，不让RendererApi暂时有未实现必选方法。主进程updated向所有已存活窗口发送版本化快照，不反复刷新业务页。
+- [ ] 保护启动阶段的second-instance：数据库和服务未就绪时只记一次“打开工作台”意图，就绪后再执行；不使用未经检查的dbRef非空断言。数据库或资源加载失败时给出本地错误提示和可诊断退出结果，不创建半初始化窗口。增加“第二次启动早于数据库完成”和“启动失败后重试”的测试。
+- [ ] 把外观保存队列加入既有受控退出流程：停止接收新的主题修改，等待service.drain，再与邮箱、提醒、数据库和托盘的清理统一执行。before-quit重入只执行一次；保存/落盘失败需告知并提供重试或明确退出选择，不把隐藏窗口当成退出。测试保存未完成时退出、重复退出、恢复工作台及无残留后台定时器；主进程退出逻辑只由R修改。
 - [ ] 窗口背景随主题设置，普通窗口分别用日夜bg；桌宠保持透明，不调用setBackgroundColor改成纸色。使用show:false配合ready-to-show和renderer主题初始化，核验首次启动、隐藏后重新显示、renderer重载以及切换后新开面板没有亮色闪屏。现有失焦、固定、托盘行为保持。
 - [ ] 独立运行的页面加载统一分流，保留全部安全设置：
 
@@ -414,11 +421,11 @@ export function loadAppPage(win: BrowserWindow, page: 'workbench'|'pet'|'panel')
 生产即使环境残留ELECTRON_RENDERER_URL也不能加载localhost。方法错误处理提供本地启动错误提示和日志，不因缺资源静默驻留后台。若R已经落地等价函数直接复用并补测，不再创建重复实现。
 - [ ] sql.js WASM选择统一的可核验路径：在electron-builder extraResources中明确把 `node_modules/sql.js/dist/sql-wasm.wasm` 复制到 `sql.js/sql-wasm.wasm`，生产使用 `join(process.resourcesPath,'sql.js')`，开发使用app根node_modules路径。同步调整当前读取点，不同时保留互相矛盾的asar.unpacked假设；若其他任务已提供可验证的等价方案，以统一路径和测试为准。
 - [ ] 验证静态import的PNG、CSS、字体回退和所有运行依赖进入产物；预览HTML、Chrome测试profile、.superpowers、.zcode、原始用户文件、真实邮件、日志和凭据不进入安装包。只白名单包含out、必要resources和依赖，不把项目根全量打包。
-- [ ] 完整断开开发服务器，用解包exe运行三个窗口，确认不打开浏览器且无localhost页面请求；关闭网络后本地日历/待办仍工作，邮箱/AI错误状态可理解。窗口安全与资源路径单元测试、类型检查和build通过后提交 `feat(desktop): integrate paper themes with packaged runtime`。
+- [ ] 先以窗口安全、资源路径单元测试、类型检查和build验证代码接线，提交 `feat(desktop): integrate paper themes with packaged runtime`。任务7生成产物后，由任务8执行断开开发服务器的解包/安装exe测试，确认三个窗口不打开浏览器、不依赖localhost页面；此处不把尚未生成产物的真机验收写成完成。
 
 ## 任务 7：Windows安装、升级与数据保护（R）
 
-Files：Modify package.json 的build/必要脚本（lock仅在获准且确有依赖变化时更新）；Create `scripts/verify-desktop-artifact.mjs`、`tests/desktop/packaging.test.ts`。不自动更换appId/productName，也不升级核心依赖。
+Files：Modify package.json 的build/必要脚本（lock仅在获准且确有依赖变化时更新）、`scripts/gen-assets.mjs` 和对应 `resources/tray.ico`；Create `build/installer.nsh`、`scripts/verify-desktop-artifact.mjs`、`tests/desktop/packaging.test.ts`。不自动更换appId/productName，也不升级核心依赖。
 
 Interfaces：产物检查脚本接受命令行唯一参数“解包产物绝对路径”，只读取路径下文件、app.asar清单及配置，输出缺失项并设置非零退出码；不能安装、卸载或清理目录。asar解析使用已有electron-builder依赖提供的工具，不为文档任务安装工具。
 
@@ -447,6 +454,7 @@ it('桌面安装有稳定身份且不会默认删除个人数据', () => {
     "perMachine": false,
     "allowElevation": false,
     "allowToChangeInstallationDirectory": true,
+    "include": "build/installer.nsh",
     "createDesktopShortcut": true,
     "createStartMenuShortcut": true,
     "deleteAppDataOnUninstall": false,
@@ -456,10 +464,34 @@ it('桌面安装有稳定身份且不会默认删除个人数据', () => {
 ```
 
 不在未查当前schema时盲粘配置；如果现有版本不支持某选项，使用官方支持的等价配置并说明验证，不能以关闭安全校验或更高权限绕过。
+- [ ] 明确安装范围：当前仓库的NSIS模板即使perMachine=false仍可能显示所有用户选项，allowElevation=false也不等于固定当前用户。使用已核对的customInstallMode钩子仅在安装器中限定当前用户；不覆盖卸载器对既有安装范围的判断：
+
+```nsh
+; build/installer.nsh
+!macro customInstallMode
+  !ifndef BUILD_UNINSTALLER
+    StrCpy $isForceCurrentInstall "1"
+  !endif
+!macroend
+```
+
+配置测试校验include路径，真实标准用户安装验证没有强制UAC请求。已存在机器级安装时，不自动切换范围、擦除旧安装或迁移数据；提示需要单独确认迁移，在该场景验证完成前不承诺无缝升级。
+- [ ] 保留现有应用标识，为ICO补齐16/24/32/48/64/128/256px条目，256px条目可使用PNG编码。生成过程不改桌宠立绘、不自动设计新Logo；图标视觉重绘需另行确认。编写ICO头/目录测试并在安装器、任务栏、快捷方式、托盘和卸载入口目视检查；只验证某一张PNG存在不足以通过。
+
+```ts
+it('Windows图标包含小图与高分辨率条目', () => {
+  const ico = readFileSync('resources/tray.ico')
+  expect(ico.readUInt16LE(2)).toBe(1)
+  const count = ico.readUInt16LE(4)
+  const sizes = Array.from({ length: count }, (_, i) => ico[6 + i * 16] || 256)
+  expect(sizes).toEqual(expect.arrayContaining([16, 32, 48, 256]))
+})
+```
 - [ ] 产物脚本验证exe、app.asar、renderer三入口、静态assets、sql.js WASM、托盘/应用图标和运行依赖清单。检查包内无localhost硬编码启动、个人目录和预览服务器；只扫描执行路径配置，不能误把库文档出现localhost算作启动依赖。脚本路径校验失败时停止，不遍历整个磁盘。
 - [ ] 先运行 `npm.cmd run build` 和 `npm.cmd exec -- electron-builder --win --dir`；静态验证通过后运行 `npm.cmd run dist` 生成NSIS。开发机缺缓存导致需要下载时如实报告依赖，不声称安装包已生成。记录产物名、版本、SHA-256及签名状态。
 - [ ] 安装/升级/卸载均按用户危险操作机制单独说明目标和影响并取得确认；优先干净Windows测试账户或虚拟机。测试从exe及桌面/开始菜单启动、单实例、托盘恢复/退出、重启后主题保持，不要求机器预装Node或打开任何服务。
 - [ ] 用合成数据验证旧版升级至新版后事项、账号和外观偏好保留；跨版本数据库迁移归业务模块，不在主题任务复制或修改。卸载仅移除程序和快捷方式，确认userData保留，再由用户决定是否另行清理；测试过程不得使用真实邮箱/模型凭据或主动删除真实数据。
+- [ ] 运行中升级须先走同一安全退出流程，未完成保存时不直接强杀。对于数据库版本高于旧应用支持范围的降级，旧应用应拒绝写入并给出说明，不能自动降schema；需要恢复时只使用用户已验证的备份流程。分别验证中文/空格安装路径、标准用户可写数据目录和程序目录只读的情形。
 - [ ] 输出本地安装与升级记录，分别标明静态产物通过/解包运行通过/NSIS安装通过/升级卸载通过/签名状态。未完成的项保留未验证，不以配置存在代替成功安装。提交 `build(desktop): verify standalone Windows delivery`。
 
 ## 任务 8：跨窗口回归、视觉验收与交付（R统筹，各区提供证据）
@@ -498,6 +530,21 @@ git diff --check
 | 保留数据及安全边界 | 任务3、6、7、8 | 持久化错误、来源校验、升级卸载的真实记录 |
 
 后续执行可按已授权的并行工作规范派发U-V/U-N/U-I并滚动验收，或使用executing-plans按检查点推进。当前请求的交付物仅为这份独立计划，未开始主题改造、安装打包或公开发布。
+
+### 执行阶段验收记录模板
+
+记录以实际检查对象为单位填写，必须写明版本或commit、运行环境、操作、预期与实际结果，以及证据位置。静态检查、模拟测试和Windows实际运行分开记录；任一项不具备环境时使用“未验证”而非推测通过。
+
+| 检查项 | 证据要求 | 当前状态 |
+| --- | --- | --- |
+| 日夜色彩与组件状态 | 当前代码的对比度测试及真实Electron截图 | 未实施/未验证 |
+| 排版不被预览锁定 | 差异检查与单独的布局决策记录 | 已写入计划约束，实施时核对 |
+| 偏好持久化与窗口同步 | 成功、失败、乱序、重启、跟随系统测试 | 未实施/未验证 |
+| 透明桌宠与业务页面 | 三窗口、邮箱安全正文、长内容和缩放证据 | 未验证 |
+| 本地资源完整性 | asar清单、WASM、ICO、PNG、运行依赖校验 | 未验证 |
+| 独立exe启动 | 无浏览器/Node/npm/预览服务的干净环境运行记录 | 未验证 |
+| NSIS安装与数据保留 | 已获授权的安装、升级、卸载、重装记录 | 未验证 |
+| 签名与素材公开许可 | 签名核验及资源授权依据 | 未核实，不自动公开发布 |
 
 ## 6. 实施参考
 

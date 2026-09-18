@@ -2,6 +2,12 @@ import React from 'react'
 import { createRoot } from 'react-dom/client'
 import App from './App'
 import '../shared/ui.css'
+import { bootstrapAppearance } from '../shared/theme/bootstrap'
+
+// 渲染前启动主题控制器:失败时按系统外观回退,不会永久白屏
+bootstrapAppearance(window.api.appearance, document.documentElement, () => {
+  console.warn('[workbench] 外观服务不可用,已回退为系统外观')
+})
 
 /** 全局错误兜底:渲染层任何未捕获异常都不允许白屏,必须留下可见错误信息 */
 class RootErrorBoundary extends React.Component<{ children: React.ReactNode }, { error: Error | null }> {
@@ -21,7 +27,7 @@ class RootErrorBoundary extends React.Component<{ children: React.ReactNode }, {
   render(): React.ReactNode {
     if (this.state.error) {
       return (
-        <div style={{ padding: 24, fontFamily: 'monospace', color: '#b42318', whiteSpace: 'pre-wrap' }}>
+        <div style={{ padding: 24, fontFamily: 'monospace', color: 'var(--ui-error-text)', whiteSpace: 'pre-wrap' }}>
           <h2 style={{ marginTop: 0 }}>页面出现异常(已拦截,不会丢失数据)</h2>
           <div>{this.state.error.message}</div>
           <button type="button" style={{ marginTop: 12 }} onClick={() => this.setState({ error: null })}>

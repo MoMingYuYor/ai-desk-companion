@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { AppInfo, ProviderInfo, ProviderInput, ProviderTestResult } from '../../../shared/types'
 import { Toast, useSubscribe, useToast } from '../../shared/util'
+import { AppearanceSettings } from '../../shared/theme/AppearanceSettings'
+import type { AppearanceClientPort } from '../../shared/theme/controller'
 
 interface Props {
   refreshKey: number
+  /** 由入口注入的外观桥;缺省时回退 window.api.appearance */
+  appearance?: AppearanceClientPort
 }
 
-export function SettingsPage({ refreshKey }: Props): JSX.Element {
+export function SettingsPage({ refreshKey, appearance }: Props): JSX.Element {
+  const appearanceApi = appearance ?? window.api?.appearance
   const [providers, setProviders] = useState<ProviderInfo[]>([])
   const [editor, setEditor] = useState<ProviderInput | null>(null)
   const [info, setInfo] = useState<AppInfo | null>(null)
@@ -98,6 +103,16 @@ export function SettingsPage({ refreshKey }: Props): JSX.Element {
           </div>
         ))}
       </div>
+
+      {appearanceApi && (
+        <div className="card" style={{ marginTop: 12 }}>
+          <h3>外观</h3>
+          <div className="muted" style={{ marginBottom: 10 }}>
+            选择应用的整体外观。选择保存在本机,重启后保持;工作台、信息面板与桌宠气泡会同步切换。
+          </div>
+          <AppearanceSettings api={appearanceApi} />
+        </div>
+      )}
 
       <div className="card" style={{ marginTop: 12 }}>
         <h3>数据</h3>

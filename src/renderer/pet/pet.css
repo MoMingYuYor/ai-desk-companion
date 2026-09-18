@@ -31,7 +31,7 @@ html, body, #root {
 }
 
 .pet-character-button:focus-visible {
-  outline: 2px solid #8971b8;
+  outline: 2px solid var(--ui-focus-ring);
   outline-offset: 2px;
 }
 
@@ -115,7 +115,7 @@ html, body, #root {
     transform: none !important;
   }
   .pet-press[data-pressed="true"] {
-    outline: 1px solid #8971b8;
+    outline: 1px solid var(--ui-focus-ring);
   }
 }
 
@@ -134,14 +134,15 @@ html, body, #root {
 }
 
 .pet-bubble-item {
-  background: rgba(35, 42, 59, 0.92);
-  color: #fff;
+  background: var(--ui-surface);
+  color: var(--ui-text);
+  border: 1px solid var(--ui-border);
   padding: 6px 10px;
   border-radius: 10px;
   font-size: 12px;
   line-height: 18px;
   max-width: 288px;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+  box-shadow: var(--ui-shadow-soft);
   word-break: break-all;
   display: -webkit-box;
   -webkit-line-clamp: 2;

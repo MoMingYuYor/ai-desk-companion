@@ -20,6 +20,6 @@
       "@main/*": ["src/main/*"]
     }
   },
-  "include": ["electron.vite.config.ts", "vitest.config.ts", "src/main/**/*", "src/preload/**/*", "src/shared/**/*", "src/renderer/pet/*.ts", "scripts/**/*", "tests/**/*.ts"],
+  "include": ["electron.vite.config.ts", "vitest.config.ts", "src/main/**/*", "src/preload/**/*", "src/shared/**/*", "src/renderer/pet/*.ts", "src/renderer/shared/theme/*.ts", "scripts/**/*", "tests/**/*.ts"],
   "exclude": ["tests/ui/**", "node_modules", "out"]
 }

@@ -17,6 +17,7 @@ import type {
   EventInput,
   ExtractedSchoolEvent,
   Material,
+  PendingImport,
   PendingItem,
   ProfileFact,
   ProviderInfo,
@@ -459,6 +460,47 @@ function safeParse(s: string | null | undefined): AnalysisPayload {
   } catch {
     return {}
   }
+}
+
+// ---------- 课表/校历导入待确认 ----------
+
+/** 每个导入类会话取最新一条 status=done 且含可导入内容的提取结果 */
+export function listPendingImports(db: SqliteDb, limit = 3): PendingImport[] {
+  const rows = db.all<{
+    id: string
+    conversation_id: string
+    payload: string | null
+    created_at: string
+    kind: string
+    title: string
+  }>(
+    `SELECT a.id, a.conversation_id, a.payload, a.created_at, c.kind, c.title
+     FROM analyses a JOIN conversations c ON c.id = a.conversation_id
+     WHERE c.kind IN ('timetable','school-calendar') AND a.status = 'done' AND a.payload IS NOT NULL
+     ORDER BY a.created_at DESC`
+  )
+  const seenConvs = new Set<string>()
+  const out: PendingImport[] = []
+  for (const r of rows) {
+    if (seenConvs.has(r.conversation_id)) continue
+    const payload = safeParse(r.payload)
+    if ((payload.courses?.length ?? 0) === 0 && (payload.schoolEvents?.length ?? 0) === 0) continue
+    seenConvs.add(r.conversation_id)
+    out.push({
+      analysisId: r.id,
+      conversationId: r.conversation_id,
+      kind: r.kind === 'timetable' ? 'timetable' : 'school-calendar',
+      title: r.title,
+      createdAt: r.created_at,
+      payload
+    })
+    if (out.length >= limit) break
+  }
+  return out
+}
+
+export function markImportHandled(db: SqliteDb, analysisId: string): void {
+  db.run("UPDATE analyses SET status = 'handled' WHERE id = ?", [analysisId])
 }
 
 // ---------- events ----------

@@ -1,0 +1,111 @@
+/* 基础交互状态:焦点、选中、滚动条、placeholder、减少动态、装饰 opt-in。
+   只消费 palettes.css/tokens.css 的变量,不写死颜色,不规定布局。 */
+
+/* 主题就绪前隐藏内容,避免错误主题闪屏;窗口背景由默认色板保持一致 */
+html[data-theme-boot='pending'] #root {
+  visibility: hidden;
+}
+
+/* 原生控件(滚动条/表单)配色方案与主题一致;bootstrap 也会写内联 colorScheme */
+:root,
+[data-theme='light'] {
+  color-scheme: light;
+}
+[data-theme='dark'] {
+  color-scheme: dark;
+}
+
+/* 键盘焦点:至少 2px 实线,不依赖阴影 */
+:focus-visible {
+  outline: var(--ui-focus-width) solid var(--ui-focus-ring);
+  outline-offset: 2px;
+}
+button:focus:not(:focus-visible),
+input:focus:not(:focus-visible),
+textarea:focus:not(:focus-visible),
+select:focus:not(:focus-visible),
+[tabindex]:focus:not(:focus-visible) {
+  outline: none;
+}
+
+::selection {
+  background: var(--ui-accent-surface);
+  color: var(--ui-text);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--ui-text-muted);
+  opacity: 1;
+}
+
+/* 滚动条随主题,不抢视觉 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--ui-control-border) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--ui-control-border);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 正文与密集内容容器:纯色,不叠纹理 */
+.content-surface {
+  background: var(--ui-surface);
+  color: var(--ui-text);
+}
+
+/* 纸张装饰仅 opt-in:低透明度圆点纹理,只允许用于低信息密度背景 */
+.paper-decoration {
+  background-image: radial-gradient(var(--ui-border) 1px, transparent 1px);
+  background-size: 18px 18px;
+}
+
+/* 主题服务不可用时的非阻断提示(由 bootstrap 注入/移除) */
+.theme-fallback-notice {
+  position: fixed;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 999;
+  background: var(--ui-warning-surface);
+  color: var(--ui-warning-text);
+  border: 1px solid var(--ui-control-border);
+  border-radius: var(--ui-radius-sm);
+  padding: 6px 14px;
+  font-size: 12px;
+  box-shadow: var(--ui-shadow-soft);
+  cursor: pointer;
+}
+
+/* 外观设置错误提示:role=alert 配套样式 */
+.appearance-error {
+  align-self: flex-start;
+  background: var(--ui-error-surface);
+  color: var(--ui-error-text);
+  border: 1px solid var(--ui-control-border);
+  border-radius: var(--ui-radius-sm);
+  padding: 6px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* 减少动态效果时关闭非必要过渡与动画 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

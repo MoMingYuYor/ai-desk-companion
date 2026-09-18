@@ -1,0 +1,8 @@
+/* 非排版型状态令牌:圆角、焦点、动效。这里不放栏宽/列数/卡片高度等布局量。 */
+
+:root {
+  --ui-radius: 10px;
+  --ui-radius-sm: 8px;
+  --ui-focus-width: 2px;
+  --ui-transition-fast: 120ms ease-out;
+}

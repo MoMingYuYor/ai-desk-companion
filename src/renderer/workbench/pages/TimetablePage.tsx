@@ -5,6 +5,7 @@ import type {
   CourseOccurrence,
   ExtractedCourse,
   ExtractedSchoolEvent,
+  PendingImport,
   SchoolEvent,
   Semester
 } from '../../../shared/types'
@@ -25,6 +26,8 @@ export function TimetablePage({ refreshKey }: Props): JSX.Element {
   const [overrideEditor, setOverrideEditor] = useState<Course | null>(null)
   const [semEditor, setSemEditor] = useState<Semester | 'new' | null>(null)
   const [importWizard, setImportWizard] = useState<null | 'timetable' | 'school-calendar'>(null)
+  const [wizardInitial, setWizardInitial] = useState<{ analysisId: string; payload: AnalysisPayload } | null>(null)
+  const [pendingImports, setPendingImports] = useState<PendingImport[]>([])
   const [toast, showToast] = useToast()
 
   const reload = useCallback(async (): Promise<void> => {
@@ -48,11 +51,28 @@ export function TimetablePage({ refreshKey }: Props): JSX.Element {
     }
   }, [activeSem])
 
+  const reloadPending = useCallback((): void => {
+    void window.api.listPendingImports().then(setPendingImports)
+  }, [])
+
   useEffect(() => {
     void reload()
-  }, [reload, refreshKey])
+    reloadPending()
+  }, [reload, reloadPending, refreshKey])
 
   useSubscribe('evt:data-changed', useCallback(() => void reload(), [reload]))
+  // 桌宠拖放自动路由的提取结果到达时刷新待确认清单
+  useSubscribe('evt:analysis-updated', useCallback(() => reloadPending(), [reloadPending]))
+
+  const openPendingImport = (pi: PendingImport): void => {
+    setWizardInitial({ analysisId: pi.analysisId, payload: pi.payload })
+    setImportWizard(pi.kind)
+  }
+
+  const dismissImport = async (analysisId: string): Promise<void> => {
+    await window.api.markImportHandled(analysisId)
+    reloadPending()
+  }
 
   const today = toDateStr(new Date())
   const currentWeek = activeSem ? weekOfDate(activeSem.startDate, today) : 0
@@ -93,17 +113,45 @@ export function TimetablePage({ refreshKey }: Props): JSX.Element {
         )}
         <div className="spacer" />
         <button onClick={() => setSemEditor('new')}>学期设置</button>
-        <button onClick={() => setImportWizard('timetable')}>导入课表</button>
-        <button onClick={() => setImportWizard('school-calendar')}>导入校历</button>
+        <button onClick={() => { setWizardInitial(null); setImportWizard('timetable') }}>导入课表</button>
+        <button onClick={() => { setWizardInitial(null); setImportWizard('school-calendar') }}>导入校历</button>
         <button className="primary" onClick={() => setCourseEditor('new')} disabled={!activeSem}>
           + 添加课程
         </button>
       </div>
 
+      {pendingImports.length > 0 && (
+        <div className="card" style={{ marginBottom: 10 }}>
+          <h3>待确认导入(来自拖拽分析)</h3>
+          {pendingImports.map((pi) => (
+            <div key={pi.analysisId} className="list-row">
+              <span className={`chip ${pi.kind === 'timetable' ? 'course' : 'school'}`}>
+                {pi.kind === 'timetable' ? '课表' : '校历'}
+              </span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div>{pi.title || '提取结果'}</div>
+                <div className="muted">
+                  {pi.createdAt.slice(0, 16).replace('T', ' ')} ·{' '}
+                  {pi.kind === 'timetable'
+                    ? `${pi.payload.courses?.length ?? 0} 门课程`
+                    : `${pi.payload.schoolEvents?.length ?? 0} 条校历`}
+                </div>
+              </div>
+              <button className="primary" onClick={() => openPendingImport(pi)}>
+                查看并导入
+              </button>
+              <button className="ghost" onClick={() => void dismissImport(pi.analysisId)}>
+                忽略
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       {!activeSem && (
         <div className="card" style={{ flex: 1 }}>
           <div className="empty">
-            先设置学期(开学日期 = 第一教学周周一),再把课表图片/文件通过"导入课表"交给 AI 提取。
+            还没有设置学期。点击上方"导入课表"把课表图片/文件交给 AI 提取,确认导入时会自动创建学期;也可以先"学期设置"。
           </div>
         </div>
       )}
@@ -201,16 +249,22 @@ export function TimetablePage({ refreshKey }: Props): JSX.Element {
         />
       )}
 
-      {/* 导入向导 */}
-      {importWizard && activeSem && (
+      {/* 导入向导:无学期时也可用,确认导入时自动创建学期 */}
+      {importWizard && (
         <ImportWizard
           kind={importWizard}
           semester={activeSem}
-          onClose={() => setImportWizard(null)}
+          initial={wizardInitial}
+          onClose={() => {
+            setImportWizard(null)
+            setWizardInitial(null)
+          }}
           onDone={async (msg) => {
             setImportWizard(null)
+            setWizardInitial(null)
             showToast(msg)
             await reload()
+            reloadPending()
           }}
         />
       )}
@@ -427,55 +481,65 @@ function OverrideEditor({
 function ImportWizard({
   kind,
   semester,
+  initial,
   onClose,
   onDone
 }: {
   kind: 'timetable' | 'school-calendar'
-  semester: Semester
+  semester: Semester | null
+  initial?: { analysisId: string; payload: AnalysisPayload } | null
   onClose: () => void
   onDone: (msg: string) => Promise<void>
 }): JSX.Element {
   const [paths, setPaths] = useState<string[]>([])
   const [text, setText] = useState('')
   const [running, setRunning] = useState(false)
-  const [error, setError] = useState('')
-  const [payload, setPayload] = useState<AnalysisPayload | null>(null)
-  const [startDate, setStartDate] = useState(semester.startDate)
-  const [weeks, setWeeks] = useState(semester.weeks)
-  const [courses, setCourses] = useState<ExtractedCourse[]>([])
-  const [events, setEvents] = useState<ExtractedSchoolEvent[]>([])
+  const [payload, setPayload] = useState<AnalysisPayload | null>(initial?.payload ?? null)
+  const [analysisId, setAnalysisId] = useState(initial?.analysisId ?? '')
+  const [startDate, setStartDate] = useState(semester?.startDate ?? initial?.payload.semester?.startDate ?? '')
+  const [weeks, setWeeks] = useState(semester?.weeks ?? initial?.payload.semester?.weeks ?? 20)
+  const [semesterName, setSemesterName] = useState(initial?.payload.semester?.name ?? semester?.name ?? '2026-2027-1')
+  const [courses, setCourses] = useState<ExtractedCourse[]>(initial?.payload.courses ?? [])
+  const [events, setEvents] = useState<ExtractedSchoolEvent[]>(initial?.payload.schoolEvents ?? [])
   const [existingCourses, setExistingCourses] = useState<Course[]>([])
   const [hover, setHover] = useState(false)
 
   useEffect(() => {
+    if (!semester) return
     void window.api.listCourses(semester.id).then(setExistingCourses)
-  }, [semester.id])
+  }, [semester])
 
-  const run = async (): Promise<void> => {
+  const run = (): void => {
+    if (running) return
     setRunning(true)
-    setError('')
-    try {
-      const input = { texts: text.trim() ? [{ name: '粘贴内容', content: text }] : [], files: paths }
-      const result =
-        kind === 'timetable'
-          ? await window.api.importTimetable(input)
-          : await window.api.importSchoolCalendar(input)
-      const p = (result.payload ?? {}) as AnalysisPayload
-      setPayload(p)
-      setCourses(p.courses ?? [])
-      setEvents(p.schoolEvents ?? [])
-      if (p.semester?.startDate) setStartDate(p.semester.startDate)
-      if (p.semester?.weeks) setWeeks(p.semester.weeks)
-      if (!p.courses && !p.schoolEvents) setError('没有提取到内容' + (p.questions ? ':' + p.questions.join(';') : ''))
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setRunning(false)
+    const input = { texts: text.trim() ? [{ name: '粘贴内容', content: text }] : [], files: paths }
+    // 后台提取:不等待结果,立即关闭向导,期间可正常使用其他页面。
+    // 完成后主进程经桌宠气泡提醒,结果进入课表页"待确认导入"等待用户确认。
+    const request =
+      kind === 'timetable' ? window.api.importTimetable(input) : window.api.importSchoolCalendar(input)
+    void request.then(
+      () => undefined,
+      () => undefined
+    )
+    void onDone('正在后台提取,期间可以正常使用其他功能;完成后桌宠会提醒你,结果在课表页的「待确认导入」里')
+  }
+
+  /** 确认时没有学期则按当前表单自动创建,返回可用的学期 id */
+  const ensureSemesterId = async (): Promise<string> => {
+    if (semester) {
+      await window.api.saveSemester({ id: semester.id, name: semester.name, startDate, weeks })
+      return semester.id
     }
+    const saved = await window.api.saveSemester({
+      name: semesterName.trim() || '2026-2027-1',
+      startDate,
+      weeks
+    })
+    return saved.id
   }
 
   const confirmTimetable = async (): Promise<void> => {
-    await window.api.saveSemester({ id: semester.id, name: semester.name, startDate, weeks })
+    const semesterId = await ensureSemesterId()
     let added = 0
     let skipped = 0
     for (const c of courses) {
@@ -485,7 +549,7 @@ function ImportWizard({
         continue
       }
       await window.api.saveCourse({
-        semesterId: semester.id,
+        semesterId,
         name: c.name,
         weekday: c.weekday,
         startTime: c.startTime,
@@ -496,15 +560,17 @@ function ImportWizard({
       })
       added++
     }
-    const qs = payload?.questions?.length ? `(待确认:${payload.questions.join(';')})` : ''
+    if (analysisId) await window.api.markImportHandled(analysisId)
+    const qs = payload?.questions?.length ? `(待确认:${payload.questions.slice(0, 3).join(';')})` : ''
     await onDone(`已导入 ${added} 门课程${skipped ? `,跳过重复 ${skipped} 门` : ''}${qs}`)
   }
 
   const confirmCalendar = async (): Promise<void> => {
+    const semesterId = await ensureSemesterId()
     let added = 0
     for (const e of events) {
       await window.api.saveSchoolEvent({
-        semesterId: semester.id,
+        semesterId,
         type: e.type,
         title: e.title,
         startDate: e.startDate,
@@ -513,6 +579,7 @@ function ImportWizard({
       })
       added++
     }
+    if (analysisId) await window.api.markImportHandled(analysisId)
     await onDone(`已导入 ${added} 条校历信息`)
   }
 
@@ -562,35 +629,30 @@ function ImportWizard({
               value={text}
               onChange={(e) => setText(e.target.value)}
             />
-            {error && <div className="muted" style={{ color: 'var(--danger)' }}>{error}</div>}
+            <div className="muted">点击"开始提取"后窗口会立即关闭,提取在后台进行,期间可以正常使用其他功能。</div>
             <div className="row" style={{ justifyContent: 'flex-end' }}>
               <button onClick={onClose}>取消</button>
-              <button className="primary" disabled={running || (paths.length === 0 && !text.trim())} onClick={() => void run()}>
-                {running ? 'AI 提取中…' : '开始提取'}
+              <button className="primary" disabled={running || (paths.length === 0 && !text.trim())} onClick={() => run()}>
+                开始提取
               </button>
-            </div>
-          </>
-        )}
-        {payload && !preview && (
-          <>
-            <div className="muted">{error || '模型没有提取到可导入的内容'}</div>
-            {payload.questions && payload.questions.length > 0 && (
-              <div>
-                {payload.questions.map((q, i) => (
-                  <div key={i} className="muted">
-                    ❓ {q}
-                  </div>
-                ))}
-              </div>
-            )}
-            <div className="row" style={{ justifyContent: 'flex-end' }}>
-              <button onClick={onClose}>关闭</button>
             </div>
           </>
         )}
         {preview && kind === 'timetable' && (
           <>
             <div className="form-grid">
+              {!semester && (
+                <>
+                  <label>学期名称</label>
+                  <input
+                    value={semesterName}
+                    onChange={(e) => setSemesterName(e.target.value)}
+                    placeholder="如 2026-2027-1"
+                  />
+                  <label />
+                  <div className="muted">尚未设置学期,确认导入时会自动创建。</div>
+                </>
+              )}
               <label>开学日期</label>
               <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
               <label>总周数</label>
@@ -643,6 +705,18 @@ function ImportWizard({
         {preview && kind === 'school-calendar' && (
           <>
             <div className="form-grid">
+              {!semester && (
+                <>
+                  <label>学期名称</label>
+                  <input
+                    value={semesterName}
+                    onChange={(e) => setSemesterName(e.target.value)}
+                    placeholder="如 2026-2027-1"
+                  />
+                  <label />
+                  <div className="muted">尚未设置学期,确认导入时会自动创建。</div>
+                </>
+              )}
               <label>开学日期</label>
               <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
               <label>总周数</label>

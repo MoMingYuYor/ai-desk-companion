@@ -16,6 +16,7 @@ import type {
   MaterialIntakeInput,
   ModelSwitchNotice,
   ModelProtocol,
+  PendingImport,
   PendingItem,
   ProfileFact,
   ProviderInfo,
@@ -91,6 +92,8 @@ export const Channels = {
   SchoolEventsDelete: 'school-events:delete',
   ImportTimetable: 'import:timetable',
   ImportSchoolCalendar: 'import:school-calendar',
+  PendingImports: 'imports:pending',
+  ImportHandled: 'imports:handled',
   // profile
   ProfileList: 'profile:list',
   ProfileSave: 'profile:save',
@@ -152,6 +155,8 @@ export interface ImportPreview {
   conversationId: string
   analysisId: string
   payload: unknown
+  /** 提取失败的原因;payload 为空时用于界面诊断 */
+  error?: string | null
 }
 
 export interface RendererApi {
@@ -197,6 +202,8 @@ export interface RendererApi {
   updatePending(id: string, patch: Partial<Pick<PendingItem, 'status' | 'title' | 'notes'>>): Promise<void>
   deletePending(id: string): Promise<void>
   // timetable
+  listPendingImports(limit?: number): Promise<PendingImport[]>
+  markImportHandled(analysisId: string): Promise<void>
   listSemesters(): Promise<Semester[]>
   saveSemester(input: { id?: string; name: string; startDate: string; weeks: number }): Promise<Semester>
   deleteSemester(id: string): Promise<void>
@@ -240,4 +247,4 @@ export interface RendererApi {
   on(channel: string, listener: (...args: unknown[]) => void): () => void
 }
 
-export type { Analysis, BackupFile, CalendarEvent, ChatMessage, ConfirmResult, Conversation, Course, CourseOverride, CourseOccurrence, DayAgenda, EventInput, Material, ModelProtocol, ModelSwitchNotice, PendingItem, ProfileFact, ProviderInfo, ProviderInput, ProviderTestResult, ReminderNotice, SchoolEvent, Semester, Todo, TodoInput }
+export type { Analysis, BackupFile, CalendarEvent, ChatMessage, ConfirmResult, Conversation, Course, CourseOverride, CourseOccurrence, DayAgenda, EventInput, Material, ModelProtocol, ModelSwitchNotice, PendingImport, PendingItem, ProfileFact, ProviderInfo, ProviderInput, ProviderTestResult, ReminderNotice, SchoolEvent, Semester, Todo, TodoInput }

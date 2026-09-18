@@ -1,5 +1,5 @@
 // 应用入口:数据库、引擎、提醒、窗口、托盘与单实例锁
-import { app, BrowserWindow, Notification } from 'electron'
+import { app, BrowserWindow, Notification, nativeTheme, dialog } from 'electron'
 import { join } from 'node:path'
 import { openDatabase } from './db/connection'
 import { getProviderApiKey, initSchema } from './db/dao'
@@ -8,7 +8,16 @@ import { Engine } from './services/engine'
 import { ModelRouter } from './services/modelRouter'
 import { ReminderService } from './services/reminder'
 import { registerIpcHandlers, setDataChangedListener } from './ipc'
-import { createPetWindow, createWorkbenchWindow, broadcastToAll, isQuitting, markQuitting } from './windows'
+import {
+  createPetWindow,
+  createWorkbenchWindow,
+  broadcastToAll,
+  getPanelWindow,
+  getPetWindow,
+  getWorkbenchWindow,
+  isQuitting,
+  markQuitting
+} from './windows'
 import { createTray, destroyTray } from './tray'
 import { markPetBubble, markPetState } from './petBridge'
 import { createPetActivityRegistry } from './pet/activity'
@@ -16,6 +25,10 @@ import type { PetActivityNotice } from '../shared/pet'
 import { MailService } from './mail/service'
 import type { CredentialStorage } from './mail/credentials'
 import { safeStorage, powerMonitor } from 'electron'
+import { createAppearanceStore } from './appearance/store'
+import { createAppearanceService, type AppearanceService, type NativeThemePort } from './appearance/service'
+import { registerAppearanceIpc } from './appearance/ipc'
+import { AppearanceChannels } from '../shared/appearance'
 
 const safeStorageAdapter: CredentialStorage = {
   isEncryptionAvailable: () => safeStorage.isEncryptionAvailable(),
@@ -38,12 +51,54 @@ function broadcastPetActivity(notice: PetActivityNotice): void {
 function bootstrap(): void {
   let reminders: ReminderService | null = null
   let dbRef: Awaited<ReturnType<typeof openDatabase>> | null = null
+  let appearanceService: AppearanceService | null = null
+  let unregisterAppearance: (() => void) | null = null
 
   app.on('second-instance', () => {
-    createWorkbenchWindow(dbRef!.db)
+    // 数据库尚未就绪时不创建半初始化窗口,仅忽略本次唤起
+    if (dbRef) createWorkbenchWindow(dbRef.db)
   })
 
   app.whenReady().then(async () => {
+    // 外观服务必须先于任何窗口创建:nativeTheme.themeSource 决定窗口初始配色
+    const appearanceWarnings: string[] = []
+    const store = createAppearanceStore(join(app.getPath('userData'), 'appearance.json'), (message) => {
+      appearanceWarnings.push(message)
+      console.warn('[appearance]', message)
+    })
+    const native: NativeThemePort = {
+      get themeSource() {
+        return nativeTheme.themeSource
+      },
+      set themeSource(value) {
+        nativeTheme.themeSource = value
+      },
+      get shouldUseDarkColors() {
+        return nativeTheme.shouldUseDarkColors
+      },
+      onUpdated: (listener) => {
+        nativeTheme.on('updated', listener)
+        return () => nativeTheme.removeListener('updated', listener)
+      }
+    }
+    appearanceService = createAppearanceService({
+      store,
+      native,
+      emit: (snapshot) => broadcastToAll(AppearanceChannels.changed, snapshot)
+    })
+    unregisterAppearance = registerAppearanceIpc(appearanceService, (event, write) => {
+      // 只接受本应用三个窗口的主 frame;写权限仅工作台
+      const frame = event.senderFrame
+      if (frame && frame.parent) return false
+      const senderId = event.sender.id
+      const workbench = getWorkbenchWindow()
+      const owned = [workbench, getPetWindow(), getPanelWindow()].some(
+        (win) => win && !win.isDestroyed() && win.webContents.id === senderId
+      )
+      if (!owned) return false
+      return write ? workbench !== null && workbench.webContents.id === senderId : true
+    })
+
     const sqlJsDistDir = app.isPackaged
       ? join(process.resourcesPath, 'app.asar.unpacked', 'node_modules', 'sql.js', 'dist')
       : join(app.getAppPath(), 'node_modules', 'sql.js', 'dist')
@@ -104,6 +159,25 @@ function bootstrap(): void {
 
     createWorkbenchWindow(db)
     createPetWindow(db)
+
+    // 外观偏好读取告警暂存至此,首个工作台就绪后一次性提示,不阻断启动
+    if (appearanceWarnings.length > 0) {
+      const win = getWorkbenchWindow()
+      const showWarnings = (): void => {
+        void dialog.showMessageBox({
+          type: 'warning',
+          title: '外观设置',
+          message: '外观偏好已回退为默认值',
+          detail: appearanceWarnings.join('\n'),
+          buttons: ['知道了']
+        })
+      }
+      if (win && !win.isDestroyed() && win.webContents.isLoading()) {
+        win.once('ready-to-show', showWarnings)
+      } else {
+        showWarnings()
+      }
+    }
     createTray(db, () => {
       markQuitting()
       app.quit()
@@ -129,6 +203,8 @@ function bootstrap(): void {
       void mail.stop()
     })
     app.on('will-quit', () => {
+      unregisterAppearance?.()
+      appearanceService?.dispose()
       try {
         flush()
       } catch (err) {

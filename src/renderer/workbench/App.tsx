@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { OverviewPage } from './pages/OverviewPage'
 import { ChatPage } from './pages/ChatPage'
 import { CalendarPage } from './pages/CalendarPage'
 import { TodosPage } from './pages/TodosPage'
@@ -10,9 +11,10 @@ import { MailPage } from './mail/MailPage'
 import { useSubscribe } from '../shared/util'
 import type { PendingItem } from '../../shared/types'
 
-type PageName = 'chat' | 'mail' | 'calendar' | 'todos' | 'pending' | 'timetable' | 'profile' | 'settings'
+type PageName = 'overview' | 'chat' | 'mail' | 'calendar' | 'todos' | 'pending' | 'timetable' | 'profile' | 'settings'
 
 const NAV: Array<{ key: PageName; icon: string; label: string }> = [
+  { key: 'overview', icon: '🏠', label: '今日概览' },
   { key: 'chat', icon: '💬', label: '工作台' },
   { key: 'mail', icon: '📧', label: '邮箱' },
   { key: 'calendar', icon: '📅', label: '日历' },
@@ -24,7 +26,7 @@ const NAV: Array<{ key: PageName; icon: string; label: string }> = [
 ]
 
 export default function App(): JSX.Element {
-  const [page, setPage] = useState<PageName>('chat')
+  const [page, setPage] = useState<PageName>('overview')
   const [pendingCount, setPendingCount] = useState(0)
   const [refreshKey, setRefreshKey] = useState(0)
   const [petAction, setPetAction] = useState<{ action: string; at: number } | null>(null)
@@ -65,11 +67,12 @@ export default function App(): JSX.Element {
           </div>
         ))}
         <div className="spacer" />
-        <div className="muted" style={{ color: '#8b93a8', padding: '0 10px', fontSize: 11 }}>
+        <div className="sidebar-hint">
           把通知或文件拖给<br />桌宠即可开始分析
         </div>
       </div>
       <div className="main">
+        {page === 'overview' && <OverviewPage refreshKey={refreshKey} onNavigate={setPage} />}
         {page === 'chat' && (
           <ChatPage refreshKey={refreshKey} petAction={petAction} locateConversationId={locateConversation} />
         )}
@@ -88,7 +91,7 @@ export default function App(): JSX.Element {
         {page === 'pending' && <PendingPage refreshKey={refreshKey} />}
         {page === 'timetable' && <TimetablePage refreshKey={refreshKey} />}
         {page === 'profile' && <ProfilePage refreshKey={refreshKey} />}
-        {page === 'settings' && <SettingsPage refreshKey={refreshKey} />}
+        {page === 'settings' && <SettingsPage refreshKey={refreshKey} appearance={window.api.appearance} />}
       </div>
     </div>
   )

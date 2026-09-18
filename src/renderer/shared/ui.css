@@ -1,17 +1,23 @@
+/* 全局基础样式:布局规则保持原样,颜色一律消费 theme/ 语义令牌。
+   旧变量名(--bg/--panel/--accent 等)保留为语义变量的别名,供存量页面平滑过渡。 */
+@import './theme/palettes.css';
+@import './theme/tokens.css';
+@import './theme/components.css';
+
 :root {
-  --bg: #f6f7fb;
-  --panel: #ffffff;
-  --border: #e5e8f0;
-  --text: #24292f;
-  --text-2: #6a7280;
-  --accent: #4f7cff;
-  --accent-weak: #eef2ff;
-  --danger: #e5534b;
-  --ok: #2da44e;
-  --warn: #bf8700;
-  --sidebar: #232a3b;
-  --sidebar-text: #c8cfe0;
-  --radius: 10px;
+  --bg: var(--ui-bg);
+  --panel: var(--ui-surface);
+  --border: var(--ui-border);
+  --text: var(--ui-text);
+  --text-2: var(--ui-text-muted);
+  --accent: var(--ui-accent);
+  --accent-weak: var(--ui-accent-surface);
+  --danger: var(--ui-error-text);
+  --ok: var(--ui-success-text);
+  --warn: var(--ui-warning-text);
+  --sidebar: var(--ui-surface-nav);
+  --sidebar-text: var(--ui-text-muted);
+  --radius: var(--ui-radius);
   font-size: 14px;
 }
 
@@ -25,36 +31,38 @@ body,
   margin: 0;
   height: 100%;
   font-family: 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
-  color: var(--text);
-  background: var(--bg);
+  color: var(--ui-text);
+  background: var(--ui-bg);
   overflow: hidden;
 }
 
 button {
   font-family: inherit;
   font-size: 13px;
-  border: 1px solid var(--border);
-  background: var(--panel);
-  color: var(--text);
-  border-radius: 8px;
+  border: 1px solid var(--ui-control-border);
+  background: var(--ui-surface);
+  color: var(--ui-text);
+  border-radius: var(--ui-radius-sm);
   padding: 5px 12px;
   cursor: pointer;
+  transition: border-color var(--ui-transition-fast), color var(--ui-transition-fast),
+    background-color var(--ui-transition-fast);
 }
 button:hover {
-  border-color: var(--accent);
-  color: var(--accent);
+  border-color: var(--ui-accent);
+  color: var(--ui-accent);
 }
 button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
+  background: var(--ui-accent);
+  border-color: var(--ui-accent);
+  color: var(--ui-on-accent);
 }
 button.primary:hover {
   opacity: 0.9;
-  color: #fff;
+  color: var(--ui-on-accent);
 }
 button.danger {
-  color: var(--danger);
+  color: var(--ui-error-text);
 }
 button.ghost {
   border-color: transparent;
@@ -62,7 +70,7 @@ button.ghost {
 }
 button:disabled {
   opacity: 0.5;
-  cursor: default;
+  cursor: not-allowed;
 }
 
 input,
@@ -70,20 +78,24 @@ textarea,
 select {
   font-family: inherit;
   font-size: 13px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  border: 1px solid var(--ui-control-border);
+  border-radius: var(--ui-radius-sm);
   padding: 6px 10px;
-  color: var(--text);
-  background: var(--panel);
+  color: var(--ui-text);
+  background: var(--ui-surface);
   outline: none;
 }
 input:focus,
 textarea:focus,
 select:focus {
-  border-color: var(--accent);
+  border-color: var(--ui-accent);
 }
 textarea {
   resize: vertical;
+}
+
+a {
+  color: var(--ui-accent);
 }
 
 .app {
@@ -94,8 +106,9 @@ textarea {
 /* ---------- 侧栏 ---------- */
 .sidebar {
   width: 168px;
-  background: var(--sidebar);
-  color: var(--sidebar-text);
+  background: var(--ui-surface-nav);
+  color: var(--ui-text);
+  border-right: 1px solid var(--ui-border);
   display: flex;
   flex-direction: column;
   padding: 14px 10px;
@@ -104,35 +117,44 @@ textarea {
 }
 .sidebar .logo {
   font-weight: 700;
-  color: #fff;
+  color: var(--ui-text);
   font-size: 16px;
   padding: 4px 10px 14px;
   letter-spacing: 1px;
+}
+.sidebar-hint {
+  color: var(--ui-text-muted);
+  padding: 0 10px;
+  font-size: 12px;
 }
 .nav-item {
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 9px 12px;
-  border-radius: 8px;
+  border-radius: var(--ui-radius-sm);
   cursor: pointer;
-  color: var(--sidebar-text);
+  color: var(--ui-text);
   user-select: none;
 }
 .nav-item:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--ui-subtle-surface);
 }
 .nav-item.active {
-  background: var(--accent);
-  color: #fff;
+  background: var(--ui-accent);
+  color: var(--ui-on-accent);
 }
 .nav-item .badge {
   margin-left: auto;
-  background: var(--danger);
-  color: #fff;
+  background: var(--ui-error-surface);
+  color: var(--ui-error-text);
   border-radius: 10px;
   font-size: 11px;
   padding: 1px 7px;
+}
+.nav-item.active .badge {
+  background: var(--ui-on-accent);
+  color: var(--ui-accent);
 }
 
 /* ---------- 主区域 ---------- */
@@ -150,9 +172,9 @@ textarea {
   gap: 14px;
 }
 .card {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius);
   padding: 14px;
   overflow: auto;
 }
@@ -161,7 +183,7 @@ textarea {
   font-size: 14px;
 }
 .muted {
-  color: var(--text-2);
+  color: var(--ui-text-muted);
   font-size: 12px;
 }
 .row {
@@ -184,24 +206,24 @@ textarea {
   font-size: 11px;
   border-radius: 6px;
   padding: 1px 8px;
-  background: var(--accent-weak);
-  color: var(--accent);
+  background: var(--ui-accent-surface);
+  color: var(--ui-accent);
 }
 .tag.warn {
-  background: #fff5e0;
-  color: var(--warn);
+  background: var(--ui-warning-surface);
+  color: var(--ui-warning-text);
 }
 .tag.ok {
-  background: #e6f6ec;
-  color: var(--ok);
+  background: var(--ui-success-surface);
+  color: var(--ui-success-text);
 }
 .tag.gray {
-  background: #f0f1f5;
-  color: var(--text-2);
+  background: var(--ui-subtle-surface);
+  color: var(--ui-text-muted);
 }
 
 .empty {
-  color: var(--text-2);
+  color: var(--ui-text-muted);
   text-align: center;
   padding: 30px 0;
   font-size: 13px;
@@ -217,16 +239,16 @@ textarea {
 }
 .conv-item {
   padding: 9px 10px;
-  border-radius: 8px;
+  border-radius: var(--ui-radius-sm);
   cursor: pointer;
   border: 1px solid transparent;
 }
 .conv-item:hover {
-  background: #f2f4fa;
+  background: var(--ui-subtle-surface);
 }
 .conv-item.active {
-  background: var(--accent-weak);
-  border-color: var(--accent);
+  background: var(--ui-accent-surface);
+  border-color: var(--ui-accent);
 }
 .conv-item .title {
   font-size: 13px;
@@ -241,9 +263,9 @@ textarea {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius);
 }
 .messages {
   flex: 1;
@@ -264,23 +286,27 @@ textarea {
 }
 .msg.user {
   align-self: flex-end;
-  background: var(--accent);
-  color: #fff;
+  background: var(--ui-accent);
+  color: var(--ui-on-accent);
   border-bottom-right-radius: 3px;
+}
+.msg.user .model {
+  color: var(--ui-on-accent);
+  opacity: 0.75;
 }
 .msg.assistant {
   align-self: flex-start;
-  background: #f2f4fa;
+  background: var(--ui-subtle-surface);
   border-bottom-left-radius: 3px;
 }
 .msg .model {
   display: block;
   font-size: 11px;
-  color: var(--text-2);
+  color: var(--ui-text-muted);
   margin-top: 5px;
 }
 .chat-input {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--ui-border);
   padding: 10px 12px;
   display: flex;
   gap: 8px;
@@ -302,13 +328,13 @@ textarea {
   overflow: auto;
 }
 .candidate {
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm);
   padding: 10px;
   display: flex;
   flex-direction: column;
   gap: 6px;
-  background: #fbfcff;
+  background: var(--ui-bg);
 }
 .candidate .title-line {
   font-weight: 600;
@@ -322,7 +348,7 @@ textarea {
   align-items: center;
 }
 .field-grid label {
-  color: var(--text-2);
+  color: var(--ui-text-muted);
 }
 .field-grid input,
 .field-grid select {
@@ -346,13 +372,13 @@ textarea {
 }
 .cal-head div {
   text-align: center;
-  color: var(--text-2);
+  color: var(--ui-text-muted);
   font-size: 12px;
 }
 .cal-cell {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm);
   min-height: 86px;
   padding: 6px;
   cursor: pointer;
@@ -362,38 +388,18 @@ textarea {
   gap: 3px;
 }
 .cal-cell:hover {
-  border-color: var(--accent);
+  border-color: var(--ui-accent);
 }
 .cal-cell.today {
-  border-color: var(--accent);
-  background: var(--accent-weak);
+  border-color: var(--ui-accent);
+  background: var(--ui-accent-surface);
 }
 .cal-cell.other-month {
   opacity: 0.45;
 }
 .cal-cell .d {
   font-size: 12px;
-  color: var(--text-2);
-}
-.cal-cell .d-row {
-  display: flex;
-  align-items: baseline;
-  gap: 4px;
-  min-width: 0;
-}
-.cal-cell .lunar {
-  font-size: 11px;
-  color: var(--text-2);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.cal-cell .lunar.festival {
-  color: var(--accent);
-  font-weight: 600;
-}
-.cal-cell .lunar.term {
-  color: var(--accent);
+  color: var(--ui-text-muted);
 }
 .chip {
   font-size: 11px;
@@ -404,16 +410,16 @@ textarea {
   text-overflow: ellipsis;
 }
 .chip.course {
-  background: #e8f4ff;
-  color: #1c6fb8;
+  background: var(--ui-accent-surface);
+  color: var(--ui-accent);
 }
 .chip.event {
-  background: #e6f6ec;
-  color: var(--ok);
+  background: var(--ui-success-surface);
+  color: var(--ui-success-text);
 }
 .chip.school {
-  background: #fff0f0;
-  color: var(--danger);
+  background: var(--ui-warning-surface);
+  color: var(--ui-warning-text);
 }
 
 /* ---------- 待办 ---------- */
@@ -422,7 +428,7 @@ textarea {
   align-items: center;
   gap: 10px;
   padding: 9px 10px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--ui-border);
 }
 .todo-item:last-child {
   border-bottom: none;
@@ -432,11 +438,11 @@ textarea {
 }
 .todo-item.done .title {
   text-decoration: line-through;
-  color: var(--text-2);
+  color: var(--ui-text-muted);
 }
 .group-title {
   font-size: 12px;
-  color: var(--text-2);
+  color: var(--ui-text-muted);
   margin: 12px 0 4px;
   font-weight: 600;
 }
@@ -450,9 +456,9 @@ textarea {
   overflow: auto;
 }
 .week-col {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm);
   padding: 8px;
   display: flex;
   flex-direction: column;
@@ -462,14 +468,14 @@ textarea {
 .week-col .day-name {
   text-align: center;
   font-weight: 600;
-  color: var(--text-2);
+  color: var(--ui-text-muted);
   font-size: 12px;
 }
 .course-block {
-  border-radius: 8px;
+  border-radius: var(--ui-radius-sm);
   padding: 7px 8px;
-  background: #e8f4ff;
-  color: #1c6fb8;
+  background: var(--ui-accent-surface);
+  color: var(--ui-accent);
   font-size: 12px;
   cursor: pointer;
 }
@@ -479,7 +485,7 @@ textarea {
 }
 .course-block .loc {
   display: block;
-  color: #4a7fa8;
+  color: var(--ui-text-muted);
   font-size: 11px;
 }
 
@@ -487,14 +493,14 @@ textarea {
 .modal-mask {
   position: fixed;
   inset: 0;
-  background: rgba(20, 24, 34, 0.4);
+  background: var(--ui-mask);
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 50;
 }
 .modal {
-  background: var(--panel);
+  background: var(--ui-surface);
   border-radius: 12px;
   padding: 18px;
   width: 460px;
@@ -503,7 +509,7 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.18);
+  box-shadow: var(--ui-shadow);
 }
 .modal.wide {
   width: 760px;
@@ -518,33 +524,33 @@ textarea {
   align-items: center;
 }
 .form-grid label {
-  color: var(--text-2);
+  color: var(--ui-text-muted);
   font-size: 13px;
 }
 
 /* ---------- 设置 ---------- */
 .provider-card {
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius);
   padding: 12px;
   display: flex;
   flex-direction: column;
   gap: 6px;
   margin-bottom: 10px;
-  background: #fbfcff;
+  background: var(--ui-bg);
 }
 
 .dropzone {
-  border: 2px dashed var(--border);
-  border-radius: 10px;
+  border: 2px dashed var(--ui-control-border);
+  border-radius: var(--ui-radius);
   padding: 26px;
   text-align: center;
-  color: var(--text-2);
+  color: var(--ui-text-muted);
   cursor: pointer;
 }
 .dropzone.hover {
-  border-color: var(--accent);
-  background: var(--accent-weak);
+  border-color: var(--ui-accent);
+  background: var(--ui-accent-surface);
 }
 
 .toast {
@@ -552,9 +558,9 @@ textarea {
   bottom: 18px;
   left: 50%;
   transform: translateX(-50%);
-  background: #2c3446;
-  color: #fff;
-  border-radius: 8px;
+  background: var(--ui-toast-bg);
+  color: var(--ui-toast-text);
+  border-radius: var(--ui-radius-sm);
   padding: 8px 18px;
   font-size: 13px;
   z-index: 99;
@@ -571,7 +577,7 @@ textarea {
   align-items: center;
   gap: 8px;
   padding: 8px 4px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--ui-border);
 }
 .list-row:last-child {
   border-bottom: none;

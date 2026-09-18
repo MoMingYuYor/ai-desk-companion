@@ -1,0 +1,45 @@
+/* 信息面板:布局与原内联样式一致,颜色消费语义令牌 */
+.panel-root {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: var(--ui-bg);
+  border: 1px solid var(--ui-border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.panel-titlebar {
+  background: var(--ui-surface-nav);
+  color: var(--ui-text);
+  border-bottom: 1px solid var(--ui-border);
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.panel-date {
+  font-size: 12px;
+  color: var(--ui-text-muted);
+}
+.panel-title-btn {
+  font-size: 12px;
+  color: var(--ui-text-muted);
+}
+.panel-title-btn.pinned {
+  color: var(--ui-accent);
+}
+.panel-body {
+  flex: 1;
+  overflow: auto;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.panel-footer {
+  padding: 8px;
+  border-top: 1px solid var(--ui-border);
+  display: flex;
+  gap: 8px;
+}

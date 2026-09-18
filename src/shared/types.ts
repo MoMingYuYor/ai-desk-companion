@@ -142,8 +142,8 @@ export interface ExtractedCourse {
   startTime: string // HH:MM
   endTime: string
   weeks: Array<[number, number]>
-  location?: string
-  teacher?: string
+  location?: string | null
+  teacher?: string | null
 }
 
 export interface ExtractedSchoolEvent {
@@ -151,7 +151,7 @@ export interface ExtractedSchoolEvent {
   title: string
   startDate: string
   endDate?: string | null
-  note?: string
+  note?: string | null
 }
 
 export interface Analysis {
@@ -161,9 +161,19 @@ export interface Analysis {
   payload: AnalysisPayload
   rawResponse?: string | null
   modelLabel?: string | null
-  status: 'pending' | 'done' | 'failed'
+  status: 'pending' | 'done' | 'failed' | 'handled'
   error?: string | null
   createdAt: string
+}
+
+/** 课表/校历导入的待确认提取结果 */
+export interface PendingImport {
+  analysisId: string
+  conversationId: string
+  kind: 'timetable' | 'school-calendar'
+  title: string
+  createdAt: string
+  payload: AnalysisPayload
 }
 
 // ---------- 日程 / 待办 / 待处理 ----------

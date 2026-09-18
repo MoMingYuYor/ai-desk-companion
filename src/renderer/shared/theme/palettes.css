@@ -1,0 +1,61 @@
+/* 日夜手账语义色板:唯一允许定义 day/night 颜色的地方。
+   业务页面只消费这里的语义变量,不自行发明另一套暗色规则。
+   对比度由 tests/appearance/contrast.test.ts 对本文件自动校验。 */
+
+:root,
+[data-theme="light"] {
+  --ui-bg: #f5f1e9;
+  --ui-surface: #fffcf5;
+  --ui-surface-nav: #faf6ed;
+  --ui-text: #51483f;
+  --ui-text-muted: #766556;
+  --ui-accent: #795b75;
+  --ui-accent-surface: #f1e5eb;
+  --ui-on-accent: #ffffff;
+  --ui-border: #e9dfd0;
+  --ui-control-border: #96818b;
+  --ui-warning-text: #855725;
+  --ui-warning-surface: #fbf1e4;
+  --ui-success-text: #35624f;
+  --ui-success-surface: #edf4ef;
+  --ui-error-text: #923d44;
+  --ui-error-surface: #faeeee;
+
+  /* 非排版型辅助令牌:hover 填充、遮罩、阴影、反色提示、纸胶带 */
+  --ui-subtle-surface: #efe8db;
+  --ui-tape: rgba(121, 91, 117, 0.2);
+  --ui-mask: rgba(81, 72, 63, 0.38);
+  --ui-shadow: 0 10px 40px rgba(81, 72, 63, 0.16), 0 2px 8px rgba(81, 72, 63, 0.08);
+  --ui-shadow-soft: 0 4px 14px rgba(81, 72, 63, 0.14);
+  --ui-toast-bg: #312d35;
+  --ui-toast-text: #f0e8df;
+  --ui-focus-ring: #795b75;
+}
+
+[data-theme="dark"] {
+  --ui-bg: #25232a;
+  --ui-surface: #312d35;
+  --ui-surface-nav: #2a272e;
+  --ui-text: #f0e8df;
+  --ui-text-muted: #c0b1b3;
+  --ui-accent: #d7b6c9;
+  --ui-accent-surface: #493e48;
+  --ui-on-accent: #30222b;
+  --ui-border: #4a4149;
+  --ui-control-border: #b09aa7;
+  --ui-warning-text: #e3c394;
+  --ui-warning-surface: #4b3c2d;
+  --ui-success-text: #b8d6bf;
+  --ui-success-surface: #293e32;
+  --ui-error-text: #f0b6b9;
+  --ui-error-surface: #492d33;
+
+  --ui-subtle-surface: #3a3540;
+  --ui-tape: rgba(227, 195, 148, 0.24);
+  --ui-mask: rgba(0, 0, 0, 0.55);
+  --ui-shadow: 0 10px 40px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.35);
+  --ui-shadow-soft: 0 4px 14px rgba(0, 0, 0, 0.4);
+  --ui-toast-bg: #f5f1e9;
+  --ui-toast-text: #51483f;
+  --ui-focus-ring: #d7b6c9;
+}

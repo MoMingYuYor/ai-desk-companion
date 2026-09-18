@@ -25,11 +25,13 @@ import {
   listEventsRange,
   listMessages,
   listPending,
+  listPendingImports,
   listProfileFacts,
   listProviders,
   listSchoolEvents,
   listSemesters,
   listTodos,
+  markImportHandled,
   renameConversation,
   saveCourse,
   saveCourseOverride,
@@ -257,17 +259,20 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   })
   handle(Channels.SchoolEventsDelete, (id: string) => deleteSchoolEvent(db, id))
 
-  // ---- 导入:渲染端传入文件路径或文本,主进程统一接收并运行提取 ----
+  // ---- 导入:渲染端传入文件路径或文本,主进程统一接收并运行提取;失败原因随结果返回 ----
   handle(Channels.ImportTimetable, async (input: MaterialIntakeInput) => {
     const { conversationId } = await engine.intakeMaterials({ ...input, kind: 'timetable', autoRun: false })
     const analysis = await engine.runImport(conversationId, 'timetable')
-    return { conversationId, analysisId: analysis?.id ?? '', payload: analysis?.payload ?? null }
+    return { conversationId, analysisId: analysis?.id ?? '', payload: analysis?.payload ?? null, error: analysis?.error ?? null }
   })
   handle(Channels.ImportSchoolCalendar, async (input: MaterialIntakeInput) => {
     const { conversationId } = await engine.intakeMaterials({ ...input, kind: 'school-calendar', autoRun: false })
     const analysis = await engine.runImport(conversationId, 'school-calendar')
-    return { conversationId, analysisId: analysis?.id ?? '', payload: analysis?.payload ?? null }
+    return { conversationId, analysisId: analysis?.id ?? '', payload: analysis?.payload ?? null, error: analysis?.error ?? null }
   })
+  // 桌宠拖放等自动路由产生的提取结果:课表页展示待确认清单
+  handle(Channels.PendingImports, (limit?: number) => listPendingImports(db, limit))
+  handle(Channels.ImportHandled, (analysisId: string) => markImportHandled(db, analysisId))
 
   // ---- profile ----
   handle(Channels.ProfileList, () => listProfileFacts(db))

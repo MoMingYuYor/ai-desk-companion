@@ -125,6 +125,8 @@ const api: RendererApi = {
   deleteSchoolEvent: invoke(Channels.SchoolEventsDelete),
   importTimetable: invoke(Channels.ImportTimetable),
   importSchoolCalendar: invoke(Channels.ImportSchoolCalendar),
+  listPendingImports: invoke(Channels.PendingImports),
+  markImportHandled: invoke(Channels.ImportHandled),
 
   listProfile: invoke(Channels.ProfileList),
   saveProfile: invoke(Channels.ProfileSave),
