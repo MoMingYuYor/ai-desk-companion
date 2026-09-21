@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const electronMocks = vi.hoisted(() => ({
-  clipboardReadText: vi.fn((): string => '')
+  // electron 44:clipboard.readText() 返回 Promise<string>,mock 同步对齐
+  clipboardReadText: vi.fn((): Promise<string> => Promise.resolve(''))
 }))
 
 vi.mock('electron', () => ({
@@ -40,7 +41,7 @@ describe('桌宠"分析剪贴板通知"失败兜底', () => {
   beforeEach(() => {
     vi.mocked(markPetBubble).mockClear()
     electronMocks.clipboardReadText.mockReset()
-    electronMocks.clipboardReadText.mockReturnValue('')
+    electronMocks.clipboardReadText.mockResolvedValue('')
     intake = vi.fn()
     registerIpcHandlers({
       db: {} as never,
@@ -53,16 +54,19 @@ describe('桌宠"分析剪贴板通知"失败兜底', () => {
   })
 
   it('剪贴板有文本且分析失败:先提示开始,随后气泡提示失败(不产生 unhandledrejection)', async () => {
-    electronMocks.clipboardReadText.mockReturnValue('会议通知全文')
+    electronMocks.clipboardReadText.mockResolvedValue('会议通知全文')
     intake.mockRejectedValue(new Error('模型超时'))
 
     runPetAction('analyze-clipboard')
 
-    expect(intake).toHaveBeenCalledWith({
-      texts: [{ name: '剪贴板通知', content: '会议通知全文' }],
-      autoRun: true
+    // electron 44 适配:readText 异步化,intake 与气泡提示均转入微任务后触发
+    await vi.waitFor(() => {
+      expect(intake).toHaveBeenCalledWith({
+        texts: [{ name: '剪贴板通知', content: '会议通知全文' }],
+        autoRun: true
+      })
+      expect(markPetBubble).toHaveBeenCalledWith('已开始分析剪贴板通知…')
     })
-    expect(markPetBubble).toHaveBeenCalledWith('已开始分析剪贴板通知…')
 
     await vi.waitFor(() => {
       expect(markPetBubble).toHaveBeenCalledWith('剪贴板分析失败,请重试')
@@ -70,7 +74,7 @@ describe('桌宠"分析剪贴板通知"失败兜底', () => {
   })
 
   it('分析成功:不出现失败气泡', async () => {
-    electronMocks.clipboardReadText.mockReturnValue('通知全文')
+    electronMocks.clipboardReadText.mockResolvedValue('通知全文')
     intake.mockResolvedValue({ conversationId: 'c1', materials: [] })
 
     runPetAction('analyze-clipboard')
@@ -79,12 +83,14 @@ describe('桌宠"分析剪贴板通知"失败兜底', () => {
     expect(markPetBubble).not.toHaveBeenCalledWith('剪贴板分析失败,请重试')
   })
 
-  it('剪贴板无文本:仅提示无内容,不触发分析', () => {
-    electronMocks.clipboardReadText.mockReturnValue('   ')
+  it('剪贴板无文本:仅提示无内容,不触发分析', async () => {
+    electronMocks.clipboardReadText.mockResolvedValue('   ')
 
     runPetAction('analyze-clipboard')
 
-    expect(intake).not.toHaveBeenCalled()
-    expect(markPetBubble).toHaveBeenCalledWith('剪贴板没有文本内容')
+    await vi.waitFor(() => {
+      expect(intake).not.toHaveBeenCalled()
+      expect(markPetBubble).toHaveBeenCalledWith('剪贴板没有文本内容')
+    })
   })
 })
