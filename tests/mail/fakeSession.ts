@@ -29,10 +29,13 @@ export class FakeSession implements MailSession {
   envelopesByUid = new Map<number, EnvelopeRow>()
   /** 每次 envelopes 调用前的钩子(可用于触发 abort) */
   onEnvelopes?: (uids: number[]) => void
+  /** 每次 open 调用返回前的钩子:可在第二次打开前注入新邮件或推进 uidNext */
+  onOpen?: (openCount: number) => void
   searchError: Error | null = null
 
   async open(): Promise<{ uidValidity: string; uidNext: number }> {
     this.openCount += 1
+    if (this.onOpen) this.onOpen(this.openCount)
     this.calls.push(`open#${this.openCount}`)
     return { uidValidity: String(this.uidValidity), uidNext: this.uidNext }
   }

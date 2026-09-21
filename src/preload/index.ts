@@ -5,6 +5,26 @@ import type { AppearanceBridge, RendererApi } from '../shared/api'
 import { AppearanceChannels } from '../shared/appearance'
 import type { AppearanceSnapshot } from '../shared/appearance'
 import type { MailApi, MailSubscribe, MailEventMap } from '../shared/mail'
+import { isAllowedAppPageUrl } from '../main/security/ipcPolicy'
+
+/**
+ * 文档合格性(R3):preload 仅对合格应用文档暴露 api。
+ * 生产 file: 精确页面 / 开发 dev server 精确页面路径;devUrl 不可读时按精确页面路径兜底,
+ * 主进程 authorizeIpc 仍按登记窗口做最终校验。
+ */
+export function isQualifiedRendererDocument(href: string | null | undefined, devUrl?: string): boolean {
+  if (!href) return false
+  const env = typeof process !== 'undefined' && process.env ? process.env.ELECTRON_RENDERER_URL : undefined
+  return isAllowedAppPageUrl(href, devUrl ?? env)
+}
+
+function currentDocumentHref(): string | null {
+  try {
+    return typeof window !== 'undefined' && window.location ? window.location.href : null
+  } catch {
+    return null
+  }
+}
 
 const invoke =
   <A extends unknown[], R>(channel: string) =>
@@ -39,6 +59,7 @@ const MAIL_EVENT_CHANNELS: ReadonlyArray<keyof MailEventMap> = [
 ]
 
 // 通用事件订阅白名单:仅开放 evt: 前缀(主进程 → 渲染层广播的命名空间)。
+// R8 会话运行契约的 evt:chat-started 走此前缀放行,与 evt:chat-delta/done/error 同属聊天流事件;
 // 桌宠气泡/状态/动作等直发事件(evt:pet-bubble / evt:pet-state / evt:pet-action)未收录进
 // Channels 常量,故用前缀校验而非精确枚举;invoke 类通道与任意自定义通道一律拒绝。
 const EVENT_CHANNEL_PREFIX = 'evt:'
@@ -72,6 +93,7 @@ const appearance: AppearanceBridge = {
 
 const api: RendererApi = {
   getAppInfo: invoke(Channels.AppInfo),
+  getWorkspaceEpoch: invoke(Channels.WorkspaceEpoch),
   pathForFile: (file: unknown) => webUtils.getPathForFile(file as File),
   mail,
   subscribeMail,
@@ -92,6 +114,8 @@ const api: RendererApi = {
   sendChat: invoke(Channels.ChatSend),
   stopChat: invoke(Channels.ChatStop),
   retryChat: invoke(Channels.ChatRetry),
+  // R8 活动运行快照:主进程 handler 注册在 ipc.ts(集成任务接线)
+  getActiveChatRun: invoke(Channels.ChatActiveRun),
   addMaterials: invoke(Channels.MaterialsAdd),
   fetchUrlText: invoke(Channels.UrlFetch),
   petGetScale: invoke(Channels.PetGetScale),
@@ -115,6 +139,8 @@ const api: RendererApi = {
   listPending: invoke(Channels.PendingList),
   updatePending: invoke(Channels.PendingUpdate),
   deletePending: invoke(Channels.PendingDelete),
+  // 原子转换(Task 8/R7):主进程 handler 注册在 ipc.ts(集成任务接线)
+  resolveExistingPending: invoke(Channels.PendingResolve),
 
   listSemesters: invoke(Channels.SemestersList),
   saveSemester: invoke(Channels.SemestersSave),
@@ -165,4 +191,9 @@ const api: RendererApi = {
   }
 }
 
-contextBridge.exposeInMainWorld('api', api)
+// 仅对合格应用文档暴露完整 api;非应用文档(外源页面/任意本地文件)不暴露任何接口
+if (isQualifiedRendererDocument(currentDocumentHref())) {
+  contextBridge.exposeInMainWorld('api', api)
+} else {
+  console.warn('[preload] 当前文档不是已登记的应用页面,已拒绝暴露 api')
+}

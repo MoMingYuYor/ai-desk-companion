@@ -1,4 +1,6 @@
-export const SCHEMA_VERSION = 3
+// v4(M1 写入基础):实体 revision、操作回执。版本号由集成负责人按合入顺序唯一分配,
+// S1 在 v3 基础上分配为 4;迁移路径见 src/main/db/migrations/m1.ts。
+export const SCHEMA_VERSION = 4
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -83,6 +85,7 @@ CREATE TABLE IF NOT EXISTS events (
   reminder_minutes INTEGER,
   status TEXT NOT NULL DEFAULT 'active',
   fingerprint TEXT,
+  revision INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -99,6 +102,7 @@ CREATE TABLE IF NOT EXISTS todos (
   source TEXT NOT NULL DEFAULT 'manual',
   source_ref TEXT,
   fingerprint TEXT,
+  revision INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -109,6 +113,7 @@ CREATE TABLE IF NOT EXISTS pending_items (
   title TEXT NOT NULL,
   notes TEXT,
   status TEXT NOT NULL DEFAULT 'open',
+  revision INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -172,5 +177,15 @@ CREATE TABLE IF NOT EXISTS profile_facts (
 CREATE TABLE IF NOT EXISTS fired_reminders (
   key TEXT PRIMARY KEY,
   fired_at TEXT NOT NULL
+);
+
+-- v4(M1):操作回执。只保存摘要与可恢复结果引用,不存请求全文或凭据;
+-- 回执与业务数据在同一事务内写入(runOperation 是唯一事务拥有者)。
+CREATE TABLE IF NOT EXISTS operation_receipts (
+  operation_id TEXT PRIMARY KEY,
+  command TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  result_ref TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 `

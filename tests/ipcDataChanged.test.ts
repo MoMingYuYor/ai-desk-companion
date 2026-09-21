@@ -13,23 +13,55 @@ vi.mock('electron', () => ({
   },
   BrowserWindow: class {},
   Menu: { buildFromTemplate: vi.fn(), setApplicationMenu: vi.fn() },
-  app: { getPath: vi.fn(() => '/tmp') },
+  app: { getPath: vi.fn(() => '/tmp'), getVersion: vi.fn(() => '0.0.0') },
   clipboard: { writeText: vi.fn(), readText: vi.fn() },
   dialog: { showOpenDialog: vi.fn(), showSaveDialog: vi.fn() }
 }))
 
+// Task 12 集成:ipc.ts 统一经 authorizeIpc 授权(登记窗口能力表),
+// 测试注册一个工作台窗口并构造其主 frame 的合法事件
+vi.mock('../src/main/windows', () => ({
+  getWindowRegistry: () => [
+    {
+      role: 'workbench' as const,
+      webContentsId: 1,
+      pageUrl: 'http://localhost:5173/workbench.html',
+      isDestroyed: () => false
+    }
+  ],
+  broadcastToAll: vi.fn(),
+  getWorkbenchWindow: vi.fn(() => null),
+  getPetWindow: vi.fn(() => null),
+  getPanelWindow: vi.fn(() => null),
+  createWorkbenchWindow: vi.fn(),
+  createPanelWindow: vi.fn(),
+  markQuitting: vi.fn(),
+  petScaleOf: vi.fn(() => 1),
+  savePetPosition: vi.fn(),
+  setPanelPinnedMeta: vi.fn(),
+  setPetScale: vi.fn(),
+  togglePet: vi.fn(),
+  isQuitting: vi.fn(() => false)
+}))
+
 import { Channels } from '../src/shared/api'
 import { registerIpcHandlers, setDataChangedListener } from '../src/main/ipc'
+import { initWorkspaceEpoch } from '../src/main/db/operations'
 import { createTodo, createEvent } from '../src/main/db/dao'
 import { makeTestDb } from './helpers'
 
-const fakeEvent = {} as IpcMainInvokeEvent
+const fakeEvent = {
+  sender: { id: 1 },
+  senderFrame: { url: 'http://localhost:5173/workbench.html', parent: null }
+} as unknown as IpcMainInvokeEvent
 
 async function boot() {
   const db = await makeTestDb()
   handlers.clear()
   const fired = vi.fn()
   setDataChangedListener(fired)
+  // 写命令边界依赖 workspaceEpoch 单例
+  initWorkspaceEpoch()
   registerIpcHandlers({
     db,
     engine: {},
@@ -53,10 +85,11 @@ describe('数据变更 IPC 广播 evt:data-changed', () => {
     await handlers.get(Channels.TodosDelete)!(fakeEvent, todo.id)
     expect(fired).toHaveBeenCalledTimes(1)
 
-    await handlers.get(Channels.TodosCreate)!(fakeEvent, { title: '新待办' })
+    const todo2 = await handlers.get(Channels.TodosCreate)!(fakeEvent, { title: '新待办' })
     expect(fired).toHaveBeenCalledTimes(2)
 
-    await handlers.get(Channels.TodosUpdate)!(fakeEvent, todo.id, { title: '改名' })
+    // 更新现存条目(删除后的旧 id 按契约返回 TARGET_UNAVAILABLE)
+    await handlers.get(Channels.TodosUpdate)!(fakeEvent, (todo2 as { id: string }).id, { title: '改名' })
     expect(fired).toHaveBeenCalledTimes(3)
   })
 

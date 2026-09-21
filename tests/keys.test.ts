@@ -11,36 +11,37 @@ vi.mock('electron', () => ({
   }
 }))
 
-import { decryptApiKey, encryptApiKey } from '../src/main/keys'
+import { SecretStoreUnavailableError, decryptApiKey, encryptApiKey } from '../src/main/keys'
 import { getProviderApiKey, listProviders, saveProvider } from '../src/main/db/dao'
 import { makeTestDb } from './helpers'
 
-// 回归背景:getProviderApiKey 曾自行 slice(6) 返回裸 base64,
-// 调用方再走 decryptApiKey 时 'plain:' 前缀已丢失,明文降级链永远解不出(2026-09-18)。
-describe('API Key 明文降级链:getProviderApiKey 原样返回 + decryptApiKey 解密', () => {
-  it('safeStorage 不可用:plain: 前缀密文经 getProviderApiKey+decryptApiKey 还原明文', async () => {
+// R4(Task 6):模型密钥一律走系统安全存储,禁止明文降级。
+// 回归背景:getProviderApiKey 曾自行 slice(6) 返回裸 base64(2026-09-18);
+// 旧版 encryptApiKey 在安全存储不可用时写 'plain:' 前缀明文,S1 起改为明确拒绝。
+describe('R4:模型密钥加密边界(禁止明文降级)', () => {
+  it('safeStorage 不可用时 encryptApiKey 抛内部加密异常,不再产生 plain: 密文', () => {
     safeStorageState.available = false
-    const db = await makeTestDb()
-    const enc = encryptApiKey('sk-plain-key')
-    expect(enc.startsWith('plain:')).toBe(true)
-
-    const id = saveProvider(db, {
-      name: '降级',
-      baseUrl: 'https://api.example.com/v1',
-      protocol: 'chat-completions',
-      models: ['m1'],
-      defaultModel: 'm1',
-      supportsVision: false,
-      apiKeyEnc: enc
-    })
-
-    // dao 原样返回存储串,不改密文形态
-    const stored = getProviderApiKey(db, id)
-    expect(stored).toBe(enc)
-    expect(decryptApiKey(stored!)).toBe('sk-plain-key')
+    expect(() => encryptApiKey('sk-plain-key')).toThrow(SecretStoreUnavailableError)
+    try {
+      encryptApiKey('sk-plain-key')
+      expect.unreachable()
+    } catch (err) {
+      const e = err as SecretStoreUnavailableError
+      // 公共层映射契约:AUTH_REQUIRED、不可重试、脱敏(不含密钥内容)
+      const appErr = e.toAppError()
+      expect(appErr.code).toBe('AUTH_REQUIRED')
+      expect(appErr.retryable).toBe(false)
+      expect(appErr.message).not.toContain('sk-plain-key')
+      expect(e.message).not.toContain('sk-plain-key')
+    }
   })
 
-  it('safeStorage 可用:密文路径同样走通', async () => {
+  it('R4:历史 plain: 密文不再产出可用明文(decryptApiKey 拒绝降级)', () => {
+    const legacy = 'plain:' + Buffer.from('sk-legacy', 'utf-8').toString('base64')
+    expect(decryptApiKey(legacy)).toBeNull()
+  })
+
+  it('safeStorage 可用:加密/解密往返,密文无 plain: 前缀', async () => {
     safeStorageState.available = true
     const db = await makeTestDb()
     const enc = encryptApiKey('sk-secure-key')
@@ -56,12 +57,14 @@ describe('API Key 明文降级链:getProviderApiKey 原样返回 + decryptApiKey
       apiKeyEnc: enc
     })
 
+    // dao 原样返回存储串,不改密文形态
     const stored = getProviderApiKey(db, id)
     expect(stored).toBe(enc)
     expect(decryptApiKey(stored!)).toBe('sk-secure-key')
   })
 
   it('未存密钥返回 null', async () => {
+    safeStorageState.available = true
     const db = await makeTestDb()
     const id = saveProvider(db, {
       name: '无密钥',
@@ -79,7 +82,7 @@ describe('API Key 明文降级链:getProviderApiKey 原样返回 + decryptApiKey
 // 存储实现:providers.api_key_enc 列,'' 即"无密钥"(getProviderApiKey → null / hasApiKey → false)。
 describe('saveProvider 清空密钥', () => {
   it("apiKeyEnc === '' 删除已存密钥;undefined 保留旧值", async () => {
-    safeStorageState.available = false
+    safeStorageState.available = true
     const db = await makeTestDb()
     const enc = encryptApiKey('sk-old-key')
     const id = saveProvider(db, {

@@ -17,7 +17,8 @@ import {
   getProviderApiKey,
   renameConversation,
   saveProfileFact,
-  touchConversation
+  touchConversation,
+  uid
 } from '../db/dao'
 import type {
   ActionCandidate,
@@ -30,6 +31,7 @@ import type {
   ProviderInfo
 } from '../../shared/types'
 import type { PetActivityChange } from '../../shared/pet'
+import type { ActiveChatRun } from '../../shared/api'
 import { validateAnalysisPayload, validateImportPayload, repairFeedback } from '../../shared/extraction'
 import { extractUrls } from '../../shared/urlText'
 import { createUrlFetcher } from './urlFetch'
@@ -77,8 +79,20 @@ type PayloadValidator = (
   raw: unknown
 ) => { ok: true; value: AnalysisPayload; warnings: string[] } | { ok: false; errors: string[] }
 
+/** 会话内一次运行(聊天/分析/导入)的引擎侧状态;迟到事件按 runId 由页面过滤 */
+interface ActiveRun {
+  runId: string
+  /** 单会话递增的运行代数 */
+  generation: number
+  kind: 'chat' | 'analysis' | 'import'
+  controller: AbortController
+  /** 已累计的流式文本(getActiveChatRun 快照用) */
+  text: string
+}
+
 export class Engine {
-  private aborts = new Map<string, AbortController>()
+  private activeRuns = new Map<string, ActiveRun>()
+  private runGenerations = new Map<string, number>()
   private readonly linkFetcher: (url: string) => Promise<{ title: string; text: string }>
 
   constructor(private deps: EngineDeps) {
@@ -87,6 +101,51 @@ export class Engine {
 
   private get db(): SqliteDb {
     return this.deps.db
+  }
+
+  // ---------- 运行生命周期(R8) ----------
+
+  /** 开始一次运行:生成 runId、代数递增,并在任何流事件前广播 chat-started */
+  private beginRun(conversationId: string, kind: ActiveRun['kind'], controller: AbortController): ActiveRun {
+    const generation = (this.runGenerations.get(conversationId) ?? 0) + 1
+    this.runGenerations.set(conversationId, generation)
+    const run: ActiveRun = { runId: uid(), generation, kind, controller, text: '' }
+    this.activeRuns.set(conversationId, run)
+    this.deps.broadcast('evt:chat-started', { conversationId, runId: run.runId, runGeneration: generation })
+    return run
+  }
+
+  /** 结束运行:只清理当前运行对应项,旧运行的迟到结束不得清掉新运行 */
+  private endRun(conversationId: string, runId: string): void {
+    const run = this.activeRuns.get(conversationId)
+    if (run && run.runId === runId) this.activeRuns.delete(conversationId)
+  }
+
+  /** 流式增量绑定当前运行:旧运行/已失效运行的增量不广播 */
+  private appendRunDelta(conversationId: string, runId: string, full: string, delta: string): void {
+    const run = this.activeRuns.get(conversationId)
+    if (!run || run.runId !== runId) return
+    run.text = full
+    this.deps.broadcast('evt:chat-delta', { conversationId, runId, delta })
+  }
+
+  /** 活动运行与累计文本快照:支持视图切回恢复;无活动运行返回 null */
+  getActiveChatRun(conversationId: string): ActiveChatRun | null {
+    const run = this.activeRuns.get(conversationId)
+    if (!run) return null
+    return { conversationId, runId: run.runId, runGeneration: run.generation, text: run.text }
+  }
+
+  /** 恢复 workspaceEpoch 等边界事件:中止并清空全部活动运行,旧活动快照随之失效(接线归任务 12) */
+  invalidateAllRuns(): void {
+    for (const run of this.activeRuns.values()) {
+      try {
+        run.controller.abort()
+      } catch {
+        // 单个中止失败不影响其余清理
+      }
+    }
+    this.activeRuns.clear()
   }
 
   // ---------- 材料接收 ----------
@@ -246,7 +305,7 @@ export class Engine {
     const taskId = `analysis:${conversationId}`
     this.deps.onPetActivity?.({ phase: 'start', taskId })
     const controller = new AbortController()
-    this.aborts.set(conversationId, controller)
+    const run = this.beginRun(conversationId, 'analysis', controller)
     let analysis: Analysis | null = null
     let outcome: 'done' | 'failed' | 'cancelled' = 'failed'
     let rawText = ''
@@ -284,12 +343,12 @@ export class Engine {
     } catch (err) {
       const aborted = err instanceof Error && err.name === 'AbortError'
       outcome = aborted ? 'cancelled' : 'failed'
-      analysis = await this.recordFailure(conversationId, err, rawText)
+      analysis = await this.recordFailure(conversationId, err, rawText, run.runId)
     } finally {
-      this.aborts.delete(conversationId)
+      this.endRun(conversationId, run.runId)
       this.deps.onPetActivity?.({ phase: 'finish', taskId, outcome })
     }
-    this.deps.broadcast('evt:analysis-updated', { conversationId, analysisId: analysis?.id })
+    this.deps.broadcast('evt:analysis-updated', { conversationId, analysisId: analysis?.id, runId: run.runId })
     return analysis
   }
 
@@ -461,7 +520,7 @@ export class Engine {
       text: kind === 'timetable' ? '正在提取课表,完成后会提醒你' : '正在提取校历,完成后会提醒你'
     })
     const controller = new AbortController()
-    this.aborts.set(conversationId, controller)
+    const run = this.beginRun(conversationId, 'import', controller)
     let analysis: Analysis | null = null
     let outcome: 'done' | 'failed' | 'cancelled' = 'failed'
     try {
@@ -509,12 +568,12 @@ export class Engine {
     } catch (err) {
       const aborted = err instanceof Error && err.name === 'AbortError'
       outcome = aborted ? 'cancelled' : 'failed'
-      analysis = await this.recordFailure(conversationId, err)
+      analysis = await this.recordFailure(conversationId, err, '', run.runId)
     } finally {
-      this.aborts.delete(conversationId)
+      this.endRun(conversationId, run.runId)
       this.deps.onPetActivity?.({ phase: 'finish', taskId, outcome })
     }
-    this.deps.broadcast('evt:analysis-updated', { conversationId, analysisId: analysis?.id })
+    this.deps.broadcast('evt:analysis-updated', { conversationId, analysisId: analysis?.id, runId: run.runId })
     return analysis
   }
 
@@ -550,7 +609,7 @@ export class Engine {
     const conv = getConversation(this.db, conversationId)
     if (!conv) return
     const controller = new AbortController()
-    this.aborts.set(conversationId, controller)
+    const run = this.beginRun(conversationId, 'chat', controller)
     const assistant = insertMessage(this.db, {
       conversationId,
       role: 'assistant',
@@ -583,10 +642,8 @@ export class Engine {
         messages,
         materials.some((m) => m.type === 'image'),
         controller.signal,
-        (full, delta) => {
-          void full
-          void delta
-        }
+        // 流式增量绑定当前运行广播;迟到/旧运行增量由页面按 runId 过滤
+        (full, delta) => this.appendRunDelta(conversationId, run.runId, full, delta)
       )
       usedLabel = label
       let display = raw
@@ -598,18 +655,19 @@ export class Engine {
       // [PROFILE] 标记在流式过程中可能已部分显示,统一以清洗后的全文为准
       appendMessageContent(this.db, assistant.id, '')
       this.db.run('UPDATE messages SET content = ?, model_label = ? WHERE id = ?', [display, usedLabel || null, assistant.id])
-      this.deps.broadcast('evt:chat-done', { conversationId, messageId: assistant.id })
+      this.deps.broadcast('evt:chat-done', { conversationId, runId: run.runId, messageId: assistant.id })
     } catch (err) {
       const aborted = err instanceof Error && err.name === 'AbortError'
       const message = aborted ? '(已停止生成)' : err instanceof Error ? err.message : String(err)
       this.db.run("UPDATE messages SET content = ? WHERE id = ?", [aborted ? '(已停止生成)' : `⚠ ${message}`, assistant.id])
       this.deps.broadcast(aborted ? 'evt:chat-done' : 'evt:chat-error', {
         conversationId,
+        runId: run.runId,
         messageId: assistant.id,
         error: aborted ? undefined : message
       })
     } finally {
-      this.aborts.delete(conversationId)
+      this.endRun(conversationId, run.runId)
     }
     this.deps.broadcast('evt:conversation-changed', { conversationId })
   }
@@ -626,8 +684,12 @@ export class Engine {
 
   // ---------- 停止 / 重试 ----------
 
-  stop(conversationId: string): void {
-    this.aborts.get(conversationId)?.abort()
+  /** 停止当前活动运行;携带 runId 时与活动运行不一致则忽略(防误停新运行) */
+  stop(conversationId: string, runId?: string): void {
+    const run = this.activeRuns.get(conversationId)
+    if (!run) return
+    if (runId && run.runId !== runId) return
+    run.controller.abort()
   }
 
   /** 邮箱分析材料注入:直接写入材料表,不触发自动分析(由邮箱服务控制时序) */
@@ -680,7 +742,8 @@ export class Engine {
   private async recordFailure(
     conversationId: string,
     err: unknown,
-    rawResponse = ''
+    rawResponse = '',
+    runId?: string
   ): Promise<Analysis> {
     const aborted = err instanceof Error && err.name === 'AbortError'
     const message = aborted ? '已取消' : err instanceof Error ? err.message : String(err)
@@ -689,7 +752,9 @@ export class Engine {
       error: message,
       rawResponse: rawResponse || (err instanceof AnalysisFormatError ? err.rawResponse : '')
     })
-    if (!aborted) this.deps.broadcast('evt:chat-error', { conversationId, error: message })
+    if (!aborted) {
+      this.deps.broadcast('evt:chat-error', { conversationId, runId, error: message })
+    }
     return analysis
   }
 
@@ -698,13 +763,18 @@ export class Engine {
     messages: LlmMessage[],
     needVision: boolean,
     signal: AbortSignal,
-    _onDelta?: (full: string, delta: string) => void
+    onDelta?: (full: string, delta: string) => void
   ): Promise<CallOutcome> {
     const providers = listProviders(this.db)
+    let full = ''
     const result = await this.deps.router.call(providers, {
       messages,
       needVision,
       signal,
+      onDelta: (delta: string) => {
+        full += delta
+        onDelta?.(full, delta)
+      },
       onNotice: (n: RouterNotice) => {
         if (n.type === 'switched') {
           this.deps.notifyModelSwitch?.({ from: n.from, to: n.to, reason: n.reason })

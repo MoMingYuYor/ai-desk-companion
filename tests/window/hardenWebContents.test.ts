@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import { hardenWebContents } from '../../src/main/windows'
 
 // windows.ts 顶层 import 了 electron(BrowserWindow/screen)与依赖 screen 的 geometry,
@@ -11,9 +11,11 @@ vi.mock('electron', () => ({
   }
 }))
 
+// vitest 5 迁移:无参 vi.fn() 默认类型变为 Mock<Procedure | Constructable>,
+// 须显式标注与 HardenableWebContents 对齐的方法签名
 type FakeWebContents = {
-  setWindowOpenHandler: ReturnType<typeof vi.fn>
-  on: ReturnType<typeof vi.fn>
+  setWindowOpenHandler: Mock<(handler: (details: unknown) => { action: 'deny' }) => unknown>
+  on: Mock<(event: string, listener: (...args: never[]) => void) => unknown>
 }
 
 function makeFakeWebContents(): FakeWebContents {
@@ -87,5 +89,34 @@ describe('hardenWebContents 窗口导航加固', () => {
     const otherPort = { preventDefault: vi.fn() }
     listener(otherPort, 'http://localhost:9999/workbench.html')
     expect(otherPort.preventDefault).toHaveBeenCalledTimes(1)
+  })
+
+  it('R3: 生产态仅放行精确应用页面,其他本地 html 与任意 file: 路径被拦截', () => {
+    const wc = makeFakeWebContents()
+    hardenWebContents(wc)
+    const listener = willNavigateListenerOf(wc)
+
+    const otherPage = { preventDefault: vi.fn() }
+    listener(otherPage, 'file:///D:/app/out/renderer/evil.html')
+    expect(otherPage.preventDefault).toHaveBeenCalledTimes(1)
+
+    const disguised = { preventDefault: vi.fn() }
+    listener(disguised, 'file:///D:/app/out/renderer/notworkbench.html')
+    expect(disguised.preventDefault).toHaveBeenCalledTimes(1)
+
+    const systemFile = { preventDefault: vi.fn() }
+    listener(systemFile, 'file:///C:/Windows/system32/drivers/etc/hosts')
+    expect(systemFile.preventDefault).toHaveBeenCalledTimes(1)
+  })
+
+  it('R3: 开发态同前缀恶意主机(5173.evil.com)被拦截', () => {
+    process.env.ELECTRON_RENDERER_URL = DEV_URL
+    const wc = makeFakeWebContents()
+    hardenWebContents(wc)
+    const listener = willNavigateListenerOf(wc)
+
+    const prefixAttack = { preventDefault: vi.fn() }
+    listener(prefixAttack, 'http://localhost:5173.evil.com/workbench.html')
+    expect(prefixAttack.preventDefault).toHaveBeenCalledTimes(1)
   })
 })

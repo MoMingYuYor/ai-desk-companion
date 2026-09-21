@@ -74,7 +74,10 @@ export class MailSyncWorker {
     day: string,
     signal: AbortSignal
   ): Promise<SyncRunResult> {
-    const { uidValidity: validity, uidNext } = await session.open()
+    const first = await session.open()
+    const validity = first.uidValidity
+    // cap 是初始 open() 的固定快照:本轮窗口检索只装载 uid <= cap,完成后游标一次性推进到 cap
+    const cap = first.uidNext - 1
     let lastUid = state.lastUid
     if (state.uidValidity != null && validity !== state.uidValidity) {
       // 上次初始化中断后邮箱被重建:旧行全部失效,由仓储按指纹复用
@@ -82,40 +85,47 @@ export class MailSyncWorker {
       lastUid = 0
     }
     const win = initialWindow(day)
-    const cap = uidNext - 1
     this.ensureLive(signal)
     const uids = (await session.searchDays(win.since, win.before))
       .filter((uid) => uid <= cap)
       .sort((a, b) => a - b)
 
-    let added = await this.commitUidChunks(accountId, session, validity, uids, signal, (_top, isFinal, maxUid) => {
-      lastUid = Math.max(lastUid, maxUid)
-      return {
-        mailbox: 'INBOX',
-        uidValidity: validity,
-        lastUid,
-        oldestDay: win.since,
-        initialized: isFinal
-      }
-    })
-
+    let added = 0
     if (uids.length === 0) {
-      this.repository.commitBatch(accountId, validity, [], {
+      // 空窗口:提交成功即推进到 cap 并完成初始化,绝不回捞窗口外历史(AC10)
+      added += this.repository.commitBatch(accountId, validity, [], {
         mailbox: 'INBOX',
         uidValidity: validity,
-        lastUid,
+        lastUid: Math.max(lastUid, cap),
         oldestDay: win.since,
         initialized: true
       })
+    } else {
+      added = await this.commitUidChunks(accountId, session, validity, uids, signal, (_top, isFinal, maxUid) => {
+        // 非最后一批只推进到该批已处理最大 UID 并保留未初始化标记;
+        // 最后一批完整提交才把 lastUid 推进到 cap
+        lastUid = isFinal ? Math.max(lastUid, cap) : Math.max(lastUid, maxUid)
+        return {
+          mailbox: 'INBOX',
+          uidValidity: validity,
+          lastUid,
+          oldestDay: win.since,
+          initialized: isFinal
+        }
+      })
     }
 
-    // 补收初始扫描期间新到的邮件
+    // 补收初始扫描期间新到的邮件:仅补 (cap, 新 uidNext-1],不重扫 cap 及以下
     this.ensureLive(signal)
     const reopened = await session.open()
-    if (incrementalRange(lastUid, reopened.uidNext) != null) {
-      const catchUp = (await session.searchUids(lastUid, reopened.uidNext - 1)).sort((a, b) => a - b)
-      added += await this.commitUidChunks(accountId, session, validity, catchUp, signal, (_top, _isFinal, maxUid) => {
-        lastUid = Math.max(lastUid, maxUid)
+    if (validity !== reopened.uidValidity) {
+      // 初始化期间邮箱身份被重建:进入远端身份重建分支,不把旧 UID 当新邮箱记录
+      return this.rescanAfterReset(accountId, session, state, reopened.uidValidity, reopened.uidNext, day, signal)
+    }
+    if (incrementalRange(cap, reopened.uidNext) != null) {
+      const catchUp = (await session.searchUids(cap, reopened.uidNext - 1)).sort((a, b) => a - b)
+      added += await this.commitUidChunks(accountId, session, validity, catchUp, signal, (_top, isFinal, maxUid) => {
+        lastUid = isFinal ? Math.max(lastUid, reopened.uidNext - 1) : Math.max(lastUid, maxUid)
         return {
           mailbox: 'INBOX',
           uidValidity: validity,

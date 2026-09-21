@@ -1,0 +1,66 @@
+# O5:CI 在干净 Windows 上执行锁文件安装、单测、类型检查与构建,并留存 Node 基准数据。
+# 注意:此处只采集 Node 中 sql.js 的查询基准数据;暖态查询 P95 300ms 与交互连续阻塞 100ms
+# 属于真实 Windows/Electron runtime 指标,须在真机单独采集环境、版本和 trace,不在本 CI 冒充。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows clean check
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies from lockfile
+        run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      # Node 基准只留数据,不做任何 300ms/100ms 断言
+      - name: Node sql.js baseline (data only)
+        run: node scripts/measure-baseline.mjs --output baseline/baseline.json
+
+      - name: Upload baseline report
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-${{ github.sha }}
+          path: baseline/baseline.json
+          if-no-files-found: error
+
+      # 审计只记录不阻断:依赖处理在 Task 1 Step 4 的批准清单上执行
+      - name: Dependency audit (record only)
+        run: npm audit --json > npm-audit.json
+        continue-on-error: true
+
+      - name: Upload audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-audit-${{ github.sha }}
+          path: npm-audit.json
+          if-no-files-found: error

@@ -1,10 +1,12 @@
 // 窗口管理:工作台主窗口 / 桌宠悬浮窗 / 桌面信息面板
 import { BrowserWindow, screen } from 'electron'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import type { SqliteDb } from './db/connection'
 import { getMeta, setMeta } from './db/dao'
 import { resolvePetPlacement, panelBoundsForPet } from './pet/geometry'
 import { clampPetScale } from '../shared/petScale'
+import { isAllowedAppPageUrl, type IpcPolicyWindow, type WindowRole } from './security/ipcPolicy'
 
 let workbenchWindow: BrowserWindow | null = null
 let petWindow: BrowserWindow | null = null
@@ -29,8 +31,13 @@ function rendererUrl(page: string): string {
   return join(__dirname, '../renderer/', `${page}.html`)
 }
 
-function loadPage(win: BrowserWindow, page: string): void {
+// 登记页面 URL:创建窗口时固化,供 IPC 授权精确比对(frame 页面必须等于登记页面)
+const registeredPageUrls = new Map<WindowRole, string>()
+
+function loadPage(win: BrowserWindow, page: WindowRole): void {
   const url = rendererUrl(page)
+  // 开发态是 dev server URL;生产态是 renderer 目录内路径,统一转 file: URL 与 frame.url 同形态比较
+  registeredPageUrls.set(page, process.env.ELECTRON_RENDERER_URL ? url : pathToFileURL(url).href)
   if (process.env.ELECTRON_RENDERER_URL) {
     void win.loadURL(url)
     // 开发诊断:渲染层 error 级日志转发到终端,便于定位白屏类问题
@@ -52,11 +59,9 @@ function loadPage(win: BrowserWindow, page: string): void {
 
 // ---------- WebContents 安全加固 ----------
 
-/** 开发态允许 dev server(ELECTRON_RENDERER_URL)前缀,生产态允许 file: 协议(loadFile 的页面),其余视为外源 */
+/** 导航白名单:生产态仅精确应用页面(file:),开发态比较解析后的协议/主机/端口与页面路径,其余视为外源 */
 function isSameOriginUrl(url: string): boolean {
-  const devUrl = process.env.ELECTRON_RENDERER_URL
-  if (devUrl && url.startsWith(devUrl)) return true
-  return url.startsWith('file:')
+  return isAllowedAppPageUrl(url, process.env.ELECTRON_RENDERER_URL)
 }
 
 /** 加固所需的最小 webContents 形状(不依赖 BrowserWindow,便于单测注入假对象) */
@@ -76,6 +81,29 @@ export function hardenWebContents(wc: HardenableWebContents): void {
     if (isSameOriginUrl(url)) return
     event.preventDefault()
   })
+}
+
+// ---------- IPC 授权登记 ----------
+
+/**
+ * 当前存活窗口的 IPC 授权登记表:角色 + webContents id + 固化页面 URL。
+ * 供 src/main/ipc.ts 与外观 IPC 在每个 handler 入口调用 authorizeIpc 使用(任务 12 统一接线)。
+ */
+export function getWindowRegistry(): IpcPolicyWindow[] {
+  const entry = (role: WindowRole, win: BrowserWindow | null): IpcPolicyWindow | null => {
+    if (!win || win.isDestroyed()) return null
+    return {
+      role,
+      webContentsId: win.webContents.id,
+      pageUrl: registeredPageUrls.get(role) ?? '',
+      isDestroyed: () => win.isDestroyed()
+    }
+  }
+  return [
+    entry('workbench', workbenchWindow),
+    entry('pet', petWindow),
+    entry('panel', panelWindow)
+  ].filter((w): w is IpcPolicyWindow => w !== null)
 }
 
 // ---------- 工作台 ----------

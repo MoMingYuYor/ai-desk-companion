@@ -30,6 +30,15 @@ export function ChatPage({ refreshKey, petAction, locateConversationId }: Props)
   const messagesRef = useRef<HTMLDivElement>(null)
   // 会话内容加载序号:切换会话后只应用最新一次请求,迟到的旧响应直接丢弃(参照 useMailbox 的 listSeqRef)
   const listSeqRef = useRef(0)
+  // R8 运行绑定:页面只接收与本会话 + 当前 runId 精确匹配的流事件
+  const runRef = useRef<{ conversationId: string; runId: string; generation: number } | null>(null)
+  // 当前运行已应用的文本长度(单调序号):去掉快照与增量的重叠
+  const streamSeqRef = useRef(0)
+  // 事件处理器内读取的最新会话 ID(渲染期间同步,避免闭包过期)
+  const activeIdRef = useRef<string | null>(null)
+  activeIdRef.current = activeId
+  // 仅在会话真正切换时重置流式绑定;同会话的数据刷新不动正在进行的运行
+  const prevActiveIdRef = useRef<string | null>(null)
 
   const reloadConversations = useCallback((): void => {
     void window.api.listConversations().then(setConversations)
@@ -62,17 +71,23 @@ export function ChatPage({ refreshKey, petAction, locateConversationId }: Props)
   }, [locateConversationId?.at, locateConversationId?.id])
 
   useEffect(() => {
+    if (prevActiveIdRef.current === activeId) return
+    prevActiveIdRef.current = activeId
     if (!activeId) {
       setMessages([])
       setAnalysis(null)
       setMaterials([])
       setStreaming(false)
       setStreamText('')
+      runRef.current = null
+      streamSeqRef.current = 0
       return
     }
-    // 切换会话:重置流式状态,避免上一会话的流式文本串台
+    // 切换会话:重置流式状态与本页运行绑定;只重置绑定,不取消其他会话的后台运行
     setStreaming(false)
     setStreamText('')
+    runRef.current = null
+    streamSeqRef.current = 0
     reloadActive()
     // 材料列表通过消息列表附带展示,不单独拉取(简化)
   }, [activeId, conversations, reloadActive])
@@ -82,59 +97,99 @@ export function ChatPage({ refreshKey, petAction, locateConversationId }: Props)
     messagesRef.current?.scrollTo?.({ top: messagesRef.current.scrollHeight })
   }, [messages, streamText])
 
-  // 流式事件
+  // 流式事件(R8):事件判定先于任何 UI 状态变更,非当前运行零副作用
+  useSubscribe(
+    'evt:chat-started',
+    useCallback((payload: unknown) => {
+      const { conversationId, runId, runGeneration } = payload as {
+        conversationId: string; runId: string; runGeneration: number
+      }
+      if (conversationId !== activeIdRef.current) return
+      const bound = runRef.current
+      // 迟到的旧 started 不能把任意运行绑定为新运行
+      if (bound && bound.conversationId === conversationId && runGeneration <= bound.generation) return
+      runRef.current = { conversationId, runId, generation: runGeneration }
+      streamSeqRef.current = 0
+      setStreamText('')
+      setStreaming(true)
+    }, [])
+  )
   useSubscribe(
     'evt:chat-delta',
     useCallback((payload: unknown) => {
-      const { conversationId, delta } = payload as { conversationId: string; delta: string }
-      if (conversationId !== activeId) return
+      const { conversationId, runId, delta } = payload as { conversationId: string; runId: string; delta: string }
+      const bound = runRef.current
+      // 非当前会话或非当前运行的增量:直接丢弃
+      if (conversationId !== activeIdRef.current || !bound || bound.runId !== runId) return
+      streamSeqRef.current += delta.length
       setStreamText((prev) => prev + delta)
       setStreaming(true)
-    }, [activeId])
+    }, [])
   )
   useSubscribe(
     'evt:chat-done',
     useCallback(
       (payload: unknown) => {
-        const { conversationId } = payload as { conversationId: string }
+        const { conversationId, runId } = payload as { conversationId: string; runId: string }
+        const bound = runRef.current
+        // 旧运行完成事件不清空当前运行
+        if (!bound || bound.runId !== runId || conversationId !== bound.conversationId) return
+        runRef.current = null
+        streamSeqRef.current = 0
         setStreaming(false)
         setStreamText('')
-        if (conversationId === activeId) {
+        if (conversationId === activeIdRef.current) {
           reloadActive()
           reloadConversations()
         }
       },
-      [activeId, reloadActive, reloadConversations]
+      [reloadActive, reloadConversations]
     )
   )
   useSubscribe(
     'evt:chat-error',
     useCallback(
       (payload: unknown) => {
-        const { conversationId, error } = payload as { conversationId: string; error?: string }
+        const { conversationId, runId, error } = payload as { conversationId: string; runId: string; error?: string }
+        const bound = runRef.current
+        // 旧运行错误事件不清当前流,也不提示
+        if (!bound || bound.runId !== runId || conversationId !== bound.conversationId) return
+        runRef.current = null
+        streamSeqRef.current = 0
         setStreaming(false)
         setStreamText('')
-        if (conversationId === activeId) {
+        if (conversationId === activeIdRef.current) {
           reloadActive()
           if (error) showToast('分析失败:' + error)
         }
       },
-      [activeId, reloadActive, showToast]
+      [reloadActive, showToast]
     )
   )
   useSubscribe(
     'evt:analysis-updated',
     useCallback(
       (payload: unknown) => {
-        const { conversationId } = payload as { conversationId: string }
+        const { conversationId, runId } = payload as { conversationId: string; runId?: string }
+        const bound = runRef.current
+        // 非当前运行的分析更新不清流状态,只刷新数据
+        if (runId && bound && bound.runId !== runId) {
+          if (conversationId === activeIdRef.current) {
+            reloadActive()
+            reloadConversations()
+          }
+          return
+        }
+        runRef.current = null
+        streamSeqRef.current = 0
         setStreaming(false)
         setStreamText('')
-        if (conversationId === activeId) {
+        if (conversationId === activeIdRef.current) {
           reloadActive()
           reloadConversations()
         }
       },
-      [activeId, reloadActive, reloadConversations]
+      [reloadActive, reloadConversations]
     )
   )
   useSubscribe(
@@ -148,6 +203,24 @@ export function ChatPage({ refreshKey, petAction, locateConversationId }: Props)
       [activeId, reloadActive, reloadConversations]
     )
   )
+
+  // 订阅先建立再取快照:上面的 useSubscribe 先注册,切回会话时按活动运行快照恢复流式视图
+  useEffect(() => {
+    if (!activeId) return
+    void Promise.resolve(window.api.getActiveChatRun?.(activeId)).then((snap) => {
+      if (!snap || snap.conversationId !== activeId || activeIdRef.current !== activeId) return
+      const bound = runRef.current
+      if (bound && bound.conversationId === activeId) {
+        // 旧快照不覆盖新运行;同运行的旧快照不回退已累计文本
+        if (bound.generation > snap.runGeneration) return
+        if (bound.runId === snap.runId && snap.text.length < streamSeqRef.current) return
+      }
+      runRef.current = { conversationId: activeId, runId: snap.runId, generation: snap.runGeneration }
+      streamSeqRef.current = snap.text.length
+      setStreamText(snap.text)
+      setStreaming(true)
+    })
+  }, [activeId, conversations])
 
   const activeConv = conversations.find((c) => c.id === activeId) ?? null
 
@@ -189,7 +262,8 @@ export function ChatPage({ refreshKey, petAction, locateConversationId }: Props)
   }
 
   const stop = async (): Promise<void> => {
-    if (activeId) await window.api.stopChat(activeId)
+    // 停止命令对应当前绑定的活动 runId,防止误停其他会话/新运行
+    if (activeId) await window.api.stopChat(activeId, runRef.current?.runId)
   }
 
   const retry = async (): Promise<void> => {

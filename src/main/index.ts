@@ -3,7 +3,8 @@ import { app, BrowserWindow, Notification, nativeTheme, dialog } from 'electron'
 import { join } from 'node:path'
 import { openDatabase } from './db/connection'
 import { getProviderApiKey, initSchema } from './db/dao'
-import { decryptApiKey } from './keys'
+import { createPersistenceCoordinator, initWorkspaceEpoch } from './db/operations'
+import { decryptApiKey, migrateLegacyProviderKeys } from './keys'
 import { Engine } from './services/engine'
 import { sweepStalePdfTemp } from './services/materials'
 import { ModelRouter } from './services/modelRouter'
@@ -13,8 +14,6 @@ import {
   createPetWindow,
   createWorkbenchWindow,
   broadcastToAll,
-  getPanelWindow,
-  getPetWindow,
   getWorkbenchWindow,
   isQuitting,
   markQuitting
@@ -96,27 +95,30 @@ function bootstrap(): void {
       native,
       emit: (snapshot) => broadcastToAll(AppearanceChannels.changed, snapshot)
     })
-    unregisterAppearance = registerAppearanceIpc(appearanceService, (event, write) => {
-      // 只接受本应用三个窗口的主 frame;写权限仅工作台
-      const frame = event.senderFrame
-      if (frame && frame.parent) return false
-      const senderId = event.sender.id
-      const workbench = getWorkbenchWindow()
-      const owned = [workbench, getPetWindow(), getPanelWindow()].some(
-        (win) => win && !win.isDestroyed() && win.webContents.id === senderId
-      )
-      if (!owned) return false
-      return write ? workbench !== null && workbench.webContents.id === senderId : true
-    })
+    // 外观通道走 ipcPolicy 默认策略(登记窗口 + 精确页面 + 能力表:三窗口可读,仅工作台可写)
+    unregisterAppearance = registerAppearanceIpc(appearanceService)
 
     const sqlJsDistDir = app.isPackaged
       ? join(process.resourcesPath, 'app.asar.unpacked', 'node_modules', 'sql.js', 'dist')
       : join(app.getAppPath(), 'node_modules', 'sql.js', 'dist')
 
     const { db, flush } = await openDatabase(join(app.getPath('userData'), 'data.sqlite'), sqlJsDistDir)
-    dbRef = { db, flush, raw: null as never }
+    dbRef = { db, flush, raw: null as never, persist: null as never }
 
     initSchema(db)
+    // 版本迁移/初始化必须先持久化成功,再打开业务窗口
+    db.flush()
+    // R4:历史 plain: 模型密钥迁移——加密可用时事务化替换;不可用时标待处理,
+    // 这些记录在迁移完成前不能经模型路由继续使用(decryptApiKey 拒绝 plain:)
+    const keyMigration = migrateLegacyProviderKeys(db, safeStorageAdapter)
+    if (keyMigration.pending > 0) {
+      console.warn(
+        `[keys] 历史 plain: 模型密钥待迁移 ${keyMigration.pending} 条(safeStorage 不可用或载荷损坏),迁移前相关服务商不可用`
+      )
+    }
+    // 工作空间代数:每次启动更新,旧窗口写请求随后按 STALE_PREVIEW 拒绝
+    initWorkspaceEpoch()
+    const persistCoordinator = createPersistenceCoordinator(db)
 
     const petActivity = createPetActivityRegistry(broadcastPetActivity)
 
@@ -162,7 +164,7 @@ function bootstrap(): void {
       broadcast: (channel, payload) => broadcastToAll(channel, payload)
     })
 
-    registerIpcHandlers({ db, engine, router, reminders, petActivity, mail })
+    registerIpcHandlers({ db, engine, router, reminders, petActivity, mail, persistCoordinator })
     setDataChangedListener(() => {
       broadcastToAll('evt:data-changed', { at: Date.now() })
     })

@@ -1,6 +1,17 @@
-// IPC 注册:渲染进程可见 API 的全部处理入口
+// IPC 注册:渲染进程可见 API 的全部处理入口。
+// Task 12 集成:统一来源授权(R3)、恢复排他窗口(R1)、
+// 修改型命令 runOperation/commitCritical(R2/T2/T3)、公共 AppError 边界(O4)。
 import { BrowserWindow, Menu, app, clipboard, dialog, ipcMain } from 'electron'
+import { createHash, randomUUID } from 'node:crypto'
 import type { SqliteDb } from './db/connection'
+import {
+  assertRevision,
+  getWorkspaceEpoch,
+  runOperation,
+  OperationError
+} from './db/operations'
+import { appError, assertCurrentEpoch, toIpcError } from '../shared/operations'
+import type { AppError } from '../shared/operations'
 import { createUrlFetcher } from './services/urlFetch'
 import {
   createConversation,
@@ -9,15 +20,18 @@ import {
   deleteConversation,
   deleteCourse,
   deleteCourseOverride,
-  deleteEvent,
+  deleteEventInner,
   deletePending,
   deleteProfileFact,
   deleteProvider,
   deleteSchoolEvent,
   deleteSemester,
   deleteTodo,
+  getEvent,
   getMeta,
+  getPending,
   getProviderApiKey,
+  getTodo,
   latestAnalysis,
   listConversations,
   listCourseOverrides,
@@ -44,6 +58,9 @@ import {
   updatePending,
   updateTodo
 } from './db/dao'
+import { ensureNotRestoring, restoreBackup } from './services/backup'
+import { validateEventInput } from './planning/eventValidation'
+import { resolveExistingPendingInDb } from './planning/resolveExistingPending'
 import type { ProviderInfo } from '../shared/types'
 import { Channels } from '../shared/api'
 import type {
@@ -56,25 +73,30 @@ import type {
   SchoolEvent,
   TodoInput
 } from '../shared/types'
+import type { ResolvePendingCommand } from '../shared/api'
 import type { Engine } from './services/engine'
 import type { ModelRouter } from './services/modelRouter'
 import type { ReminderService } from './services/reminder'
+import type { PersistenceCoordinator } from './db/operations'
 import { buildDayAgenda } from './services/context'
-import { exportBackup, importBackup } from './services/backup'
+import { exportBackup } from './services/backup'
 import { decryptApiKey, encryptApiKey } from './keys'
 import {
   createWorkbenchWindow,
   getPanelWindow,
   getPetWindow,
   getWorkbenchWindow,
+  broadcastToAll,
   markQuitting,
   petScaleOf,
   savePetPosition,
   setPanelPinnedMeta,
   setPetScale,
   togglePet,
-  createPanelWindow
+  createPanelWindow,
+  getWindowRegistry
 } from './windows'
+import { authorizeIpc } from './security/ipcPolicy'
 import { markPetBubble } from './petBridge'
 import { createPetDragService } from './pet/drag'
 import type { PetActivityRegistry } from './pet/activity'
@@ -87,6 +109,8 @@ export interface IpcDeps {
   reminders: ReminderService
   petActivity: PetActivityRegistry
   mail: MailService
+  /** 持久化协调器:存在时向全部窗口广播保存状态(evt:persist-state) */
+  persistCoordinator?: PersistenceCoordinator
 }
 
 let depsRef: IpcDeps | null = null
@@ -106,39 +130,131 @@ function notifyChange<T>(value: T): T {
   return value
 }
 
+/** 恢复成功后通知各窗口重读 revision/workspaceEpoch(evt: 前缀白名单放行) */
+const EVT_WORKSPACE_EPOCH_CHANGED = 'evt:workspace-epoch-changed'
+
+/**
+ * 修改型 IPC 通道清单(R1):统一包装在入口调用 ensureNotRestoring(),
+ * 恢复排他窗口内以 BUSY(可重试)拒绝新写入;只读与救援导出不受限。
+ */
+const WRITE_CHANNELS: ReadonlySet<string> = new Set([
+  Channels.ProvidersSave,
+  Channels.ProvidersDelete,
+  Channels.ProvidersSetDefault,
+  Channels.ConversationsCreate,
+  Channels.ConversationsRename,
+  Channels.ConversationsDelete,
+  Channels.ChatSend,
+  Channels.ChatRetry,
+  Channels.MaterialsAdd,
+  Channels.AnalysisConfirmItem,
+  Channels.AnalysisDeferItem,
+  Channels.EventsCreate,
+  Channels.EventsUpdate,
+  Channels.EventsDelete,
+  Channels.TodosCreate,
+  Channels.TodosUpdate,
+  Channels.TodosDelete,
+  Channels.TodosLinkEvent,
+  Channels.PendingUpdate,
+  Channels.PendingDelete,
+  Channels.PendingResolve,
+  Channels.SemestersSave,
+  Channels.SemestersDelete,
+  Channels.CoursesSave,
+  Channels.CoursesDelete,
+  Channels.CourseOverridesSave,
+  Channels.CourseOverridesDelete,
+  Channels.SchoolEventsSave,
+  Channels.SchoolEventsDelete,
+  Channels.ImportTimetable,
+  Channels.ImportSchoolCalendar,
+  Channels.ImportHandled,
+  Channels.ProfileSave,
+  Channels.ProfileDelete,
+  Channels.ProfileResolve,
+  Channels.PanelSetPinned,
+  Channels.BackupImport,
+  Channels.MailSave,
+  Channels.MailSetEnabled,
+  Channels.MailRemove,
+  Channels.MailSync,
+  Channels.MailEarlier,
+  Channels.MailMarkRead,
+  Channels.MailDownload,
+  Channels.MailSaveAttachment,
+  Channels.MailAnalyze,
+  Channels.MailCancelAnalysis
+])
+
+/** IPC 失败日志与错误透传:只含通道、错误分类、操作 ID 与面向用户的消息(脱敏,不含参数/正文/凭据) */
+function failIpc(channel: string, err: unknown): Error {
+  const out = toIpcError(err)
+  const code = out.appError?.code ?? 'INTERNAL'
+  const opId = out.appError?.operationId
+  console.error(`[ipc:${channel}] code=${code}${opId ? ` op=${opId}` : ''} msg=${out.message}`)
+  return out
+}
+
+/** 把未知异常归一为公共 AppError(Result 命令用);未知内部错误按可重试的持久层失败兜底 */
+function appErrorOf(err: unknown): AppError {
+  const carried = toIpcError(err)
+  return carried.appError ?? appError('PERSIST_FAILED', carried.message, { retryable: true })
+}
+
+/** 渲染层渐进提供 MutationContext;缺省由主进程注入当前 epoch 与新 operationId */
+interface MutationEnvelopeInput {
+  context?: { workspaceEpoch?: unknown; operationId?: unknown }
+}
+
+async function writeMutation<T>(db: SqliteDb, deps: IpcDeps, command: string, payload: unknown, apply: () => T): Promise<T> {
+  const current = getWorkspaceEpoch()
+  const ctx = (payload as MutationEnvelopeInput | null | undefined)?.context
+  // 旧窗口/旧异步任务携带旧 epoch:按 STALE_PREVIEW 拒绝,UI 重读 revision/epoch 后恢复可用
+  assertCurrentEpoch(typeof ctx?.workspaceEpoch === 'string' ? ctx.workspaceEpoch : null, current)
+  const operationId =
+    typeof ctx?.operationId === 'string' && ctx.operationId !== '' ? ctx.operationId : randomUUID()
+  const requestHash = createHash('sha1').update(JSON.stringify(payload ?? null)).digest('hex')
+  const { value } = runOperation(
+    db,
+    { operationId, command, requestHash, workspaceEpoch: current },
+    apply
+  )
+  // 关键命令只有事务提交且落盘成功才返回成功(T3)
+  if (deps.persistCoordinator) {
+    return deps.persistCoordinator.commitCritical(operationId, value)
+  }
+  return value
+}
+
+function writeNotify<T>(db: SqliteDb, deps: IpcDeps, command: string, payload: unknown, apply: () => T): Promise<T> {
+  return writeMutation(db, deps, command, payload, apply).then((value) => notifyChange(value))
+}
+
 export function registerIpcHandlers(deps: IpcDeps): void {
   depsRef = deps
   const { db, engine, router, reminders, mail } = deps
   const fetchUrlText = createUrlFetcher()
 
-  const handle = (channel: string, fn: (...args: never[]) => unknown): void => {
-    ipcMain.handle(channel, async (_event, ...args) => {
-      try {
-        return await fn(...(args as never[]))
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
-        console.error(`[ipc:${channel}]`, message)
-        throw new Error(message)
-      }
+  // 保存状态变化统一广播;UI 据此展示"未保存"状态,不依赖各命令自行上报
+  if (deps.persistCoordinator) {
+    deps.persistCoordinator.subscribePersistState((state) => {
+      broadcastToAll(Channels.EventPersistStateChanged, state)
     })
   }
 
-  // 桌宠通道:仅接受桌宠窗口主 frame 的调用,防止其他页面/子 frame 调用原生拖动/快照
-  const handleFromPet = (channel: string, fn: (...args: never[]) => unknown): void => {
+  // 统一注册包装(R3 + R1):先来源/能力授权(未授权零业务副作用),
+  // 修改型通道再检查恢复排他窗口;失败按公共 AppError 边界透传与记录
+  const handle = (channel: string, fn: (...args: never[]) => unknown): void => {
     ipcMain.handle(channel, async (event, ...args) => {
-      const pet = getPetWindow()
-      const senderValid = !!pet && !pet.isDestroyed() && event.sender.id === pet.webContents.id
-      // 主 frame 的 parent 为 null;子 frame(iframe)才有 parent
-      const isMainFrame = !event.senderFrame || !event.senderFrame.parent
-      if (!senderValid || !isMainFrame) {
-        throw new Error('FORBIDDEN: 桌宠通道来源无效')
-      }
       try {
+        if (!authorizeIpc(event, channel, getWindowRegistry())) {
+          throw new OperationError(appError('FORBIDDEN', '来源未授权,请求被拒绝', { retryable: false }))
+        }
+        if (WRITE_CHANNELS.has(channel)) ensureNotRestoring()
         return await fn(...(args as never[]))
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
-        console.error(`[ipc:${channel}]`, message)
-        throw new Error(message)
+        throw failIpc(channel, err)
       }
     })
   }
@@ -151,6 +267,8 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     dbPath: app.getPath('userData') + '/data.sqlite',
     platform: process.platform
   }))
+  // 只读:可信窗口初始化与恢复后刷新使用;旧代数的写请求由各命令在边界拒绝
+  handle(Channels.WorkspaceEpoch, () => getWorkspaceEpoch())
 
   // ---- providers ----
   handle(Channels.ProvidersList, (): ProviderInfo[] => listProviders(db))
@@ -203,6 +321,8 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   handle(Channels.ChatSend, (conversationId: string, text: string) => engine.sendChat(conversationId, text))
   handle(Channels.ChatStop, (conversationId: string) => engine.stop(conversationId))
   handle(Channels.ChatRetry, (conversationId: string) => engine.retry(conversationId))
+  // R8:当前活动运行快照(视图切回);恢复 epoch 后由 invalidateAllRuns 清空
+  handle(Channels.ChatActiveRun, (conversationId: string) => engine.getActiveChatRun(conversationId))
   handle(Channels.MaterialsAdd, (input: MaterialIntakeInput) => engine.intakeMaterials(input))
   handle(Channels.UrlFetch, (url: string) => fetchUrlText(url))
 
@@ -221,25 +341,116 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     pendingId: engine.deferItem(analysisId, item)
   }))
 
-  // ---- events / todos ----
+  // ---- events / todos / pending(R2/T2/T3:runOperation 唯一事务 + 回执 + 落盘确认) ----
   handle(Channels.EventsRange, (from: string, to: string) => listEventsRange(db, from, to))
-  handle(Channels.EventsCreate, (input: EventInput) => notifyChange(createEvent(db, input)))
-  handle(Channels.EventsUpdate, (id: string, patch: Partial<EventInput>) => notifyChange(updateEvent(db, id, patch)))
-  handle(Channels.EventsDelete, (id: string) => notifyChange(deleteEvent(db, id)))
+  handle(Channels.EventsCreate, (input: EventInput) =>
+    writeNotify(db, deps, 'events:create', input, () => {
+      // 集中校验(R7):空标题/不可解析日期/倒置区间在开事务前拒绝
+      validateEventInput(input)
+      return createEvent(db, input)
+    })
+  )
+  handle(Channels.EventsUpdate, (id: string, patch: Partial<EventInput>) =>
+    writeNotify(db, deps, 'events:update', { id, patch }, () => {
+      const existing = getEvent(db, id)
+      if (!existing) {
+        throw new OperationError(appError('TARGET_UNAVAILABLE', '日程不存在或已被删除', { retryable: false }))
+      }
+      // Partial 更新以当前值为基合并后集中校验;修订号条件检查在同一事务内
+      validateEventInput({ ...existing, ...patch } as EventInput)
+      assertRevision(db, 'events', id, existing.revision)
+      updateEvent(db, id, patch)
+      return getEvent(db, id) ?? null
+    })
+  )
+  handle(Channels.EventsDelete, (id: string) =>
+    writeNotify(db, deps, 'events:delete', { id }, () => {
+      const existing = getEvent(db, id)
+      if (!existing) {
+        throw new OperationError(appError('TARGET_UNAVAILABLE', '日程不存在或已被删除', { retryable: false }))
+      }
+      assertRevision(db, 'events', id, existing.revision)
+      deleteEventInner(db, id) // 无独立事务:唯一事务所有权在 runOperation
+      return { id, deleted: true }
+    })
+  )
   handle(Channels.TodosList, () => listTodos(db))
-  handle(Channels.TodosCreate, (input: TodoInput) => notifyChange(createTodo(db, input)))
-  handle(Channels.TodosUpdate, (id: string, patch: Partial<TodoInput>) => notifyChange(updateTodo(db, id, patch)))
-  handle(Channels.TodosDelete, (id: string) => notifyChange(deleteTodo(db, id)))
+  handle(Channels.TodosCreate, (input: TodoInput) =>
+    writeNotify(db, deps, 'todos:create', input, () => createTodo(db, input))
+  )
+  handle(Channels.TodosUpdate, (id: string, patch: Partial<TodoInput>) =>
+    writeNotify(db, deps, 'todos:update', { id, patch }, () => {
+      const existing = getTodo(db, id)
+      if (!existing) {
+        throw new OperationError(appError('TARGET_UNAVAILABLE', '待办不存在或已被删除', { retryable: false }))
+      }
+      assertRevision(db, 'todos', id, existing.revision)
+      updateTodo(db, id, patch)
+      return getTodo(db, id) ?? null
+    })
+  )
+  handle(Channels.TodosDelete, (id: string) =>
+    writeNotify(db, deps, 'todos:delete', { id }, () => {
+      const existing = getTodo(db, id)
+      if (!existing) {
+        throw new OperationError(appError('TARGET_UNAVAILABLE', '待办不存在或已被删除', { retryable: false }))
+      }
+      assertRevision(db, 'todos', id, existing.revision)
+      deleteTodo(db, id)
+      return { id, deleted: true }
+    })
+  )
   handle(Channels.TodosLinkEvent, (todoId: string, eventId: string | null) =>
-    notifyChange(updateTodo(db, todoId, { linkedEventId: eventId }))
+    writeNotify(db, deps, 'todos:link-event', { todoId, eventId }, () => {
+      const existing = getTodo(db, todoId)
+      if (!existing) {
+        throw new OperationError(appError('TARGET_UNAVAILABLE', '待办不存在或已被删除', { retryable: false }))
+      }
+      assertRevision(db, 'todos', todoId, existing.revision)
+      updateTodo(db, todoId, { linkedEventId: eventId })
+      return { todoId, eventId }
+    })
   )
 
   // ---- pending ----
   handle(Channels.PendingList, () => listPending(db))
   handle(Channels.PendingUpdate, (id: string, patch: { status?: 'open' | 'handled' | 'dismissed'; title?: string; notes?: string }) =>
-    notifyChange(updatePending(db, id, patch))
+    writeNotify(db, deps, 'pending:update', { id, patch }, () => {
+      // getPending 不按状态过滤:置 handled/dismissed 的条目仍可被后续命令定位
+      const existing = getPending(db, id)
+      if (!existing) {
+        throw new OperationError(appError('TARGET_UNAVAILABLE', '条目不存在或已被删除', { retryable: false }))
+      }
+      assertRevision(db, 'pending_items', id, existing.revision)
+      updatePending(db, id, patch)
+      return { id }
+    })
   )
-  handle(Channels.PendingDelete, (id: string) => notifyChange(deletePending(db, id)))
+  handle(Channels.PendingDelete, (id: string) =>
+    writeNotify(db, deps, 'pending:delete', { id }, () => {
+      const existing = getPending(db, id)
+      if (!existing) {
+        throw new OperationError(appError('TARGET_UNAVAILABLE', '条目不存在或已被删除', { retryable: false }))
+      }
+      assertRevision(db, 'pending_items', id, existing.revision)
+      deletePending(db, id)
+      return { id, deleted: true }
+    })
+  )
+  // 原子转换(Task 8/R7):入口 epoch 校验,错误以公共 Result 返回而非抛异常
+  handle(Channels.PendingResolve, (command: ResolvePendingCommand) => {
+    try {
+      const current = getWorkspaceEpoch()
+      assertCurrentEpoch(command?.context?.workspaceEpoch ?? null, current)
+      const value = resolveExistingPendingInDb(db, command)
+      const committed = deps.persistCoordinator
+        ? deps.persistCoordinator.commitCritical(command.context.operationId, value)
+        : Promise.resolve(value)
+      return committed.then((v) => ({ ok: true as const, value: v }))
+    } catch (err) {
+      return Promise.resolve({ ok: false as const, error: appErrorOf(err) })
+    }
+  })
 
   // ---- timetable ----
   handle(Channels.SemestersList, () => listSemesters(db))
@@ -307,22 +518,23 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     setPanelPinnedMeta(db, pinned)
   })
   handle(Channels.PanelGetPinned, () => getMeta(db, 'panel:pinned') === '1')
-  handleFromPet(Channels.PetDragStart, () => {
+  // 桌宠通道的来源/能力限制由 authorizeIpc 的 PET_CHANNELS 能力表统一覆盖(R3)
+  handle(Channels.PetDragStart, () => {
     const pet = getPetWindow()
     if (pet) petDrag.start(pet)
   })
-  handleFromPet(Channels.PetDragMove, () => movePetDrag())
-  handleFromPet(Channels.PetDragEnd, () => {
+  handle(Channels.PetDragMove, () => movePetDrag())
+  handle(Channels.PetDragEnd, () => {
     petDrag.end()
     savePetPosition(db)
   })
-  handleFromPet(Channels.PetOpenMenu, () => openPetMenu())
-  handleFromPet(Channels.PetGetScale, () => petScaleOf(db))
-  handleFromPet(Channels.PetSetScale, (scale: number) => setPetScale(db, scale))
-  handleFromPet(Channels.PetAction, (action: string) => runPetAction(action))
-  handleFromPet(Channels.PetActivitySnapshot, () => deps.petActivity.snapshot())
+  handle(Channels.PetOpenMenu, () => openPetMenu())
+  handle(Channels.PetGetScale, () => petScaleOf(db))
+  handle(Channels.PetSetScale, (scale: number) => setPetScale(db, scale))
+  handle(Channels.PetAction, (action: string) => runPetAction(action))
+  handle(Channels.PetActivitySnapshot, () => deps.petActivity.snapshot())
 
-  // ---- backup ----
+  // ---- backup(T4/R1:先验校验 + 排他窗口 + 失败回滚) ----
   handle(Channels.BackupExport, async () => {
     const win = getWorkbenchWindow() ?? BrowserWindow.getFocusedWindow() ?? undefined
     const r = await dialog.showSaveDialog(win!, {
@@ -342,16 +554,19 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       properties: ['openFile']
     })
     if (r.canceled || r.filePaths.length === 0) return false
-    // 阻止在途邮件分析写入,导入完成后恢复
-    const resume = await mail.quiesceForBackup()
-    try {
-      importBackup(db, r.filePaths[0])
-    } finally {
-      resume()
-    }
-    reminders.tick()
-    broadcastDataChanged()
-    markPetBubble('备份已恢复,数据已更新')
+    // 排他窗口:先验(坏文件零写入) → 阻止新写入 → 排空在途邮箱任务并落盘 →
+    // 提升 workspaceEpoch → 门控后快照 → 单事务替换 → 落盘确认(失败回滚)
+    await restoreBackup(db, r.filePaths[0], {
+      quiesceExternal: () => mail.quiesceExternal(),
+      onRestored: () => {
+        // 旧会话运行全部失效;提醒按新库重扫;各窗口重读 revision/epoch
+        engine.invalidateAllRuns()
+        reminders.tick()
+        broadcastDataChanged()
+        broadcastToAll(EVT_WORKSPACE_EPOCH_CHANGED, { epoch: getWorkspaceEpoch() })
+        markPetBubble('备份已恢复,数据已更新')
+      }
+    })
     return true
   })
 
@@ -408,19 +623,27 @@ export function runPetAction(action: string): void {
   const { db, engine } = depsRef
   switch (action) {
     case 'analyze-clipboard': {
-      const text = clipboard.readText() ?? ''
-      if (text.trim()) {
-        void engine
-          .intakeMaterials({ texts: [{ name: '剪贴板通知', content: text }], autoRun: true })
-          .catch((err: unknown) => {
-            // 失败气泡此时已提示"已开始分析",必须兜底,避免 unhandledrejection
-            console.error('[pet:analyze-clipboard]', err instanceof Error ? err.message : String(err))
-            markPetBubble('剪贴板分析失败,请重试')
-          })
-        markPetBubble('已开始分析剪贴板通知…')
-      } else {
-        markPetBubble('剪贴板没有文本内容')
-      }
+      // electron 44:clipboard.readText() 由同步变更为返回 Promise<string>,改异步获取;
+      // 气泡提示与分析失败的兜底链路保持原语义(失败必须兜底,避免 unhandledrejection)
+      void clipboard
+        .readText()
+        .then((text) => {
+          if (!text.trim()) {
+            markPetBubble('剪贴板没有文本内容')
+            return
+          }
+          void engine
+            .intakeMaterials({ texts: [{ name: '剪贴板通知', content: text }], autoRun: true })
+            .catch((err: unknown) => {
+              console.error('[pet:analyze-clipboard]', err instanceof Error ? err.message : String(err))
+              markPetBubble('剪贴板分析失败,请重试')
+            })
+          markPetBubble('已开始分析剪贴板通知…')
+        })
+        .catch((err: unknown) => {
+          console.error('[pet:analyze-clipboard]', err instanceof Error ? err.message : String(err))
+          markPetBubble('剪贴板分析失败,请重试')
+        })
       break
     }
     case 'new-event':

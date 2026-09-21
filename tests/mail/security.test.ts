@@ -1,5 +1,9 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { extractLinks, htmlToText, normalizeLinkUrl, sanitizeMailHtml } from '../../src/main/mail/sanitize'
+import { MailAccountStore } from '../../src/main/mail/accounts'
+import { MailError } from '../../src/main/mail/errors'
+import { decryptCredential, encryptCredential, type CredentialStorage } from '../../src/main/mail/credentials'
+import { makeTestDb } from '../helpers'
 
 describe('sanitizeMailHtml 白名单清理', () => {
   it('剥离 script 标签及其内容', () => {
@@ -138,5 +142,66 @@ describe('normalizeLinkUrl 协议验证', () => {
     expect(normalizeLinkUrl('file:///C:/Windows/System32')).toBeNull()
     expect(normalizeLinkUrl('ftp://example.com/f')).toBeNull()
     expect(normalizeLinkUrl('')).toBeNull()
+  })
+})
+
+// R4(Task 6):邮箱凭据加密边界——与模型密钥同一安全要求:拒绝明文降级、不可还原凭据不出库
+describe('R4:邮箱凭据加密边界(拒绝明文降级)', () => {
+  /** 可对称加解密的凭据存储替身,可控可用性 */
+  function makeStorage(available = true): CredentialStorage {
+    return {
+      isEncryptionAvailable: () => available,
+      encryptString: (value: string) => Buffer.from(`enc:${value}`, 'utf8'),
+      decryptString: (value: Buffer) => {
+        const text = Buffer.from(value).toString('utf8')
+        if (!text.startsWith('enc:')) throw new Error('not a protected value')
+        return text.slice(4)
+      }
+    }
+  }
+
+  const unavailable = {
+    isEncryptionAvailable: () => false,
+    encryptString: vi.fn(),
+    decryptString: vi.fn()
+  }
+
+  function accountInput() {
+    return {
+      label: '工作邮箱',
+      email: 'Alice@Example.COM',
+      provider: 'custom' as const,
+      host: 'imap.example.com',
+      port: 993,
+      credential: 'app-password-1'
+    }
+  }
+
+  it('系统加密不可用时 encryptCredential 拒绝,不产生可还原凭据', () => {
+    expect(() => encryptCredential('app-password-1', unavailable)).toThrow(MailError)
+    expect(unavailable.encryptString).not.toHaveBeenCalled()
+  })
+
+  it('解密拒绝旧明文/裸 base64/空值,不做明文回落', () => {
+    const storage = makeStorage()
+    for (const legacy of ['plain:c2VjcmV0', 'c2VjcmV0', '', 'aGk=']) {
+      expect(() => decryptCredential(legacy, storage), legacy).toThrow(MailError)
+    }
+  })
+
+  it('安全存储不可用时保存账号被明确拒绝且不落库', async () => {
+    const db = await makeTestDb()
+    const store = new MailAccountStore(db, unavailable)
+    expect(() => store.saveVerified(accountInput())).toThrow(MailError)
+    expect(db.all<{ id: string }>('SELECT id FROM mail_accounts')).toHaveLength(0)
+  })
+
+  it('账号信息不携带可还原凭据', async () => {
+    const db = await makeTestDb()
+    const store = new MailAccountStore(db, makeStorage())
+    const info = store.saveVerified(accountInput())
+    expect(info.hasCredential).toBe(true)
+    expect(JSON.stringify(info)).not.toContain('app-password-1')
+    expect(JSON.stringify(info)).not.toContain('enc:')
   })
 })

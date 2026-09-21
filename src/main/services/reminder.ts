@@ -1,9 +1,9 @@
 // 提醒服务:独立于 AI 运行;后台计时、到期通知、重启补查错过的提醒
 // (系统通知的具体展示由注入的 showNotification 实现,便于测试与解耦)
 import type { SqliteDb } from '../db/connection'
-import { isReminderFired, listTodos, listEventsRange, markReminderFired } from '../db/dao'
+import { isReminderFired, listDueTodoCandidates, listReminderEventCandidates, markReminderFired } from '../db/dao'
 import type { CalendarEvent, ReminderNotice, Todo } from '../../shared/types'
-import { addDays, nowLocalIso, toDateStr, fmtDateCn, fmtTime } from '../../shared/dateUtils'
+import { fmtDateCn, fmtTime, parseLocalDateTimeMs, toLocalIso, toLocalIsoMs } from '../../shared/dateUtils'
 
 export interface ReminderDeps {
   db: SqliteDb
@@ -12,16 +12,91 @@ export interface ReminderDeps {
   onFired?: (n: ReminderNotice) => void
 }
 
-const MISSED_WINDOW_HOURS = 24
+/** 补报窗口:fireAt ∈ [now - 24h, now],闭合区间(Global Constraints / R6) */
+const MISSED_WINDOW_MS = 24 * 60 * 60 * 1000
+/**
+ * SQL 粗筛边界余量(1 小时):字符串粗筛只保证候选超集,
+ * 精确到毫秒的窗口判定在内存中按 UTC 毫秒完成,余量抵消格式差异与夏令时偏移。
+ */
+const BOUND_PAD_MS = 60 * 60 * 1000
+
+export interface DueReminder {
+  /** 触发提醒的实体 ID(日程或待办) */
+  entityId: string
+  /** 实际触发时刻(本地朴素时间,毫秒精度) */
+  fireAt: string
+  /** 幂等键:与既有 fired_reminders 记录格式保持一致 */
+  key: string
+  kind: ReminderNotice['kind']
+  title: string
+  body: string
+}
+
+/**
+ * 当前应触发但尚未触发(fired)的提醒列表,注入时钟 now,便于边界与重启补报测试。
+ * 通知前检查已完成/取消:已完成待办与取消/软删日程不出现在结果中;
+ * 同一 key 标记 fired 后不再报。窗口为闭合区间 [now-24h, now],边界 1ms 之差都算界外。
+ */
+export function dueReminders(db: SqliteDb, now: Date): DueReminder[] {
+  const nowMs = now.getTime()
+  const windowStartMs = nowMs - MISSED_WINDOW_MS
+  const out: DueReminder[] = []
+
+  // 日程:fireAt = startAt - reminderMinutes,统一经集中转换进入 UTC 毫秒比较。
+  // 粗筛:fireAt ∈ [now-24h, now] 且 reminderMinutes >= 0 时,
+  // start_at 必然 ∈ [now-24h, now + 最大提前量],两侧各留 1 小时余量。
+  const maxRemMinutes = db.get<{ m: number | null }>(
+    "SELECT MAX(reminder_minutes) AS m FROM events WHERE status = 'active' AND reminder_minutes IS NOT NULL"
+  )?.m ?? 0
+  const startFrom = toLocalIsoMs(new Date(windowStartMs - BOUND_PAD_MS))
+  const startTo = toLocalIsoMs(new Date(nowMs + maxRemMinutes * 60_000 + BOUND_PAD_MS))
+  for (const ev of listReminderEventCandidates(db, startFrom, startTo)) {
+    const startMs = parseLocalDateTimeMs(ev.start_at)
+    if (startMs == null) continue // 不可解析的历史数据跳过,不猜测触发时刻
+    const fireMs = startMs - ev.reminder_minutes * 60_000
+    if (fireMs < windowStartMs || fireMs > nowMs) continue
+    const key = `ev:${ev.id}:${ev.start_at}:${ev.reminder_minutes}`
+    if (isReminderFired(db, key)) continue
+    const fireDate = new Date(fireMs)
+    const missed =
+      fireDate.getFullYear() !== now.getFullYear() ||
+      fireDate.getMonth() !== now.getMonth() ||
+      fireDate.getDate() !== now.getDate()
+    out.push({
+      entityId: ev.id,
+      fireAt: toLocalIsoMs(fireDate),
+      key,
+      kind: missed ? 'missed-event' : 'event',
+      title: missed ? `错过的提醒:${ev.title}` : `即将开始:${ev.title}`,
+      body: `${fmtDateCn(ev.start_at)} ${fmtTime(ev.start_at)}${ev.location ? ' @' + ev.location : ''}`
+    })
+  }
+
+  // 待办:dueAt 即触发时刻;已完成与无截止时间的待办不生成提醒
+  for (const td of listDueTodoCandidates(db)) {
+    const dueMs = parseLocalDateTimeMs(td.due_at)
+    if (dueMs == null) continue
+    if (dueMs < windowStartMs || dueMs > nowMs) continue
+    const key = `td:${td.id}:${td.due_at}`
+    if (isReminderFired(db, key)) continue
+    out.push({
+      entityId: td.id,
+      fireAt: td.due_at,
+      key,
+      kind: 'todo',
+      title: `待办到期:${td.title}`,
+      body: `截止 ${fmtDateCn(td.due_at)} ${fmtTime(td.due_at)}`
+    })
+  }
+  return out
+}
 
 export class ReminderService {
   private timer: ReturnType<typeof setInterval> | null = null
-  private lastScanIso = ''
 
   constructor(private deps: ReminderDeps) {}
 
   start(): void {
-    this.lastScanIso = nowLocalIso()
     this.tick()
     this.timer = setInterval(() => this.tick(), 30_000)
   }
@@ -31,76 +106,32 @@ export class ReminderService {
     this.timer = null
   }
 
-  /** 立即扫描一次(重启后/睡眠恢复后可调用) */
+  /**
+   * 立即扫描一次(重启后/睡眠恢复后可调用)。扫描以实际触发时刻 fireAt 为准,
+   * 重启后仅补报过去 24 小时内应触发的活跃事项。
+   * 顺序:先通知后标记——showNotification 成功仅代表交给操作系统,
+   * 通知抛错时不标记 fired,下一轮重试,避免"先标记后丢通知"。
+   */
   tick(): void {
-    const now = nowLocalIso()
-    const today = toDateStr(new Date())
-    const missedSince = addDays(today, -1) + 'T00:00'
-    let notices: ReminderNotice[] = []
-
-    // 日程提醒:start - reminderMinutes <= now 且未触发过
-    const events = listEventsRange(this.deps.db, missedSince, addDays(today, 2) + 'T00:00')
-    for (const ev of events) {
-      if (ev.reminderMinutes == null) continue
-      const fireAt = shiftMinutes(ev.startAt, -ev.reminderMinutes)
-      if (fireAt > now) continue
-      const key = `ev:${ev.id}:${ev.startAt}:${ev.reminderMinutes}`
-      if (isReminderFired(this.deps.db, key)) continue
-      markReminderFired(this.deps.db, key)
-      const missed = fireAt < this.lastScanIso && !isToday(fireAt, today)
-      notices.push({
-        key,
-        kind: missed ? 'missed-event' : 'event',
-        title: missed ? `错过的提醒:${ev.title}` : `即将开始:${ev.title}`,
-        body: `${fmtDateCn(ev.startAt)} ${fmtTime(ev.startAt)}${ev.location ? ' @' + ev.location : ''}`,
-        at: now
-      })
-    }
-
-    // 待办到期提醒
-    const todos = listTodos(this.deps.db)
-    for (const td of todos) {
-      if (td.completedAt || !td.dueAt) continue
-      if (td.dueAt > now) continue
-      const key = `td:${td.id}:${td.dueAt}`
-      if (isReminderFired(this.deps.db, key)) continue
-      markReminderFired(this.deps.db, key)
-      notices.push({
-        key,
-        kind: 'todo',
-        title: `待办到期:${td.title}`,
-        body: `截止 ${fmtDateCn(td.dueAt)} ${fmtTime(td.dueAt)}`,
-        at: now
-      })
-    }
-
-    notices = notices.filter((n) => n.kind.startsWith('missed') ? this.withinMissedWindow(n.key, now, MISSED_WINDOW_HOURS) : true)
-
-    if (notices.length > 0) {
-      for (const n of notices) {
-        this.deps.broadcast('evt:reminder-fired', n)
-        this.deps.onFired?.(n)
-        this.deps.showNotification(n)
+    const now = new Date()
+    for (const due of dueReminders(this.deps.db, now)) {
+      const notice: ReminderNotice = {
+        key: due.key,
+        kind: due.kind,
+        title: due.title,
+        body: due.body,
+        at: toLocalIso(now)
       }
+      try {
+        this.deps.broadcast('evt:reminder-fired', notice)
+        this.deps.onFired?.(notice)
+        this.deps.showNotification(notice)
+      } catch {
+        continue
+      }
+      markReminderFired(this.deps.db, due.key)
     }
-    this.lastScanIso = now
   }
-
-  private withinMissedWindow(_key: string, _now: string, _hours: number): boolean {
-    // 上面已把扫描范围限制在 24 小时内,这里直接放行
-    return true
-  }
-}
-
-function shiftMinutes(iso: string, minutes: number): string {
-  const d = new Date(iso)
-  d.setMinutes(d.getMinutes() + minutes)
-  const pad = (n: number): string => (n < 10 ? '0' + n : String(n))
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
-
-function isToday(iso: string, today: string): boolean {
-  return iso.slice(0, 10) === today
 }
 
 export function summarizeUpcoming(events: CalendarEvent[], todos: Todo[], now: string): string {

@@ -7,6 +7,7 @@ import {
   DEFAULT_BACKOFF_DELAYS,
   DEFAULT_MAX_ATTEMPTS,
   MailScheduler,
+  MailTaskRegistry,
   retryDelay,
   todayLocalDay,
   withBackoff
@@ -286,5 +287,107 @@ describe('MailScheduler', () => {
       code: 'NOT_FOUND'
     })
     fake.release(a.id)
+  })
+})
+
+// ---------- Task 12 / R10:邮箱任务注册表与账号级取消 ----------
+
+describe('MailTaskRegistry', () => {
+  it('begin/cancelAccount:取消提升代数、abort 信号并等待 finish', async () => {
+    const { accounts } = await setup()
+    const registry = new MailTaskRegistry(accounts)
+    const task = registry.begin('task-a', 'sync')
+    expect(task.generation).toBe(0)
+
+    let finished = false
+    const canceling = registry.cancelAccount('task-a')
+    void canceling.then(() => {
+      finished = true
+    })
+    await flush()
+    expect(task.signal.aborted).toBe(true)
+    // 等待任务自行 finish:未结束时 cancelAccount 不返回
+    expect(finished).toBe(false)
+    task.finish()
+    await canceling
+    expect(finished).toBe(true)
+
+    // 之后的任务拿到提升后的代数
+    const next = registry.begin('task-a', 'content')
+    expect(next.generation).toBe(1)
+    next.finish()
+  })
+
+  it('assertAlive:代数失效或账号停用/移除后抛 CANCELLED', async () => {
+    const { accounts, a } = await setup()
+    const registry = new MailTaskRegistry(accounts)
+    const task = registry.begin(a.id, 'sync')
+    expect(() => task.assertAlive()).not.toThrow()
+    task.finish() // 结束后 cancelAccount 无需等待
+
+    await registry.cancelAccount(a.id)
+    expect(() => task.assertAlive()).toThrow()
+
+    const fresh = registry.begin(a.id, 'sync')
+    accounts.setEnabled(a.id, false)
+    expect(() => fresh.assertAlive()).toThrow()
+    registry.forget(a.id)
+    fresh.finish()
+  })
+
+  it('pause 阻断新任务与迟到写入,resume 恢复', async () => {
+    const { accounts, a } = await setup()
+    const registry = new MailTaskRegistry(accounts)
+    registry.pause(a.id)
+    expect(() => registry.begin(a.id, 'sync')).toThrow()
+    expect(() => registry.assertWritable(a.id)).toThrow()
+
+    registry.resume(a.id)
+    const task = registry.begin(a.id, 'content')
+    expect(() => registry.assertWritable(a.id)).not.toThrow()
+    task.finish()
+  })
+})
+
+describe('MailScheduler 账号级取消(R10)', () => {
+  it('cancelAccount 取消在途手动同步,互斥释放且不标记账号错误', async () => {
+    const { accounts, a } = await setup()
+    const fake = new FakeWorker()
+    fake.gated = true
+    const registry = new MailTaskRegistry(accounts)
+    const scheduler = new MailScheduler(fake as unknown as MailSyncWorker, accounts, { onNotice: noNotice }, undefined, registry)
+
+    const run = scheduler.syncAccount(a.id, 'refresh', new AbortController().signal)
+    await flush()
+    expect(fake.calls).toHaveLength(1)
+
+    const canceling = registry.cancelAccount(a.id)
+    fake.release(a.id) // 假工作流监听 signal,中止后以 CANCELLED 结束
+    await canceling
+    await expect(run).rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(accounts.get(a.id)).toMatchObject({ status: 'idle', error: null })
+
+    // 互斥已释放:可再次发起同步
+    const again = scheduler.syncAccount(a.id, 'refresh', new AbortController().signal)
+    fake.release(a.id)
+    await expect(again).resolves.toMatchObject({ added: 1 })
+  })
+
+  it('stopAll 经注册表取消所有账号任务', async () => {
+    const { accounts, a, b } = await setup()
+    const fake = new FakeWorker()
+    fake.gated = true
+    const registry = new MailTaskRegistry(accounts)
+    const scheduler = new MailScheduler(fake as unknown as MailSyncWorker, accounts, { onNotice: noNotice }, undefined, registry)
+
+    const done = scheduler.runDue([a.id, b.id], new AbortController().signal)
+    await flush()
+    expect(fake.current).toBe(2)
+
+    await scheduler.stopAll()
+    await done
+    expect(fake.current).toBe(0)
+    expect(accounts.get(a.id)?.status).toBe('idle')
+    expect(accounts.get(b.id)?.status).toBe('idle')
   })
 })

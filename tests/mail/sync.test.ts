@@ -5,6 +5,7 @@ import { MailRepository } from '../../src/main/mail/repository'
 import type { CredentialStorage } from '../../src/main/mail/credentials'
 import type { SyncState } from '../../src/main/mail/ports'
 import { MailSyncWorker, syncMode } from '../../src/main/mail/sync'
+import { MailTaskRegistry } from '../../src/main/mail/scheduler'
 import { FakeSession, makeEnvelope } from './fakeSession'
 
 const storage: CredentialStorage = {
@@ -207,5 +208,129 @@ describe('MailSyncWorker', () => {
     expect(repository.list({ accountId: info.id }).items).toHaveLength(50)
     expect(repository.state(info.id).initialized).toBe(false)
     expect(fake.closeCount).toBe(1)
+  })
+
+  it('R9: 空窗口初始化推进到 cap,不回捞窗口外历史', async () => {
+    const { fake, repository, info, worker } = await setup()
+    fake.uidNext = 500
+    // 仅有的一封邮件在 400 天前,落在最近 30 天窗口之外
+    fake.envelopesByUid.set(1, makeEnvelope(1, { receivedAt: '2025-08-11T08:00:00.000Z' }))
+
+    const result = await worker.run(info.id, 'refresh', DAY, freshSignal())
+    expect(result).toEqual({ added: 0, initial: true })
+    // 空窗口提交成功后游标一次性推进到 cap = uidNext - 1
+    expect(repository.state(info.id)).toMatchObject({ lastUid: 499, initialized: true })
+    expect(repository.list({ accountId: info.id }).items).toHaveLength(0)
+    // 初始补收只允许查 (cap, 新 uidNext-1],不允许从 0 回捞全部历史
+    expect(fake.calls).not.toContain('searchUids:0:499')
+    expect(fake.calls).toContain(`searchDays:${INITIAL_WINDOW.since}:${INITIAL_WINDOW.before}`)
+  })
+
+  it('R9: 初始扫描期间新到的邮件仅补 (cap, 新 uidNext-1]', async () => {
+    const { fake, repository, info, worker } = await setup()
+    fake.uidNext = 500
+    fake.envelopesByUid.set(1, makeEnvelope(1, { receivedAt: '2025-08-11T08:00:00.000Z' }))
+    fake.onOpen = (openCount) => {
+      if (openCount === 2) {
+        // 初始扫描期间新到一封:第二次打开前注入,uidNext 推进到 501
+        fake.envelopesByUid.set(500, makeEnvelope(500, { receivedAt: '2026-09-15T08:00:00.000Z' }))
+        fake.uidNext = 501
+      }
+    }
+
+    const result = await worker.run(info.id, 'refresh', DAY, freshSignal())
+    expect(result).toEqual({ added: 1, initial: true })
+    expect(repository.state(info.id)).toMatchObject({ lastUid: 500, initialized: true })
+    const items = repository.list({ accountId: info.id }).items
+    expect(items).toHaveLength(1)
+    expect(items[0].subject).toBe('测试邮件 500')
+    // 只补新信:窗口外的 400 天前旧邮件不被装载
+    expect(fake.calls).toContain('searchUids:499:500')
+    expect(fake.calls).not.toContain('searchUids:0:499')
+  })
+
+  it('R9: 分批中止只保留已提交进度,重跑不漏剩余近期邮件', async () => {
+    const { fake, repository, info, worker } = await setup()
+    fake.uidNext = 100
+    for (let uid = 1; uid <= 51; uid += 1) fake.envelopesByUid.set(uid, makeEnvelope(uid))
+    const controller = new AbortController()
+    let batches = 0
+    const originalCommit = repository.commitBatch.bind(repository)
+    repository.commitBatch = (...args: Parameters<typeof repository.commitBatch>) => {
+      const added = originalCommit(...args)
+      batches += 1
+      if (batches === 1) controller.abort() // 首批已经提交,再中断下一批
+      return added
+    }
+    await expect(worker.run(info.id, 'refresh', DAY, controller.signal)).rejects.toMatchObject({
+      code: 'CANCELLED'
+    })
+    expect(repository.state(info.id)).toMatchObject({ lastUid: 50, initialized: false })
+    repository.commitBatch = originalCommit
+    const result = await worker.run(info.id, 'refresh', DAY, new AbortController().signal)
+    expect(result.initial).toBe(true)
+    expect(repository.state(info.id)).toMatchObject({ lastUid: 99, initialized: true })
+    expect(repository.list({ accountId: info.id, limit: 100 }).items).toHaveLength(51)
+  })
+
+  it('R9: 补收前 UIDVALIDITY 改变时进入重建分支,不把旧 UID 当新邮箱记录', async () => {
+    const { fake, repository, info, worker } = await setup()
+    fake.uidNext = 3
+    fake.envelopesByUid.set(1, makeEnvelope(1))
+    fake.envelopesByUid.set(2, makeEnvelope(2))
+    fake.onOpen = (openCount) => {
+      if (openCount === 2) {
+        // 初始扫描期间邮箱被重建:UIDVALIDITY 变化并出现新邮件
+        fake.uidValidity = '999'
+        fake.uidNext = 4
+        fake.envelopesByUid.set(3, makeEnvelope(3, { subject: '重建后的新邮件' }))
+      }
+    }
+
+    const result = await worker.run(info.id, 'refresh', DAY, freshSignal())
+    // 运行结束即收敛到新身份:旧行按指纹复用,新邮件以新身份补收,无重复行
+    expect(result.initial).toBe(false)
+    expect(repository.state(info.id)).toMatchObject({ uidValidity: '999', lastUid: 3, initialized: true })
+    const items = repository.list({ accountId: info.id }).items
+    expect(items).toHaveLength(3)
+    expect(items.every((m) => m.remoteAvailable)).toBe(true)
+    expect(items.find((m) => m.subject === '重建后的新邮件')).toBeTruthy()
+  })
+
+  it('R10: 仓储写守卫在账号停用后拒绝批次提交,未阻断时保持原行为', async () => {
+    const { repository, info, accounts } = await setup()
+    const registry = new MailTaskRegistry(accounts)
+    repository.setWriteGuard({ assertWritable: (id) => registry.assertWritable(id) })
+
+    // 停用意图已登记:迟到批次在写入边界被拒绝,mail_messages 无行
+    registry.pause(info.id)
+    expect(() =>
+      repository.commitBatch(info.id, '111', [makeEnvelope(1)], initState())
+    ).toThrow()
+    expect(repository.list({ accountId: info.id }).items).toHaveLength(0)
+
+    // 恢复后同一批次正常提交
+    registry.resume(info.id)
+    const added = repository.commitBatch(
+      info.id, '111', [makeEnvelope(1)], initState({ uidValidity: '111', lastUid: 1, initialized: true })
+    )
+    expect(added).toBe(1)
+    expect(repository.list({ accountId: info.id }).items).toHaveLength(1)
+  })
+
+  it('R10: 仓储 markRead/setBodyCache 在账号移除后拒绝写入', async () => {
+    const { repository, info, accounts } = await setup()
+    const registry = new MailTaskRegistry(accounts)
+    repository.setWriteGuard({ assertWritable: (id) => registry.assertWritable(id) })
+    repository.commitBatch(info.id, '111', [makeEnvelope(1)], initState({ uidValidity: '111', lastUid: 1, initialized: true }))
+    const item = repository.list({ accountId: info.id }).items[0]
+
+    // 移除流程:阻断 + 代数失效后,迟到标记/缓存指针写入被拒
+    registry.pause(info.id)
+    expect(() => repository.markRead(item.id, true)).toThrow()
+    expect(() => repository.setBodyCache(item.id, 'Z:\\cache\\body.bin')).toThrow()
+    expect(repository.get(item.id)?.read).toBe(false)
+
+    void accounts
   })
 })

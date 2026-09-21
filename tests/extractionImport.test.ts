@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { validateImportPayload } from '../src/shared/extraction'
+import { validateEventInput } from '../src/main/planning/eventValidation'
 
 type Result = ReturnType<typeof validateImportPayload>
 
@@ -12,6 +13,25 @@ function expectFail(r: Result): Extract<Result, { ok: false }> {
   if (r.ok) throw new Error('应当失败,实际成功')
   return r
 }
+
+describe('R7: 日程输入校验(提取候选进入日历前的共享校验)', () => {
+  it('提取出的时间先归一化再校验:无效串/倒置区间被拒绝', () => {
+    // 候选时间由 normalizeDateTime 归一为 YYYY-MM-DDTHH:mm;无法归一的时间不得进入日历
+    expect(() =>
+      validateEventInput({ title: '例会', startAt: '2026-09-21T10:00', endAt: '2026-09-21T10:00' })
+    ).toThrow(/结束时间/)
+    expect(() =>
+      validateEventInput({ title: '例会', startAt: '2026-09-21T10:00', endAt: '2026-09-21T09:00' })
+    ).toThrow(/结束时间/)
+    expect(() => validateEventInput({ title: ' ', startAt: '2026-09-21T10:00', endAt: '2026-09-21T11:00' })).toThrow(/标题/)
+  })
+
+  it('候选无结束时间:面向用户的入口拒绝,确认路径允许零长度(历史行为)', () => {
+    expect(() => validateEventInput({ title: '只有开始', startAt: '2026-09-21T10:00' })).toThrow(/结束时间/)
+    const zero = validateEventInput({ title: '只有开始', startAt: '2026-09-21T10:00' }, { allowZeroLength: true })
+    expect(zero.endMs).toBe(zero.startMs)
+  })
+})
 
 describe('课表/校历导入载荷校验', () => {
   it('非对象输出为致命错误(可触发修复)', () => {

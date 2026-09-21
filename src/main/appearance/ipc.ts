@@ -2,24 +2,35 @@
 import { ipcMain, type IpcMainInvokeEvent } from 'electron'
 import { AppearanceChannels, parseThemeMode, type AppearanceResult, type AppearanceSnapshot } from '../../shared/appearance'
 import type { AppearanceService } from './service'
+import { authorizeIpc } from '../security/ipcPolicy'
+import { getWindowRegistry } from '../windows'
 
 /**
- * trusted(event, write) 判定来源是否有权读/写外观。
+ * 注册外观读写 handler。
+ * trusted 缺省时统一走 ipcPolicy(登记窗口 + 精确页面 + 能力表:三窗口可读,仅工作台可写);
+ * index.ts 现存闭包调用保持兼容,任务 12 接线后可移除闭包改用默认策略。
  * 返回撤销函数,用于退出阶段移除 handler。
  */
 export function registerAppearanceIpc(
   service: AppearanceService,
-  trusted: (event: IpcMainInvokeEvent, write: boolean) => boolean
+  trusted?: (event: IpcMainInvokeEvent, write: boolean) => boolean
 ): () => void {
+  const check = trusted ?? ((event: IpcMainInvokeEvent, write: boolean) =>
+    authorizeIpc(
+      event,
+      write ? AppearanceChannels.set : AppearanceChannels.get,
+      getWindowRegistry()
+    ))
+
   const handleGet = (event: IpcMainInvokeEvent): AppearanceSnapshot => {
-    if (!trusted(event, false)) {
+    if (!check(event, false)) {
       throw new Error('拒绝不受信任的外观读取来源')
     }
     return service.get()
   }
 
   const handleSet = (event: IpcMainInvokeEvent, mode: unknown): Promise<AppearanceResult> | AppearanceResult => {
-    if (!trusted(event, true)) {
+    if (!check(event, true)) {
       return { ok: false, code: 'UNAVAILABLE', message: '该窗口不允许修改外观,请在工作台设置中操作' }
     }
     const parsed = parseThemeMode(mode)

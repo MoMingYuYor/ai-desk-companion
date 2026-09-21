@@ -9,7 +9,8 @@ import type { SqliteDb } from '../../src/main/db/connection'
 import { MAIL_LIMITS, type MailAttachmentInfo, type MailSummary } from '../../src/shared/mail'
 import type { EnvelopeRow, SessionFactory } from '../../src/main/mail/adapter'
 import { MailCacheService, MailCodedError, readLimited } from '../../src/main/mail/cache'
-import { MailContentService } from '../../src/main/mail/content'
+import { MailContentService, type MailContentDeps } from '../../src/main/mail/content'
+import { MailError } from '../../src/main/mail/errors'
 
 type MailRecord = {
   message: MailSummary
@@ -219,7 +220,7 @@ function makeCache(): MailCacheService {
 
 function makeHarness(
   db: SqliteDb,
-  options: { parts: Map<string, PartProvider>; limits?: typeof MAIL_LIMITS }
+  options: { parts: Map<string, PartProvider>; limits?: typeof MAIL_LIMITS; tasks?: MailContentDeps['tasks'] }
 ): { service: MailContentService; repo: FakeRepository; state: FakeSessionState; cache: MailCacheService } {
   const cache = makeCache()
   const repo = new FakeRepository(db)
@@ -231,7 +232,8 @@ function makeHarness(
       connection: () => ({ host: 'imap.example.com', port: 993, email: 'me@example.com', password: 'synthetic-password' })
     },
     cache,
-    limits: options.limits ?? MAIL_LIMITS
+    limits: options.limits ?? MAIL_LIMITS,
+    tasks: options.tasks
   })
   return { service, repo, state, cache }
 }
@@ -468,6 +470,68 @@ describe('MailContentService 正文按需加载', () => {
     expect(state.created).toBe(1)
     expect(state.partCalls).toHaveLength(1)
     expect(a.safeHtml).toBe(b.safeHtml)
+  })
+
+  // ---------- R10:账号任务取消与迟到缓存写入 ----------
+
+  it('R10: 账号任务取消后正文读取以 CANCELLED 结束且不落缓存', async () => {
+    const controller = new AbortController()
+    const { service, repo } = makeHarness(db, {
+      parts: new Map([['2', () => neverEndingStream()]]),
+      tasks: {
+        begin: () => ({
+          signal: controller.signal,
+          finish() { /* 测试句柄无需清理 */ },
+          assertAlive() {
+            if (controller.signal.aborted) throw new MailError('CANCELLED', '账号任务已取消')
+          }
+        })
+      }
+    })
+    repo.records.set('msg-1', {
+      message: makeSummary(),
+      uid: 101,
+      uidValidity: '9001',
+      structure: makeEnvelope(),
+      bodyPath: null
+    })
+
+    const pending = service.detail('msg-1', new AbortController().signal)
+    await delay(10) // 进入 part 悬挂
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(repo.bodyCacheCalls).toHaveLength(0)
+  })
+
+  it('R10: 任务代数失效后 assertAlive 拒绝,迟到正文不落缓存且会话仍关闭', async () => {
+    const { service, repo, state } = makeHarness(db, {
+      parts: new Map([
+        ['2', async () => {
+          await delay(20)
+          return Readable.from([Buffer.from('迟到正文', 'utf8')])
+        }]
+      ]),
+      tasks: {
+        begin: () => ({
+          signal: new AbortController().signal,
+          finish() { /* 测试句柄无需清理 */ },
+          assertAlive() {
+            throw new MailError('CANCELLED', '任务代数已失效')
+          }
+        })
+      }
+    })
+    repo.records.set('msg-1', {
+      message: makeSummary(),
+      uid: 101,
+      uidValidity: '9001',
+      structure: makeEnvelope(),
+      bodyPath: null
+    })
+
+    await expect(service.detail('msg-1', new AbortController().signal)).rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(repo.bodyCacheCalls).toHaveLength(0)
+    expect(state.closed).toBe(1)
   })
 })
 

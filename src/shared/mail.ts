@@ -48,6 +48,8 @@ export interface MailListQuery {
   unreadOnly?: boolean
   search?: string
   page?: number
+  /** 单页条数上限,缺省 MAIL_LIMITS.page;主进程内部调用(如同步验收)可放宽 */
+  limit?: number
 }
 
 export interface MailSummary {

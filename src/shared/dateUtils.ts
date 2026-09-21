@@ -22,6 +22,26 @@ export function nowTimestamp(): string {
   return new Date().toISOString()
 }
 
+/**
+ * 集中转换:无时区本地日期/日期时间 → UTC 毫秒(提醒调度等毫秒级比较统一走这里)。
+ * 支持 YYYY-MM-DD、YYYY-MM-DDTHH:mm(:ss(.sss)?)?;无时区串一律按本地时区解释,
+ * 不可解析返回 null,由调用方决定跳过或报错,不做猜测性回退。
+ */
+export function parseLocalDateTimeMs(s: string): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?)?$/.exec(s.trim())
+  if (!m) return null
+  const ms = m[7] ? Number(m[7].padEnd(3, '0')) : 0
+  return new Date(
+    Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+    Number(m[4] ?? 0), Number(m[5] ?? 0), Number(m[6] ?? 0), ms
+  ).getTime()
+}
+
+/** 本地朴素时间串(毫秒精度):YYYY-MM-DDTHH:mm:ss.SSS */
+export function toLocalIsoMs(d: Date): string {
+  return `${toDateStr(d)}T${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`
+}
+
 export function parseLocalIso(s: string): Date | null {
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
     const [y, m, d] = s.split('-').map(Number)

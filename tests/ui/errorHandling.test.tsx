@@ -9,6 +9,7 @@ import { MailPage } from '../../src/renderer/workbench/mail/MailPage'
 import { MailManagerView } from '../../src/renderer/workbench/mail/MailManagerView'
 import type { ProviderInfo } from '../../src/shared/types'
 import type { MailAccountInfo, MailAnalysisStatus, MailApi, MailResult, MailSubscribe, MailSummary } from '../../src/shared/mail'
+import { appError, assertCurrentEpoch, toIpcError } from '../../src/shared/operations'
 
 afterEach(cleanup)
 
@@ -193,5 +194,53 @@ describe('邮箱错误处理', () => {
     fireEvent.click(await screen.findByRole('button', { name: '加载更早邮件' }))
 
     expect(await screen.findByText('加载更早邮件失败:连接中断')).toBeTruthy()
+  })
+})
+
+// ---------- Task 12:公共 AppError IPC 边界与 epoch 校验(主进程层错误契约) ----------
+
+describe('公共 AppError IPC 边界(Task 12)', () => {
+  it('toIpcError:携带 appError 的错误保留 message 且 appError 原样传递', () => {
+    const source = new Error('保存未确认:数据尚未落盘') as Error & { appError?: unknown }
+    source.appError = appError('PERSIST_FAILED', '保存未确认:数据尚未落盘', { retryable: true, operationId: 'op-1' })
+
+    const out = toIpcError(source)
+    expect(out.message).toBe('保存未确认:数据尚未落盘')
+    expect(out.appError).toMatchObject({ code: 'PERSIST_FAILED', retryable: true, operationId: 'op-1' })
+  })
+
+  it('toIpcError:安全存储不可用错误映射 AUTH_REQUIRED(脱敏,不含密钥内容)', () => {
+    // 生产中 SecretStoreUnavailableError 是 Error 实例;此处按同构造型验证 duck-typing 分支
+    const source = Object.assign(new Error('系统安全存储不可用,已拒绝保存密钥'), {
+      name: 'SecretStoreUnavailableError',
+      toAppError: () => appError('AUTH_REQUIRED', '系统安全存储不可用,已拒绝保存密钥', { retryable: false })
+    })
+
+    const out = toIpcError(source)
+    expect(out.appError).toMatchObject({ code: 'AUTH_REQUIRED', retryable: false })
+    expect(out.message).toBe('系统安全存储不可用,已拒绝保存密钥')
+  })
+
+  it('toIpcError:普通错误原样保留 message(现有 UI 错误文案行为不变)', () => {
+    const out = toIpcError(new Error('网络超时'))
+    expect(out.message).toBe('网络超时')
+    expect(out.appError).toBeUndefined()
+  })
+
+  it('assertCurrentEpoch:旧代数按 STALE_PREVIEW 拒绝,缺省/当前代数放行', () => {
+    try {
+      assertCurrentEpoch('epoch-old', 'epoch-new')
+      expect.unreachable('旧代数应被拒绝')
+    } catch (err) {
+      expect((err as { appError?: { code: string; retryable: boolean } }).appError).toMatchObject({
+        code: 'STALE_PREVIEW',
+        retryable: true
+      })
+    }
+    // 缺省(渲染层未接入 context)与当前代数均放行
+    expect(() => assertCurrentEpoch(null, 'epoch-new')).not.toThrow()
+    expect(() => assertCurrentEpoch(undefined, 'epoch-new')).not.toThrow()
+    expect(() => assertCurrentEpoch('', 'epoch-new')).not.toThrow()
+    expect(() => assertCurrentEpoch('epoch-new', 'epoch-new')).not.toThrow()
   })
 })

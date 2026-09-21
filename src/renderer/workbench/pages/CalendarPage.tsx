@@ -17,6 +17,7 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
   const [eventsByDay, setEventsByDay] = useState<Record<string, CalendarEvent[]>>({})
   const [coursesByDay, setCoursesByDay] = useState<Record<string, CourseOccurrence[]>>({})
   const [editor, setEditor] = useState<CalendarEvent | 'new' | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
   const [toast, showToast] = useToast()
 
   const monthStart = useMemo(() => `${cursor.y}-${pad(cursor.m)}-01`, [cursor])
@@ -60,8 +61,17 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
   useSubscribe('evt:data-changed', useCallback(() => reload(), [reload]))
 
   const save = async (input: EventInput, id?: string): Promise<void> => {
-    if (id) await window.api.updateEvent(id, input)
-    else await window.api.createEvent(input)
+    try {
+      if (id) await window.api.updateEvent(id, input)
+      else await window.api.createEvent(input)
+    } catch (err) {
+      // 落盘失败(R2):不关闭编辑器、不清输入、不提示已保存,
+      // 明确标识"保存未确认"并保留重试入口(编辑器内的保存按钮)
+      const message = err instanceof Error ? err.message : String(err)
+      setSaveError(`保存未确认:数据尚未落盘(${message})。请重试。`)
+      return
+    }
+    setSaveError(null)
     setEditor(null)
     reload()
     showToast('已保存')
@@ -216,7 +226,11 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
       {editor && (
         <EventEditor
           initial={editor === 'new' ? { date: selected } : editor}
-          onClose={() => setEditor(null)}
+          error={saveError}
+          onClose={() => {
+            setSaveError(null)
+            setEditor(null)
+          }}
           onSave={save}
         />
       )}
@@ -235,10 +249,13 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
 
 function EventEditor({
   initial,
+  error,
   onClose,
   onSave
 }: {
   initial: { date: string } | CalendarEvent
+  /** 保存失败提示(如 PERSIST_FAILED:保存未确认);非空时编辑内容保留、重试入口可见 */
+  error?: string | null
   onClose: () => void
   onSave: (input: EventInput, id?: string) => Promise<void>
 }): JSX.Element {
@@ -253,11 +270,21 @@ function EventEditor({
   const [location, setLocation] = useState(isNew ? '' : (ev.location ?? ''))
   const [notes, setNotes] = useState(isNew ? '' : (ev.notes ?? ''))
   const [reminder, setReminder] = useState(isNew ? '15' : String(ev.reminderMinutes ?? ''))
+  const [validationError, setValidationError] = useState<string | null>(null)
 
   const submit = async (): Promise<void> => {
-    if (!title.trim()) return
+    if (!title.trim()) {
+      setValidationError('标题不能为空')
+      return
+    }
     const startAt = allDay ? `${d}T00:00` : `${d}T${start}`
     const endAt = allDay ? `${d}T23:59` : `${d}T${end}`
+    // 无效区间在提交前拦截(R7):相等/倒置区间不落库
+    if (!allDay && endAt <= startAt) {
+      setValidationError('结束时间必须晚于开始时间')
+      return
+    }
+    setValidationError(null)
     await onSave(
       {
         title: title.trim(),
@@ -307,6 +334,11 @@ function EventEditor({
           <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} />
         </div>
         <div className="row" style={{ justifyContent: 'flex-end' }}>
+          {(error ?? validationError) && (
+            <span role="alert" style={{ color: '#e5534b', marginRight: 'auto', alignSelf: 'center' }}>
+              {error ?? validationError}
+            </span>
+          )}
           <button onClick={onClose}>取消</button>
           <button className="primary" onClick={() => void submit()}>
             保存

@@ -5,6 +5,7 @@ import {
   SCHEMA_VERSION
 } from '../db/schema'
 import { migrateMailV2 } from '../mail/schema'
+import { migrateM1 } from './migrations/m1'
 import type {
   ActionCandidate,
   Analysis,
@@ -27,6 +28,7 @@ import type {
   TodoInput
 } from '../../shared/types'
 import { nowTimestamp, addMinutesIso } from '../../shared/dateUtils'
+import { validateEventInput } from '../planning/eventValidation'
 
 export function uid(): string {
   return createHash('sha1')
@@ -53,6 +55,10 @@ export function initSchema(db: SqliteDb): void {
       if (currentVer < 3) {
         // v3:providers 增加 JSON 结构化输出能力开关
         db.run('ALTER TABLE providers ADD COLUMN supports_json_mode INTEGER NOT NULL DEFAULT 0')
+      }
+      if (currentVer < 4) {
+        // v4(M1 写入基础):实体 revision、操作回执
+        migrateM1(db)
       }
       if (currentVer < SCHEMA_VERSION) {
         db.run("UPDATE meta SET value = ? WHERE key = 'schema_version'", [String(SCHEMA_VERSION)])
@@ -508,7 +514,7 @@ export function markImportHandled(db: SqliteDb, analysisId: string): void {
 
 // ---------- events ----------
 
-const EVENT_COLS = 'id, title, start_at AS startAt, end_at AS endAt, all_day AS allDay, color, location, notes, source, source_ref AS sourceRef, reminder_minutes AS reminderMinutes, status, fingerprint, created_at AS createdAt, updated_at AS updatedAt'
+const EVENT_COLS = 'id, title, start_at AS startAt, end_at AS endAt, all_day AS allDay, color, location, notes, source, source_ref AS sourceRef, reminder_minutes AS reminderMinutes, status, fingerprint, revision, created_at AS createdAt, updated_at AS updatedAt'
 
 export function listEventsRange(db: SqliteDb, from: string, to: string): CalendarEvent[] {
   return db.all<CalendarEvent>(
@@ -536,13 +542,15 @@ export function createEvent(db: SqliteDb, input: EventInput, source: CalendarEve
     sourceRef: input.sourceRef ?? null,
     reminderMinutes: input.reminderMinutes ?? null,
     status: 'active',
+    fingerprint: null,
+    revision: 1,
     createdAt: ts,
     updatedAt: ts
   }
   const fp = eventFingerprint(ev)
   db.run(
-    `INSERT INTO events (id, title, start_at, end_at, all_day, color, location, notes, source, source_ref, reminder_minutes, status, fingerprint, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+    `INSERT INTO events (id, title, start_at, end_at, all_day, color, location, notes, source, source_ref, reminder_minutes, status, fingerprint, revision, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, 1, ?, ?)`,
     [ev.id, ev.title, ev.startAt, ev.endAt, ev.allDay ? 1 : 0, ev.color, ev.location, ev.notes, ev.source, ev.sourceRef, ev.reminderMinutes ?? null, fp, ev.createdAt, ev.updatedAt]
   )
   ev.fingerprint = fp
@@ -554,7 +562,7 @@ export function updateEvent(db: SqliteDb, id: string, patch: Partial<EventInput>
   if (!existing) return
   const merged = { ...existing, ...patch } as CalendarEvent
   db.run(
-    `UPDATE events SET title = ?, start_at = ?, end_at = ?, all_day = ?, color = ?, location = ?, notes = ?, reminder_minutes = ?, status = ?, fingerprint = ?, updated_at = ? WHERE id = ?`,
+    `UPDATE events SET title = ?, start_at = ?, end_at = ?, all_day = ?, color = ?, location = ?, notes = ?, reminder_minutes = ?, status = ?, fingerprint = ?, revision = revision + 1, updated_at = ? WHERE id = ?`,
     [
       merged.title,
       merged.startAt,
@@ -573,15 +581,18 @@ export function updateEvent(db: SqliteDb, id: string, patch: Partial<EventInput>
 }
 
 export function deleteEvent(db: SqliteDb, id: string): void {
-  db.transaction(() => {
-    db.run('UPDATE todos SET linked_event_id = NULL WHERE linked_event_id = ?', [id])
-    db.run('DELETE FROM events WHERE id = ?', [id])
-  })
+  db.transaction(() => deleteEventInner(db, id))
+}
+
+/** 仅供 runOperation 的 apply 内调用:不加独立事务,唯一事务所有权在 runOperation */
+export function deleteEventInner(db: SqliteDb, id: string): void {
+  db.run('UPDATE todos SET linked_event_id = NULL WHERE linked_event_id = ?', [id])
+  db.run('DELETE FROM events WHERE id = ?', [id])
 }
 
 // ---------- todos ----------
 
-const TODO_COLS = 'id, title, notes, due_at AS dueAt, priority, completed_at AS completedAt, linked_event_id AS linkedEventId, source, source_ref AS sourceRef, fingerprint, created_at AS createdAt, updated_at AS updatedAt'
+const TODO_COLS = 'id, title, notes, due_at AS dueAt, priority, completed_at AS completedAt, linked_event_id AS linkedEventId, source, source_ref AS sourceRef, fingerprint, revision, created_at AS createdAt, updated_at AS updatedAt'
 
 function attachLinkedEvent(db: SqliteDb, t: Todo): Todo {
   if (t.linkedEventId) {
@@ -614,12 +625,14 @@ export function createTodo(db: SqliteDb, input: TodoInput, source: Todo['source'
     linkedEventId: input.linkedEventId ?? null,
     source,
     sourceRef: input.sourceRef ?? null,
+    fingerprint: null,
+    revision: 1,
     createdAt: ts,
     updatedAt: ts
   }
   db.run(
-    `INSERT INTO todos (id, title, notes, due_at, priority, completed_at, linked_event_id, source, source_ref, fingerprint, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO todos (id, title, notes, due_at, priority, completed_at, linked_event_id, source, source_ref, fingerprint, revision, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
     [todo.id, todo.title, todo.notes, todo.dueAt, todo.priority, todo.completedAt, todo.linkedEventId, todo.source, todo.sourceRef, todoFingerprint(todo), todo.createdAt, todo.updatedAt]
   )
   return todo
@@ -630,7 +643,7 @@ export function updateTodo(db: SqliteDb, id: string, patch: Partial<TodoInput>):
   if (!existing) return
   const merged = { ...existing, ...patch } as Todo
   db.run(
-    `UPDATE todos SET title = ?, notes = ?, due_at = ?, priority = ?, completed_at = ?, linked_event_id = ?, fingerprint = ?, updated_at = ? WHERE id = ?`,
+    `UPDATE todos SET title = ?, notes = ?, due_at = ?, priority = ?, completed_at = ?, linked_event_id = ?, fingerprint = ?, revision = revision + 1, updated_at = ? WHERE id = ?`,
     [
       merged.title,
       merged.notes ?? null,
@@ -663,6 +676,8 @@ export function confirmCandidate(
   if (item.type === 'event' && item.start) {
     const startAt = item.start
     const endAt = item.durationMinutes ? addMinutesIso(item.start, item.durationMinutes) : startAt
+    // 共享输入校验(R7):候选确认补标题/可解析时间检查;零长度(无时长)是历史行为,保留
+    validateEventInput({ title: item.title, startAt, endAt }, { allowZeroLength: true })
     const fp = eventFingerprint({ title: item.title, startAt })
     if (findDuplicateEvent(db, fp)) return { result: 'duplicate', refType: 'event', refId: '' }
     const ev = createEvent(
@@ -701,7 +716,7 @@ export function confirmCandidate(
 
 export function listPending(db: SqliteDb): PendingItem[] {
   return db.all<PendingItem>(
-    "SELECT id, conversation_id AS conversationId, title, notes, status, created_at AS createdAt, updated_at AS updatedAt FROM pending_items WHERE status = 'open' ORDER BY created_at"
+    "SELECT id, conversation_id AS conversationId, title, notes, status, revision, created_at AS createdAt, updated_at AS updatedAt FROM pending_items WHERE status = 'open' ORDER BY created_at"
   ) as PendingItem[]
 }
 
@@ -716,14 +731,22 @@ export function insertPending(
     title: input.title,
     notes: input.notes ?? null,
     status: 'open',
+    revision: 1,
     createdAt: ts,
     updatedAt: ts
   }
   db.run(
-    'INSERT INTO pending_items (id, conversation_id, title, notes, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO pending_items (id, conversation_id, title, notes, status, revision, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)',
     [p.id, p.conversationId, p.title, p.notes, p.status, p.createdAt, p.updatedAt]
   )
   return p
+}
+
+export function getPending(db: SqliteDb, id: string): PendingItem | undefined {
+  return db.get<PendingItem>(
+    'SELECT id, conversation_id AS conversationId, title, notes, status, revision, created_at AS createdAt, updated_at AS updatedAt FROM pending_items WHERE id = ?',
+    [id]
+  ) as PendingItem | undefined
 }
 
 export function updatePending(db: SqliteDb, id: string, patch: Partial<Pick<PendingItem, 'status' | 'title' | 'notes'>>): void {
@@ -742,6 +765,7 @@ export function updatePending(db: SqliteDb, id: string, patch: Partial<Pick<Pend
     vals.push(patch.notes)
   }
   if (sets.length === 0) return
+  sets.push('revision = revision + 1')
   sets.push('updated_at = ?')
   vals.push(nowTimestamp())
   vals.push(id)
@@ -874,6 +898,35 @@ export function saveProfileFact(db: SqliteDb, input: { id?: string; category: Pr
 
 export function deleteProfileFact(db: SqliteDb, id: string): void {
   db.run('DELETE FROM profile_facts WHERE id = ?', [id])
+}
+
+// ---------- 提醒候选(Task 9 R6:按实际触发时刻过滤,SQL 只做粗筛) ----------
+
+export interface ReminderEventRow {
+  id: string
+  title: string
+  start_at: string
+  location: string | null
+  reminder_minutes: number
+}
+
+/** 活跃且设置了提醒的日程;调用方给出 start_at 粗筛窗口 [startFrom, startTo](闭合) */
+export function listReminderEventCandidates(db: SqliteDb, startFrom: string, startTo: string): ReminderEventRow[] {
+  return db.all<ReminderEventRow>(
+    "SELECT id, title, start_at, location, reminder_minutes FROM events WHERE status = 'active' AND reminder_minutes IS NOT NULL AND start_at >= ? AND start_at <= ?",
+    [startFrom, startTo]
+  )
+}
+
+export interface DueTodoRow {
+  id: string
+  title: string
+  due_at: string
+}
+
+/** 未完成且设置了截止时间的待办(截止时间即提醒触发时刻);无截止时间的待办不生成提醒 */
+export function listDueTodoCandidates(db: SqliteDb): DueTodoRow[] {
+  return db.all<DueTodoRow>('SELECT id, title, due_at FROM todos WHERE completed_at IS NULL AND due_at IS NOT NULL')
 }
 
 // ---------- fired reminders ----------

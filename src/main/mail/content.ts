@@ -21,12 +21,26 @@ export type MailContentRepository = MailRepositoryPort & {
   listAttachments?(messageId: string): MailAttachmentInfo[]
 }
 
+/** 账号级取消(R10):正文/附件任务经注册表登记,账号停用/移除/退出时统一取消并等待 */
+export interface MailContentTaskHandle {
+  readonly signal: AbortSignal
+  finish(): void
+  /** 写缓存/落库指针前检查:账号代数一致且账号存在并启用 */
+  assertAlive(): void
+}
+
+export interface MailContentTasks {
+  begin(accountId: string, kind: 'content'): MailContentTaskHandle
+}
+
 export interface MailContentDeps {
   repository: MailContentRepository
   sessionFactory: SessionFactory
   accounts: { connection(id: string): { host: string; port: number; email: string; password: string } }
   cache: MailCacheService
   limits: typeof MAIL_LIMITS
+  /** 可选的账号任务注册表;缺省时不做账号级取消(单测直连场景) */
+  tasks?: MailContentTasks
 }
 
 type MailRecord = NonNullable<ReturnType<MailRepositoryPort['record']>>
@@ -70,6 +84,17 @@ function isAnalyzableMime(mime: string): boolean {
   return mime === 'application/pdf' || mime.startsWith('text/')
 }
 
+/** 合并外部取消信号与账号任务信号:任一中止即取消正文/附件传输 */
+function combineSignals(primary: AbortSignal, taskSignal?: AbortSignal): AbortSignal {
+  if (!taskSignal || taskSignal.aborted) return primary
+  if (primary.aborted) return primary
+  const composite = new AbortController()
+  const forward = (): void => composite.abort()
+  primary.addEventListener('abort', forward, { once: true })
+  taskSignal.addEventListener('abort', forward, { once: true })
+  return composite.signal
+}
+
 /**
  * 正文/附件按需获取与读取：
  * - 缓存命中零网络；缺失且 remote_available=1 才建立会话取正文 part；
@@ -87,11 +112,23 @@ export class MailContentService {
   detail(id: string, signal: AbortSignal): Promise<MailDetail> {
     const existing = this.inflightDetails.get(id)
     if (existing) return existing
-    const promise = this.detailOnce(id, signal).finally(() => {
+    const promise = this.detailWithTask(id, signal).finally(() => {
       this.inflightDetails.delete(id)
     })
     this.inflightDetails.set(id, promise)
     return promise
+  }
+
+  /** 正文读取按账号登记为 content 任务:账号停用/移除/退出时随注册表统一取消 */
+  private async detailWithTask(id: string, signal: AbortSignal): Promise<MailDetail> {
+    const head = this.deps.repository.record(id)
+    if (!head) throw new MailCodedError('NOT_FOUND', '邮件不存在或已被删除')
+    const task = this.deps.tasks?.begin(head.message.accountId, 'content')
+    try {
+      return await this.detailOnce(id, combineSignals(signal, task?.signal), task)
+    } finally {
+      task?.finish()
+    }
   }
 
   async download(id: string, signal: AbortSignal): Promise<MailAttachmentInfo> {
@@ -111,24 +148,32 @@ export class MailContentService {
     }
     if (rec.uid == null) throw new MailCodedError('NOT_FOUND', '邮件缺少远端标识，无法下载附件')
 
-    const target = att.cachePath ?? this.deps.cache.attachmentPath(rec.message.accountId, att.messageId, att.part)
-    const session = this.deps.sessionFactory(
-      this.deps.accounts.connection(rec.message.accountId),
-      signal
-    )
+    const task = this.deps.tasks?.begin(rec.message.accountId, 'content')
     try {
-      await session.open()
-      const stream = await session.part(rec.uid, att.part)
-      await this.deps.cache.writeAtomic(target, stream, this.deps.limits.attachmentBytes)
-    } finally {
+      const effective = combineSignals(signal, task?.signal)
+      const target = att.cachePath ?? this.deps.cache.attachmentPath(rec.message.accountId, att.messageId, att.part)
+      const session = this.deps.sessionFactory(
+        this.deps.accounts.connection(rec.message.accountId),
+        effective
+      )
       try {
-        await session.close()
-      } catch {
-        // close 失败不掩盖主流程
+        await session.open()
+        const stream = await session.part(rec.uid, att.part)
+        await this.deps.cache.writeAtomic(target, stream, this.deps.limits.attachmentBytes)
+      } finally {
+        try {
+          await session.close()
+        } catch {
+          // close 失败不掩盖主流程
+        }
       }
+      // 写回 cache_path 指针前复核账号任务:迟到下载不落任何引用
+      task?.assertAlive()
+      this.deps.repository.setAttachmentCache(id, target)
+      return this.toAttachmentInfo({ ...att, cachePath: target }, true)
+    } finally {
+      task?.finish()
     }
-    this.deps.repository.setAttachmentCache(id, target)
-    return this.toAttachmentInfo({ ...att, cachePath: target }, true)
   }
 
   attachmentPath(id: string): string {
@@ -150,7 +195,7 @@ export class MailContentService {
     await this.deps.cache.removeAccount(accountId)
   }
 
-  private async detailOnce(id: string, signal: AbortSignal): Promise<MailDetail> {
+  private async detailOnce(id: string, signal: AbortSignal, task?: MailContentTaskHandle): Promise<MailDetail> {
     if (signal.aborted) throw cancelledError()
     const rec = this.deps.repository.record(id)
     if (!rec) throw new MailCodedError('NOT_FOUND', '邮件不存在或已被删除')
@@ -167,7 +212,7 @@ export class MailContentService {
         throw new MailCodedError('NOT_FOUND', '邮件缺少远端标识，无法取回正文')
       }
       try {
-        body = await this.fetchBody(rec, signal)
+        body = await this.fetchBody(rec, signal, task)
       } catch (err) {
         if (err instanceof MailCodedError && err.code === 'LIMIT') {
           try {
@@ -192,7 +237,7 @@ export class MailContentService {
   }
 
   /** 建立会话取正文 part：优先 HTML part（可同时得到 text 与 safeHtml），否则退回纯文本 part。 */
-  private async fetchBody(rec: MailRecord, signal: AbortSignal): Promise<BodyCacheFile> {
+  private async fetchBody(rec: MailRecord, signal: AbortSignal, task?: MailContentTaskHandle): Promise<BodyCacheFile> {
     const info = rec.structure.htmlParts[0] ?? rec.structure.textParts[0]
     if (!info) {
       throw new MailCodedError('PARSE', '邮件结构中没有可读取的正文部分')
@@ -210,6 +255,8 @@ export class MailContentService {
       const content = mime === 'text/html' ? decoded : normalizePlainText(decoded)
       const target = this.deps.cache.bodyPath(rec.message.accountId, rec.message.id)
       await this.deps.cache.writeAtomic(target, encodeBodyCache(mime, content), this.deps.limits.bodyBytes)
+      // 落库指针前复核账号任务:账号已停用/移除时迟到正文不产生任何引用
+      task?.assertAlive()
       this.deps.repository.setBodyCache(rec.message.id, target)
       return { mime, content }
     } finally {

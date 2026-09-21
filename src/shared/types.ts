@@ -192,6 +192,8 @@ export interface CalendarEvent {
   reminderMinutes?: number | null
   status: 'active' | 'cancelled'
   fingerprint?: string | null
+  /** 修订号:初始 1,每次成功业务更新 +1;用户确认时提交所看到的值 */
+  revision: number
   createdAt: string
   updatedAt: string
 }
@@ -208,6 +210,8 @@ export interface Todo {
   source: 'manual' | 'analysis'
   sourceRef?: string | null
   fingerprint?: string | null
+  /** 修订号:初始 1,每次成功业务更新 +1;用户确认时提交所看到的值 */
+  revision: number
   createdAt: string
   updatedAt: string
 }
@@ -218,12 +222,15 @@ export interface PendingItem {
   title: string
   notes?: string | null
   status: 'open' | 'handled' | 'dismissed'
+  /** 修订号:初始 1,每次成功业务更新 +1;用户确认时提交所看到的值 */
+  revision: number
   createdAt: string
   updatedAt: string
 }
 
-export type EventInput = Partial<Omit<CalendarEvent, 'id' | 'createdAt' | 'updatedAt'>> & { title: string }
-export type TodoInput = Partial<Omit<Todo, 'id' | 'createdAt' | 'updatedAt' | 'linkedEvent'>> & { title: string }
+// revision 由主进程管理,不属于用户输入
+export type EventInput = Partial<Omit<CalendarEvent, 'id' | 'revision' | 'createdAt' | 'updatedAt'>> & { title: string }
+export type TodoInput = Partial<Omit<Todo, 'id' | 'revision' | 'createdAt' | 'updatedAt' | 'linkedEvent'>> & { title: string }
 
 export interface ConfirmResult {
   result: 'created' | 'duplicate'

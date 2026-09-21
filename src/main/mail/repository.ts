@@ -5,6 +5,7 @@ import type {
   MailListQuery,
   MailSummary
 } from '../../shared/mail'
+import { MAIL_LIMITS } from '../../shared/mail'
 import type { EnvelopeRow, PartInfo } from './adapter'
 import type { SqliteDb } from '../db/connection'
 import type { MailRepositoryPort, SyncState } from './ports'
@@ -66,8 +67,25 @@ function storageError(err: unknown): MailError {
   return new MailError('STORAGE', `邮件存储操作失败: ${err instanceof Error ? err.message : String(err)}`)
 }
 
+/** 账号级取消(R10)的写边界:拒绝已停用/移除账号或代数失效的迟到写入 */
+export interface MailWriteGuard {
+  assertWritable(accountId: string): void
+}
+
 export class MailRepository implements MailRepositoryPort {
+  private writeGuard: MailWriteGuard | null = null
+
   constructor(private readonly db: SqliteDb) {}
+
+  /** 集成接线:注入账号任务注册表守卫;测试缺省无守卫(行为与既有契约一致) */
+  setWriteGuard(guard: MailWriteGuard | null): void {
+    this.writeGuard = guard
+  }
+
+  /** 写入协调范围第一步:复核账号可写性(存在、启用、未被停用/移除阻断) */
+  private guardAccount(accountId: string | null | undefined): void {
+    if (accountId) this.writeGuard?.assertWritable(accountId)
+  }
 
   /** 读取同步游标;无记录时返回初始值 */
   state(accountId: string): SyncState {
@@ -178,6 +196,7 @@ export class MailRepository implements MailRepositoryPort {
    */
   commitBatch(accountId: string, validity: string, rows: EnvelopeRow[], next: SyncState): number {
     try {
+      this.guardAccount(accountId)
       let added = 0
       this.db.transaction(() => {
         const mailbox = next.mailbox || 'INBOX'
@@ -205,7 +224,7 @@ export class MailRepository implements MailRepositoryPort {
     }
   }
 
-  private listSql(where: string, params: SqlValue[], page: number): { items: MailSummary[]; hasMore: boolean } {
+  private listSql(where: string, params: SqlValue[], page: number, limit: number): { items: MailSummary[]; hasMore: boolean } {
     const rows = this.db.all<{
       id: string
       accountId: string
@@ -224,12 +243,12 @@ export class MailRepository implements MailRepositoryPort {
        JOIN mail_accounts a ON a.id = m.account_id
        ${where}
        ORDER BY m.received_at DESC, m.id DESC
-       LIMIT 51 OFFSET ?`,
-      [...params, page * 50]
+       LIMIT ${limit + 1} OFFSET ?`,
+      [...params, page * limit]
     )
-    const hasMore = rows.length > 50
+    const hasMore = rows.length > limit
     return {
-      items: rows.slice(0, 50).map((row) => this.toSummary(row)),
+      items: rows.slice(0, limit).map((row) => this.toSummary(row)),
       hasMore
     }
   }
@@ -280,8 +299,12 @@ export class MailRepository implements MailRepositoryPort {
       params.push(pattern, pattern, pattern)
     }
     const page = Number.isFinite(query.page) ? Math.max(0, Math.floor(query.page as number)) : 0
+    // 主进程内部调用可放宽单页上限(如初始化验收需一次取回全部),渲染层缺省仍为一页 50 条
+    const limit = Number.isFinite(query.limit)
+      ? Math.min(500, Math.max(1, Math.floor(query.limit as number)))
+      : MAIL_LIMITS.page
     const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : ''
-    return this.listSql(where, params, page)
+    return this.listSql(where, params, page, limit)
   }
 
   get(id: string): MailSummary | null {
@@ -308,16 +331,28 @@ export class MailRepository implements MailRepositoryPort {
   }
 
   markRead(id: string, read: boolean): void {
+    const row = this.db.get<{ account_id: string }>('SELECT account_id FROM mail_messages WHERE id = ?', [id])
+    if (!row) return
+    this.guardAccount(row.account_id)
     this.db.run('UPDATE mail_messages SET read_local = ? WHERE id = ?', [read ? 1 : 0, id])
     this.db.flush()
   }
 
   setBodyCache(id: string, path: string): void {
+    const row = this.db.get<{ account_id: string }>('SELECT account_id FROM mail_messages WHERE id = ?', [id])
+    if (!row) return
+    this.guardAccount(row.account_id)
     this.db.run("UPDATE mail_messages SET body_state = 'cached', body_path = ? WHERE id = ?", [path, id])
     this.db.flush()
   }
 
   setAttachmentCache(id: string, path: string): void {
+    const row = this.db.get<{ account_id: string }>(
+      'SELECT m.account_id AS account_id FROM mail_attachments at JOIN mail_messages m ON m.id = at.message_id WHERE at.id = ?',
+      [id]
+    )
+    if (!row) return
+    this.guardAccount(row.account_id)
     this.db.run('UPDATE mail_attachments SET cache_path = ? WHERE id = ?', [path, id])
     this.db.flush()
   }
@@ -375,12 +410,16 @@ export class MailRepository implements MailRepositoryPort {
     }
   }
 
-  /** 远端失效(如 UIDVALIDITY 变化):禁止再对旧行取远端 part */
+  /** 远端失效(如 UIDVALIDITY 变化):禁止再对旧行取远端 part;同步任务内调用,受写守卫约束 */
   invalidateRemote(accountId: string): void {
+    this.guardAccount(accountId)
     this.db.run('UPDATE mail_messages SET remote_available = 0 WHERE account_id = ?', [accountId])
   }
 
-  /** 移除账号收件缓存:附件随消息一起删除 */
+  /**
+   * 移除账号收件缓存:附件随消息一起删除。
+   * 生命周期清理路径:账号可能已被删除,不过账号写守卫(由 remove 流程先行取消并等待任务)。
+   */
   removeAccountCache(accountId: string): void {
     this.db.transaction(() => {
       this.db.run(
