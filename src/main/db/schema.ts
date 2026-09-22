@@ -1,8 +1,11 @@
-// v4(M1 写入基础):实体 revision、操作回执。版本号由集成负责人按合入顺序唯一分配,
-// S1 在 v3 基础上分配为 4;迁移路径见 src/main/db/migrations/m1.ts。
-export const SCHEMA_VERSION = 4
+// v4(M1 写入基础):实体 revision、操作回执。
+// v5(C-03):Agent 运行、轨迹事件与审批记录。
+// 版本号由集成负责人按合入顺序唯一分配;迁移路径见 src/main/db/migrations/registry.ts。
+import { AGENT_RUNS_SQL, APPROVALS_SQL, TRACE_EVENTS_SQL } from './migrations/m2'
 
-export const SCHEMA_SQL = `
+export const SCHEMA_VERSION = 5
+
+const BASE_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -189,3 +192,7 @@ CREATE TABLE IF NOT EXISTS operation_receipts (
   created_at TEXT NOT NULL
 );
 `
+
+// v5(C-03):Agent 运行、轨迹事件与审批记录。
+// DDL 与迁移 m2 共用同一份定义,避免"当前库形状"与"迁移脚本"两处漂移。
+export const SCHEMA_SQL = BASE_SCHEMA_SQL + AGENT_RUNS_SQL + TRACE_EVENTS_SQL + APPROVALS_SQL

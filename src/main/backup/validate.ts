@@ -115,6 +115,20 @@ const MAIL_CONFIRMATIONS: BackupColumnSpec[] = [
 const OPERATION_RECEIPTS: BackupColumnSpec[] = [
   t('operation_id'), t('command'), t('request_hash'), t('result_ref'), t('created_at')
 ]
+// v5(C-03):Agent 运行、轨迹与审批。三张表不引用业务实体,故不登记 references。
+const AGENT_RUNS: BackupColumnSpec[] = [
+  t('run_id'), t('mode'), t('status'), t('input'), t('timezone'), t('context_clock'),
+  t('config_version'), t('budget_json'), t('result_ref', true), t('error_code', true),
+  t('started_at'), t('finished_at', true)
+]
+const TRACE_EVENTS: BackupColumnSpec[] = [
+  t('run_id'), i('seq'), t('event_type'), i('schema_version'), t('payload'),
+  i('duration_ms', true), t('token_usage', true), t('created_at')
+]
+const APPROVALS: BackupColumnSpec[] = [
+  t('approval_id'), t('run_id'), t('tool_name'), t('arguments_hash'), i('plan_version'),
+  i('target_version', true), t('expires_at'), t('decision'), t('decided_at', true)
+]
 
 /** 备份写入/清除顺序:被依赖的表在前,回执最后(回执随其引用的业务实体一起替换) */
 export const BACKUP_TABLE_ORDER = [
@@ -123,7 +137,8 @@ export const BACKUP_TABLE_ORDER = [
   'semesters', 'courses', 'course_overrides', 'school_events',
   'profile_facts',
   'mail_analysis_links', 'mail_analysis_versions', 'mail_confirmations',
-  'operation_receipts'
+  'operation_receipts',
+  'agent_runs', 'trace_events', 'approvals'
 ] as const
 
 const BUSINESS_REFERENCES: BackupReferenceSpec[] = [
@@ -135,14 +150,21 @@ const BUSINESS_REFERENCES: BackupReferenceSpec[] = [
   { table: 'school_events', column: 'semester_id', targetTable: 'semesters', targetColumn: 'id', nullable: true }
 ]
 
+/** 复合或非 id 主键的表:其余表默认单列 id 主键 */
+const PRIMARY_KEY_OVERRIDES: Readonly<Record<string, readonly string[]>> = {
+  mail_confirmations: ['analysis_id', 'candidate_index'],
+  agent_runs: ['run_id'],
+  trace_events: ['run_id', 'seq'],
+  approvals: ['approval_id']
+}
+
 function buildTables(columns: Array<[string, BackupColumnSpec[]]>, pkColumn = 'id'): Record<string, BackupTableSpec> {
   const out: Record<string, BackupTableSpec> = {}
   for (const [name, cols] of columns) {
     out[name] = {
       name,
       columns: cols,
-      // 唯一复合主键:mail_confirmations(analysis_id, candidate_index);其余均为单列 id
-      primaryKey: name === 'mail_confirmations' ? ['analysis_id', 'candidate_index'] : [pkColumn]
+      primaryKey: [...(PRIMARY_KEY_OVERRIDES[name] ?? [pkColumn])]
     }
   }
   return out
@@ -166,9 +188,20 @@ const V4_TABLES = buildTables([
   ['mail_confirmations', MAIL_CONFIRMATIONS], ['operation_receipts', OPERATION_RECEIPTS]
 ])
 
+const V5_TABLES = buildTables([
+  ['conversations', CONVERSATIONS], ['messages', MESSAGES], ['materials', MATERIALS],
+  ['analyses', ANALYSES], ['events', EVENTS_V4], ['todos', TODOS_V4], ['pending_items', PENDING_V4],
+  ['semesters', SEMESTERS], ['courses', COURSES], ['course_overrides', COURSE_OVERRIDES],
+  ['school_events', SCHOOL_EVENTS], ['profile_facts', PROFILE_FACTS],
+  ['mail_analysis_links', MAIL_ANALYSIS_LINKS], ['mail_analysis_versions', MAIL_ANALYSIS_VERSIONS],
+  ['mail_confirmations', MAIL_CONFIRMATIONS], ['operation_receipts', OPERATION_RECEIPTS],
+  ['agent_runs', AGENT_RUNS], ['trace_events', TRACE_EVENTS], ['approvals', APPROVALS]
+])
+
 const VERSION_SPECS: Readonly<Record<number, BackupVersionSpec>> = {
   3: { version: 3, requiredTables: Object.keys(V3_TABLES), tables: V3_TABLES, references: BUSINESS_REFERENCES },
-  4: { version: 4, requiredTables: Object.keys(V4_TABLES), tables: V4_TABLES, references: BUSINESS_REFERENCES }
+  4: { version: 4, requiredTables: Object.keys(V4_TABLES), tables: V4_TABLES, references: BUSINESS_REFERENCES },
+  5: { version: 5, requiredTables: Object.keys(V5_TABLES), tables: V5_TABLES, references: BUSINESS_REFERENCES }
 }
 
 /** 取指定备份版本的规格;未登记版本(未来/未知)拒绝 */

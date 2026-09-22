@@ -8,6 +8,7 @@ import { makeTestDb } from './helpers'
 import { join } from 'node:path'
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
+import { SCHEMA_VERSION } from '../src/main/db/schema'
 
 function makeReminderDeps(db: Awaited<ReturnType<typeof makeTestDb>>): { deps: ReminderDeps; notices: Array<{ title: string }> } {
   const notices: Array<{ title: string }> = []
@@ -103,7 +104,7 @@ describe('R1: 备份包含操作回执与修订号(v4)', () => {
       schemaVersion: number
       tables: Record<string, Array<Record<string, unknown>>>
     }
-    expect(parsed.schemaVersion).toBe(4)
+    expect(parsed.schemaVersion).toBe(SCHEMA_VERSION)
     expect(parsed.tables.operation_receipts).toHaveLength(1)
     expect(parsed.tables.todos[0]).toMatchObject({ id: todo.id, revision: 2 })
 

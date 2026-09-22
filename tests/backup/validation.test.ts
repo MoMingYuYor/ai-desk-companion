@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it } from 'vitest'
-import { validateBackup } from '../../src/main/backup/validate'
+import { BACKUP_TABLE_ORDER, validateBackup } from '../../src/main/backup/validate'
 import { OperationError } from '../../src/main/db/operations'
 import { createTodo, listTodos } from '../../src/main/db/dao'
 import { exportBackup, importBackup } from '../../src/main/services/backup'
@@ -149,7 +149,20 @@ it('R1: 无效备份以 BACKUP_INVALID 错误拒绝', async () => {
 it('validateBackup: 完整空库通过并规格化全部表键(含可选表补空数组)', () => {
   const parsed = validateBackup(backup(v4EmptyTables()), [3, 4])
   expect(parsed.schemaVersion).toBe(4)
-  expect(Object.keys(parsed.tables).sort()).toEqual([...V4_TABLE_NAMES].sort())
+  // 输出统一为全量表清单(BACKUP_TABLE_ORDER),替换流程按同一份清单清空/写入;
+  // v5 起该清单比 v4 版本规格多出 Agent 三表,故基准取 BACKUP_TABLE_ORDER 而非 V4 清单
+  expect(Object.keys(parsed.tables).sort()).toEqual([...BACKUP_TABLE_ORDER].sort())
+})
+
+it('validateBackup: v5 备份含 Agent 三表且缺 agent_runs 时拒绝', () => {
+  const v5Tables = Object.fromEntries(BACKUP_TABLE_ORDER.map((t) => [t, []]))
+  const parsed = validateBackup(backup(v5Tables, 5), [3, 4, 5])
+  expect(parsed.schemaVersion).toBe(5)
+  expect(Object.keys(parsed.tables).sort()).toEqual([...BACKUP_TABLE_ORDER].sort())
+
+  const missingRuns = { ...v5Tables }
+  delete (missingRuns as Record<string, unknown>).agent_runs
+  expect(() => validateBackup(backup(missingRuns, 5), [3, 4, 5])).toThrow(/agent_runs/)
 })
 
 it('validateBackup: 应用标识不符 / 缺 schemaVersion / tables 非对象均拒绝', () => {

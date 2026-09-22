@@ -17,6 +17,7 @@ import {
   isRestoreWindowOpen,
   restoreBackup
 } from '../../src/main/services/backup'
+import { SCHEMA_VERSION } from '../../src/main/db/schema'
 
 const SQLJS_DIST = join(process.cwd(), 'node_modules', 'sql.js', 'dist')
 
@@ -181,7 +182,7 @@ it('R1: 成功恢复 → 窗口期间写入被拒、epoch 提升、广播触发�
     }
   })
 
-  expect(result.schemaVersion).toBe(4)
+  expect(result.schemaVersion).toBe(SCHEMA_VERSION)
   expect(result.imported.todos).toBe(1)
   expect(windowOpenDuringQuiesce).toBe(true)
   expect(gateRejectedWrite).toBe(true)

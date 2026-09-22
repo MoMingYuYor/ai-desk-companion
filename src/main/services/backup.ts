@@ -17,8 +17,8 @@ import {
   type ValidatedBackup
 } from '../backup/validate'
 
-/** 受支持的备份版本:v3 旧备份受控迁移,v4 为当前格式 */
-export const SUPPORTED_BACKUP_VERSIONS: readonly number[] = [3, SCHEMA_VERSION]
+/** 受支持的备份版本:v3 旧备份受控迁移;v4 必须保留(否则旧备份无法恢复);v5 为当前格式 */
+export const SUPPORTED_BACKUP_VERSIONS: readonly number[] = [3, 4, SCHEMA_VERSION]
 
 type Row = Record<string, unknown>
 

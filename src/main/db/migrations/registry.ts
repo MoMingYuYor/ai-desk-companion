@@ -18,6 +18,7 @@ import type { SqliteDb } from '../connection'
 import { SCHEMA_SQL } from '../schema'
 import { migrateMailV2 } from '../../mail/schema'
 import { migrateM1, OPERATION_RECEIPTS_SQL } from './m1'
+import { migrateM2, rollbackM2 } from './m2'
 import { nowTimestamp } from '../../../shared/dateUtils'
 
 export interface Migration {
@@ -134,8 +135,26 @@ const V4_WRITE_BASICS: Migration = {
   }
 }
 
+/** v5(C-03):Agent 运行、轨迹事件与审批记录 */
+const V5_AGENT_RUNS: Migration = {
+  version: 5,
+  name: 'agent_runs',
+  up: (db) => {
+    migrateM2(db)
+  },
+  down: (db) => {
+    rollbackM2(db)
+  }
+}
+
 /** 注册表:按 version 升序执行;新增迁移只允许追加,不回改已发布条目 */
-export const MIGRATIONS: readonly Migration[] = [V1_BASE, V2_MAIL, V3_PROVIDER_JSON_MODE, V4_WRITE_BASICS]
+export const MIGRATIONS: readonly Migration[] = [
+  V1_BASE,
+  V2_MAIL,
+  V3_PROVIDER_JSON_MODE,
+  V4_WRITE_BASICS,
+  V5_AGENT_RUNS
+]
 
 /** 注册表支持的最高版本 */
 export const REGISTRY_VERSION = MIGRATIONS.reduce((max, m) => (m.version > max ? m.version : max), 0)

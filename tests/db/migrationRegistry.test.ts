@@ -42,6 +42,9 @@ const MAIL_TABLES = [
   'mail_confirmations'
 ]
 
+/** v5(C-03)新增的 Agent 三表 */
+const AGENT_TABLES = ['agent_runs', 'trace_events', 'approvals']
+
 describe('注册表不变量', () => {
   it('注册表最高版本与 schema.ts 的 SCHEMA_VERSION 一致', () => {
     expect(REGISTRY_VERSION).toBe(SCHEMA_VERSION)
@@ -66,12 +69,13 @@ describe('全新库', () => {
   it('应用全部迁移并写入迁移历史', async () => {
     const db = await makeTestDb()
     const applied = readApplied(db)
-    expect(applied.map((a) => a.version)).toEqual([1, 2, 3, 4])
+    expect(applied.map((a) => a.version)).toEqual(MIGRATIONS.map((m) => m.version))
     expect(metaVersion(db)).toBe(String(SCHEMA_VERSION))
     for (const t of MAIL_TABLES) expect(tableNames(db)).toContain(t)
     expect(columnNames(db, 'providers')).toContain('supports_json_mode')
     expect(columnNames(db, 'events')).toContain('revision')
     expect(tableNames(db)).toContain('operation_receipts')
+    for (const t of AGENT_TABLES) expect(tableNames(db)).toContain(t)
   })
 
   it('重复初始化幂等:历史不重复写入', async () => {
@@ -97,8 +101,8 @@ describe('兼容既有库:按 meta.schema_version 回填', () => {
     expect(readApplied(db)).toEqual([])
 
     const backfilled = backfillFromMeta(db)
-    expect(backfilled).toBe(4)
-    expect(readApplied(db).map((a) => a.version)).toEqual([1, 2, 3, 4])
+    expect(backfilled).toBe(MIGRATIONS.length)
+    expect(readApplied(db).map((a) => a.version)).toEqual(MIGRATIONS.map((m) => m.version))
     expect(pendingMigrations(db)).toHaveLength(0)
   })
 
@@ -109,7 +113,9 @@ describe('兼容既有库:按 meta.schema_version 回填', () => {
 
     expect(backfillFromMeta(db)).toBe(1)
     expect(readApplied(db).map((a) => a.version)).toEqual([1])
-    expect(pendingMigrations(db).map((m) => m.version)).toEqual([2, 3, 4])
+    expect(pendingMigrations(db).map((m) => m.version)).toEqual(
+      MIGRATIONS.filter((m) => m.version > 1).map((m) => m.version)
+    )
   })
 
   it('注册表已有记录时不回填(返回 0)', async () => {
@@ -122,7 +128,7 @@ describe('兼容既有库:按 meta.schema_version 回填', () => {
     db.run('DELETE FROM schema_migrations')
     db.run("DELETE FROM meta WHERE key = 'schema_version'")
     expect(backfillFromMeta(db)).toBe(0)
-    expect(pendingMigrations(db)).toHaveLength(4)
+    expect(pendingMigrations(db)).toHaveLength(MIGRATIONS.length)
   })
 })
 
@@ -152,6 +158,7 @@ describe('回滚', () => {
     })
     expect(rebuilt).toBe(SCHEMA_VERSION)
     for (const t of MAIL_TABLES) expect(tableNames(db)).toContain(t)
+    for (const t of AGENT_TABLES) expect(tableNames(db)).toContain(t)
     expect(columnNames(db, 'providers')).toContain('supports_json_mode')
     expect(columnNames(db, 'events')).toContain('revision')
     expect(tableNames(db)).toContain('operation_receipts')
@@ -167,8 +174,9 @@ describe('回滚', () => {
 
     expect(finalVersion).toBe(3)
     expect(metaVersion(db)).toBe('3')
-    // v4 的结构移除
+    // v4 与 v5 的结构移除
     expect(tableNames(db)).not.toContain('operation_receipts')
+    for (const t of AGENT_TABLES) expect(tableNames(db)).not.toContain(t)
     expect(columnNames(db, 'events')).not.toContain('revision')
     expect(columnNames(db, 'todos')).not.toContain('revision')
     expect(columnNames(db, 'pending_items')).not.toContain('revision')
