@@ -144,6 +144,16 @@ export const Channels = {
   MailCancelAnalysis: 'mail:cancel-analysis',
   MailSource: 'mail:source',
 
+  // Agent 运行契约(C-02):运行生命周期、澄清、取消与审批。
+  // 这些通道只对 workbench 角色开放;桌宠与面板一律拒绝(见 tests/agent/ipcAuthorization.test.ts)。
+  // 执行语义由 C-03 实现,本文件只固定通道名与渲染层可见契约。
+  AgentRunCreate: 'agent:run-create',
+  AgentRunGet: 'agent:run-get',
+  AgentRunEvents: 'agent:run-events',
+  AgentRunAnswers: 'agent:run-answers',
+  AgentRunCancel: 'agent:run-cancel',
+  AgentApprovalDecide: 'agent:approval-decide',
+
   // main -> renderer 事件
   // R8 会话运行契约:started 先于任何流事件;delta/done/error 均携带 runId,
   // 页面只接收与当前运行精确匹配的事件,迟到事件零 UI 副作用
@@ -159,7 +169,11 @@ export const Channels = {
   EventDataChanged: 'evt:data-changed',
   EventPetActivity: 'evt:pet-activity',
   // 持久化状态广播:dirty/saving/saved/failed + 写入代数(Task 3)
-  EventPersistStateChanged: 'evt:persist-state'
+  EventPersistStateChanged: 'evt:persist-state',
+  // Agent 运行事件(C-02):按 seq 递增推送,客户端按 seq 补发缺失事件;
+  // 断线重连不取消运行;终态发 run.finished
+  EventAgentRunUpdated: 'evt:agent-run-updated',
+  EventAgentRunFinished: 'evt:agent-run-finished'
 } as const
 
 export interface AnalysisDeferResult {
