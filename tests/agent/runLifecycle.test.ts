@@ -3,6 +3,7 @@ import { makeTestDb } from '../helpers'
 import { RUN_STATUSES, type RunStatus } from '../../src/shared/agent'
 import { assertTransition, canReach, canTransition, allowedTransitions } from '../../src/main/agent/stateMachine'
 import { RunQueue } from '../../src/main/agent/runQueue'
+import { WORKER_INTERRUPTED, recoverInterruptedRuns } from '../../src/main/agent/recovery'
 import {
   appendTraceEvent,
   createApproval,
@@ -438,5 +439,63 @@ describe('显式运行队列', () => {
     // 绕过队列直接改库,模拟"队列语义被绕过"
     db.run("UPDATE agent_runs SET status = 'executing'")
     expect(() => queue.currentActive()).toThrow(/队列不变量被破坏/)
+  })
+})
+
+describe('启动恢复', () => {
+  it('把失去执行者的运行标记为 failed + WORKER_INTERRUPTED', async () => {
+    const db = await makeTestDb()
+    const queue = new RunQueue(db)
+    const planning = makeRun(db, '规划中')
+    const executing = makeRun(db, '执行中')
+    const untouched = makeRun(db, '排队中')
+
+    queue.tryStart(planning.runId)
+    transitionRun(db, executing.runId, 'planning')
+    transitionRun(db, executing.runId, 'executing')
+
+    const recovered = recoverInterruptedRuns(db)
+    expect(recovered.map((r) => r.runId).sort()).toEqual([planning.runId, executing.runId].sort())
+    for (const run of recovered) {
+      expect(run.status).toBe('failed')
+      expect(run.errorCode).toBe(WORKER_INTERRUPTED)
+      expect(run.finishedAt).not.toBeNull()
+    }
+    // 排队中的运行不受影响
+    expect(getRun(db, untouched.runId)?.status).toBe('queued')
+    expect(queue.isBusy()).toBe(false)
+  })
+
+  it('等待人工的运行不被当作中断(它们在等用户,不是失去执行者)', async () => {
+    const db = await makeTestDb()
+    const run = makeRun(db)
+    transitionRun(db, run.runId, 'planning')
+    transitionRun(db, run.runId, 'awaiting_confirmation')
+
+    expect(recoverInterruptedRuns(db)).toEqual([])
+    expect(getRun(db, run.runId)?.status).toBe('awaiting_confirmation')
+  })
+
+  it('终态运行不被改动', async () => {
+    const db = await makeTestDb()
+    const run = makeRun(db)
+    transitionRun(db, run.runId, 'planning')
+    transitionRun(db, run.runId, 'succeeded')
+    expect(recoverInterruptedRuns(db)).toEqual([])
+    expect(getRun(db, run.runId)?.status).toBe('succeeded')
+  })
+
+  it('无中断运行时返回空数组', async () => {
+    const db = await makeTestDb()
+    makeRun(db)
+    expect(recoverInterruptedRuns(db)).toEqual([])
+  })
+
+  it('重复调用是幂等的', async () => {
+    const db = await makeTestDb()
+    const run = makeRun(db)
+    transitionRun(db, run.runId, 'planning')
+    expect(recoverInterruptedRuns(db)).toHaveLength(1)
+    expect(recoverInterruptedRuns(db)).toEqual([])
   })
 })
