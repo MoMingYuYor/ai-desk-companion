@@ -1,11 +1,11 @@
 import { createHash } from 'node:crypto'
 import type { SqliteDb } from '../db/connection'
 import {
-  SCHEMA_SQL,
-  SCHEMA_VERSION
-} from '../db/schema'
-import { migrateMailV2 } from '../mail/schema'
-import { migrateM1 } from './migrations/m1'
+  applyPending,
+  assertRegistryCanHandle,
+  backfillFromMeta,
+  ensureMigrationsTable
+} from './migrations/registry'
 import type {
   ActionCandidate,
   Analysis,
@@ -41,29 +41,15 @@ export function initSchema(db: SqliteDb): void {
   // PRAGMA foreign_keys 在事务外执行
   db.run('PRAGMA foreign_keys = ON')
   db.transaction(() => {
-    db.run(SCHEMA_SQL)
-    const row = db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'schema_version'")
-    if (!row) {
-      migrateMailV2(db)
-      db.run("INSERT INTO meta (key, value) VALUES ('schema_version', ?)", [String(SCHEMA_VERSION)])
-    } else {
-      const currentVer = parseInt(row.value, 10)
-      if (currentVer > SCHEMA_VERSION) {
-        throw new Error(`数据库版本 (${currentVer}) 高于当前支持的版本 (${SCHEMA_VERSION})`)
-      }
-      if (currentVer < 2) migrateMailV2(db)
-      if (currentVer < 3) {
-        // v3:providers 增加 JSON 结构化输出能力开关
-        db.run('ALTER TABLE providers ADD COLUMN supports_json_mode INTEGER NOT NULL DEFAULT 0')
-      }
-      if (currentVer < 4) {
-        // v4(M1 写入基础):实体 revision、操作回执
-        migrateM1(db)
-      }
-      if (currentVer < SCHEMA_VERSION) {
-        db.run("UPDATE meta SET value = ? WHERE key = 'schema_version'", [String(SCHEMA_VERSION)])
-      }
-    }
+    // 版本化迁移注册表(C-03):替代此前的 meta.schema_version + if 链,
+    // 以获得可回滚与迁移历史。单事务包裹全部 DDL 与版本更新,失败整体回滚,
+    // 不留半迁移状态(与升级前的行为一致)。
+    ensureMigrationsTable(db)
+    // 兼容既有库:meta.schema_version 存在而 schema_migrations 为空时按版本回填,不重跑 DDL
+    backfillFromMeta(db)
+    // 既有库版本高于注册表时拒绝启动,不静默降级
+    assertRegistryCanHandle(db)
+    applyPending(db)
   })
 }
 

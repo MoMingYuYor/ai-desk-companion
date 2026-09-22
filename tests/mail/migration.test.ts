@@ -49,6 +49,9 @@ describe('数据库迁移与初始化', () => {
     )
     db.run('DROP TABLE providers_v1')
     db.run("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
+    // C-03 起 schema_migrations 是版本权威:模拟注册表之前的旧库必须一并清空它,
+    // 否则注册表认为 v1~v4 已应用,不会重跑迁移。真实 v1 库没有这张表。
+    db.run('DELETE FROM schema_migrations')
 
     initSchema(db)
     expect(
@@ -83,6 +86,8 @@ describe('数据库迁移与初始化', () => {
        SELECT id, name, base_url, api_key_enc, protocol, models, default_model, supports_vision, is_default, sort_order, created_at, updated_at FROM providers_v2`
     )
     db.run('DROP TABLE providers_v2')
+    // 同前:模拟 v2 旧库需清空注册表,使 backfillFromMeta 按 meta=2 回填 v1~v2 并应用 v3~v4
+    db.run('DELETE FROM schema_migrations')
 
     initSchema(db)
     const infos = listProviders(db)
