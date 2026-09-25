@@ -11,6 +11,7 @@ import { nowTimestamp } from '../../shared/dateUtils'
 import {
   isRunMode,
   isRunStatus,
+  type AgentRunView,
   type Approval,
   type ApprovalDecision,
   type RunMode,
@@ -21,21 +22,8 @@ import {
 } from '../../shared/agent'
 import { assertTransition } from '../agent/stateMachine'
 
-export interface AgentRunRecord {
-  runId: string
-  mode: RunMode
-  status: RunStatus
-  input: string
-  timezone: string
-  /** 上下文时钟的固定时刻(UTC ISO 8601);运行时用注入时钟写入 */
-  contextClock: string
-  configVersion: string
-  budgetJson: string
-  resultRef: string | null
-  errorCode: string | null
-  startedAt: string
-  finishedAt: string | null
-}
+/** 仓库记录形态与 IPC 线缆形态共用 AgentRunView 的字段定义,防止两处漂移 */
+export interface AgentRunRecord extends AgentRunView {}
 
 interface RunRow {
   run_id: string

@@ -78,6 +78,8 @@ import type { Engine } from './services/engine'
 import type { ModelRouter } from './services/modelRouter'
 import type { ReminderService } from './services/reminder'
 import type { PersistenceCoordinator } from './db/operations'
+import type { AgentEventStream } from './agent/eventStream'
+import { getRun, listTraceEvents } from './runs/repository'
 import { buildDayAgenda } from './services/context'
 import { exportBackup } from './services/backup'
 import { decryptApiKey, encryptApiKey } from './keys'
@@ -111,6 +113,11 @@ export interface IpcDeps {
   mail: MailService
   /** 持久化协调器:存在时向全部窗口广播保存状态(evt:persist-state) */
   persistCoordinator?: PersistenceCoordinator
+  /**
+   * Agent 运行事件广播(C-03):编排器(A-03)经它发 evt:agent-run-updated / finished。
+   * 本次注册的两个 handler 只依赖 db;本依赖为可选项以兼容现有测试桩。
+   */
+  agentEvents?: AgentEventStream
 }
 
 let depsRef: IpcDeps | null = null
@@ -269,6 +276,18 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   }))
   // 只读:可信窗口初始化与恢复后刷新使用;旧代数的写请求由各命令在边界拒绝
   handle(Channels.WorkspaceEpoch, () => getWorkspaceEpoch())
+
+  // ---- agent 运行事件流(C-03,只读) ----
+  // 事件写侧(创建/澄清/取消/审批)需要 A-03~A-05 的编排器,届时再注册;此处只接读侧。
+  // 断线重连语义:订阅方按 seq 记游标,重连后带 afterSeq 调 AgentRunEvents 补齐缺失事件,
+  // 一次往返同时拿到运行最新状态;运行不因订阅断开而取消。
+  handle(Channels.AgentRunGet, (runId: string) => getRun(db, runId))
+  handle(Channels.AgentRunEvents, (runId: string, afterSeq?: number) => {
+    const run = getRun(db, runId)
+    if (!run) return { run: null, events: [] }
+    const cursor = typeof afterSeq === 'number' && Number.isInteger(afterSeq) && afterSeq >= 0 ? afterSeq : 0
+    return { run, events: listTraceEvents(db, runId, cursor) }
+  })
 
   // ---- providers ----
   handle(Channels.ProvidersList, (): ProviderInfo[] => listProviders(db))

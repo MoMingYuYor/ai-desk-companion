@@ -172,6 +172,44 @@ export interface Approval {
   decidedAt: string | null
 }
 
+// ---------- IPC 线缆类型 ----------
+//
+// 运行记录对外暴露的字段定义在此(单一字段定义处),仓库层的 AgentRunRecord 直接继承,
+// 避免"仓库形态"与"IPC 线缆形态"两处漂移。
+
+export interface AgentRunView {
+  runId: string
+  mode: RunMode
+  status: RunStatus
+  input: string
+  timezone: string
+  /** 上下文时钟的固定时刻(UTC ISO 8601) */
+  contextClock: string
+  configVersion: string
+  budgetJson: string
+  resultRef: string | null
+  errorCode: string | null
+  startedAt: string
+  finishedAt: string | null
+}
+
+/** evt:agent-run-updated 的载荷:事件与事件发生时的运行快照 */
+export interface AgentRunEventPayload {
+  run: AgentRunView
+  event: TraceEvent
+}
+
+/** evt:agent-run-finished 的载荷:仅运行终态快照 */
+export interface AgentRunFinishedPayload {
+  run: AgentRunView
+}
+
+/** agent:run-events 的响应:运行状态 + 缺失事件(合并响应,重连一次往返) */
+export interface AgentRunEventsResult {
+  run: AgentRunView | null
+  events: TraceEvent[]
+}
+
 // ---------- 纯校验 ----------
 
 export function isRunMode(value: unknown): value is RunMode {

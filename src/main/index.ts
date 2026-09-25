@@ -14,10 +14,12 @@ import {
   createPetWindow,
   createWorkbenchWindow,
   broadcastToAll,
+  broadcastToWorkbench,
   getWorkbenchWindow,
   isQuitting,
   markQuitting
 } from './windows'
+import { AgentEventStream } from './agent/eventStream'
 import { createTray, destroyTray } from './tray'
 import { markPetBubble, markPetState } from './petBridge'
 import { createPetActivityRegistry } from './pet/activity'
@@ -164,7 +166,12 @@ function bootstrap(): void {
       broadcast: (channel, payload) => broadcastToAll(channel, payload)
     })
 
-    registerIpcHandlers({ db, engine, router, reminders, petActivity, mail, persistCoordinator })
+    // C-03:Agent 运行事件只发工作台(桌宠与面板按能力表拒绝 Agent 通道)。
+    // 启动恢复(recoverInterruptedRuns)不在此广播:执行时窗口尚不存在,
+    // 渲染层加载后经 agent:run-get / agent:run-events 拉取初始状态。
+    const agentEvents = new AgentEventStream({ send: broadcastToWorkbench })
+
+    registerIpcHandlers({ db, engine, router, reminders, petActivity, mail, persistCoordinator, agentEvents })
     setDataChangedListener(() => {
       broadcastToAll('evt:data-changed', { at: Date.now() })
     })

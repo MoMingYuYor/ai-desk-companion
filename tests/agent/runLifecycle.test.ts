@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { makeTestDb } from '../helpers'
-import { RUN_STATUSES, type RunStatus } from '../../src/shared/agent'
+import { RUN_STATUSES, type AgentRunView, type RunStatus } from '../../src/shared/agent'
 import { assertTransition, canReach, canTransition, allowedTransitions } from '../../src/main/agent/stateMachine'
 import { RunQueue } from '../../src/main/agent/runQueue'
 import { WORKER_INTERRUPTED, recoverInterruptedRuns } from '../../src/main/agent/recovery'
@@ -32,6 +32,19 @@ const NON_TERMINAL: readonly RunStatus[] = RUN_STATUSES.filter(
 function makeRun(db: SqliteDb, input = '整理本周未完成的高优先级任务') {
   return createRun(db, { mode: 'personal_ops', input, contextClock: CLOCK })
 }
+
+describe('AgentRunView 字段漂移防护', () => {
+  it('getRun 输出的键集合与 shared/agent 的 AgentRunView 完全一致', async () => {
+    const db = await makeTestDb()
+    const run = makeRun(db)
+    const viewKeys = Object.keys({
+      runId: '', mode: 'personal_ops', status: 'queued', input: '', timezone: '',
+      contextClock: '', configVersion: '', budgetJson: '', resultRef: null,
+      errorCode: null, startedAt: '', finishedAt: null
+    } satisfies Record<keyof AgentRunView, unknown>)
+    expect(Object.keys(getRun(db, run.runId)!).sort()).toEqual([...viewKeys].sort())
+  })
+})
 
 describe('状态机', () => {
   it('终态没有出边', () => {

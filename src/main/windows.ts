@@ -311,3 +311,13 @@ export function broadcastToAll(channel: string, payload: unknown): void {
     }
   }
 }
+
+/**
+ * 只向工作台定向广播:Agent 运行数据(轨迹事件、审批记录)按窗口能力表
+ * 只对 workbench 角色开放,不得发给桌宠与面板,故不走 broadcastToAll。
+ */
+export function broadcastToWorkbench(channel: string, payload: unknown): void {
+  if (workbenchWindow && !workbenchWindow.isDestroyed()) {
+    workbenchWindow.webContents.send(channel, payload)
+  }
+}
