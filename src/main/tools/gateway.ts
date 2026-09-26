@@ -194,7 +194,8 @@ export class ToolGateway {
       throw conflict('计划版本与批准时不一致,需重新生成提案')
     }
     if (approval.targetVersion !== null && def.resolveTargetVersion) {
-      const current = def.resolveTargetVersion(JSON.parse(approval.argumentsJson ?? '{}'), {
+      const parsedArgs = JSON.parse(approval.argumentsJson ?? '{}')
+      const current = def.resolveTargetVersion(parsedArgs, {
         db: this.deps.db,
         clock: this.deps.clock
       })
