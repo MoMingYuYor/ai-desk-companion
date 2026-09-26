@@ -13,6 +13,8 @@ export type ErrorCode =
   | 'BUSY'
   | 'STALE_PREVIEW'
   | 'TARGET_UNAVAILABLE'
+  | 'MODEL_UNAVAILABLE'
+  | 'MODEL_OUTPUT_INVALID'
 
 export interface AppError {
   code: ErrorCode

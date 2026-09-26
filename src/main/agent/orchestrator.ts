@@ -58,16 +58,21 @@ export class RunOrchestrator {
 
   /** 创建运行:只落库排队,立即返回;规划异步驱动 */
   startRun(input: StartRunInput): AgentRunRecord {
-    const run = createRun(this.deps.db, {
+    const run = this.createQueuedRun(input)
+    void this.drivePlanning(run.runId).catch((err: unknown) => {
+      console.error('[orchestrator] 规划驱动异常:', err instanceof Error ? err.message : String(err))
+    })
+    return run
+  }
+
+  /** 只创建排队运行(不驱动规划):IPC 层先写回执,再异步驱动 */
+  createQueuedRun(input: StartRunInput): AgentRunRecord {
+    return createRun(this.deps.db, {
       mode: input.mode,
       input: input.input,
       contextClock: this.deps.clock?.now().toISOString() ?? new Date().toISOString(),
       timezone: input.timezone
     })
-    void this.drivePlanning(run.runId).catch((err: unknown) => {
-      console.error('[orchestrator] 规划驱动异常:', err instanceof Error ? err.message : String(err))
-    })
-    return run
   }
 
   /** 工具目录(注册表 → 规划提示词摘要) */
@@ -238,8 +243,11 @@ export class RunOrchestrator {
     }
   }
 
-  /** 提交澄清回答:等待中的运行重新入队并再次规划(同一运行继续) */
-  async submitAnswers(runId: string, answers: AnswerItem[]): Promise<void> {
+  /**
+   * 受理澄清回答(同步):校验、落轨迹、重新入队。不等待模型——
+   * 调用方受理后自行以 drivePlanning(runId, answers) 异步驱动。
+   */
+  acceptAnswers(runId: string, answers: AnswerItem[]): AgentRunRecord {
     const run = getRun(this.deps.db, runId)
     if (!run) throw new OperationError(appError('VALIDATION', `运行不存在:${runId}`, { retryable: false }))
     if (run.status !== 'awaiting_input') {
@@ -249,7 +257,12 @@ export class RunOrchestrator {
       throw new OperationError(appError('VALIDATION', '回答不能为空', { retryable: false }))
     }
     this.trace(runId, 'input', { answers })
-    transitionRun(this.deps.db, runId, 'queued')
+    return transitionRun(this.deps.db, runId, 'queued')
+  }
+
+  /** 提交澄清回答并等待重新规划完成(测试与 CLI 用;IPC 层用 acceptAnswers) */
+  async submitAnswers(runId: string, answers: AnswerItem[]): Promise<void> {
+    this.acceptAnswers(runId, answers)
     await this.drivePlanning(runId, answers)
   }
 

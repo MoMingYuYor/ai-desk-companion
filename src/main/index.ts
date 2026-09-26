@@ -20,6 +20,14 @@ import {
   markQuitting
 } from './windows'
 import { AgentEventStream } from './agent/eventStream'
+import { RunOrchestrator } from './agent/orchestrator'
+import { RunQueue } from './agent/runQueue'
+import { ModelCompleter } from './agent/completer'
+import { ToolRegistry } from './tools/registry'
+import { ToolGateway } from './tools/gateway'
+import { registerOpsTools } from './tools/definitions'
+import { seedDemoData } from './agent/seed'
+import { recoverInterruptedRuns } from './agent/recovery'
 import { createTray, destroyTray } from './tray'
 import { markPetBubble, markPetState } from './petBridge'
 import { createPetActivityRegistry } from './pet/activity'
@@ -27,6 +35,7 @@ import type { PetActivityNotice } from '../shared/pet'
 import { MailService } from './mail/service'
 import type { CredentialStorage } from './mail/credentials'
 import { safeStorage, powerMonitor } from 'electron'
+import { systemClock } from '../shared/clock'
 import { createAppearanceStore } from './appearance/store'
 import { createAppearanceService, type AppearanceService, type NativeThemePort } from './appearance/service'
 import { registerAppearanceIpc } from './appearance/ipc'
@@ -171,7 +180,27 @@ function bootstrap(): void {
     // 渲染层加载后经 agent:run-get / agent:run-events 拉取初始状态。
     const agentEvents = new AgentEventStream({ send: broadcastToWorkbench })
 
-    registerIpcHandlers({ db, engine, router, reminders, petActivity, mail, persistCoordinator, agentEvents })
+    // A 系列:八个本地工具 + 编排器。规划走真实模型(ModelCompleter);
+    // 演示种子只在首次启动播种一次(虚拟数据,不触碰用户既有内容)。
+    const agentRegistry = new ToolRegistry()
+    registerOpsTools(agentRegistry)
+    const agentQueue = new RunQueue(db)
+    const agentGateway = new ToolGateway({ db, registry: agentRegistry, clock: systemClock })
+    seedDemoData(db)
+    const interrupted = recoverInterruptedRuns(db)
+    if (interrupted.length > 0) {
+      console.warn(`[agent] 恢复:${interrupted.length} 个中断运行标记为失败`)
+    }
+    const orchestrator = new RunOrchestrator({
+      db,
+      registry: agentRegistry,
+      gateway: agentGateway,
+      queue: agentQueue,
+      events: agentEvents,
+      completer: new ModelCompleter({ db, router })
+    })
+
+    registerIpcHandlers({ db, engine, router, reminders, petActivity, mail, persistCoordinator, agentEvents, orchestrator })
     setDataChangedListener(() => {
       broadcastToAll('evt:data-changed', { at: Date.now() })
     })

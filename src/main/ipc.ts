@@ -79,6 +79,8 @@ import type { ModelRouter } from './services/modelRouter'
 import type { ReminderService } from './services/reminder'
 import type { PersistenceCoordinator } from './db/operations'
 import type { AgentEventStream } from './agent/eventStream'
+import type { RunOrchestrator, AnswerItem } from './agent/orchestrator'
+import type { RunMode } from '../shared/agent'
 import { getRun, listTraceEvents } from './runs/repository'
 import { buildDayAgenda } from './services/context'
 import { exportBackup } from './services/backup'
@@ -118,6 +120,8 @@ export interface IpcDeps {
    * 本次注册的两个 handler 只依赖 db;本依赖为可选项以兼容现有测试桩。
    */
   agentEvents?: AgentEventStream
+  /** Agent 运行编排器(A-05):缺省时 Agent 写侧通道不可用(兼容现有测试桩) */
+  orchestrator?: RunOrchestrator
 }
 
 let depsRef: IpcDeps | null = null
@@ -191,7 +195,11 @@ const WRITE_CHANNELS: ReadonlySet<string> = new Set([
   Channels.MailDownload,
   Channels.MailSaveAttachment,
   Channels.MailAnalyze,
-  Channels.MailCancelAnalysis
+  Channels.MailCancelAnalysis,
+  Channels.AgentRunCreate,
+  Channels.AgentRunAnswers,
+  Channels.AgentRunCancel,
+  Channels.AgentApprovalDecide
 ])
 
 /** IPC 失败日志与错误透传:只含通道、错误分类、操作 ID 与面向用户的消息(脱敏,不含参数/正文/凭据) */
@@ -287,6 +295,47 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     if (!run) return { run: null, events: [] }
     const cursor = typeof afterSeq === 'number' && Number.isInteger(afterSeq) && afterSeq >= 0 ? afterSeq : 0
     return { run, events: listTraceEvents(db, runId, cursor) }
+  })
+  // Agent 写侧(A-05):创建只落库排队(202 语义),规划异步驱动;
+  // 澄清受理同步返回,重新规划异步;取消同步;审批决定同步执行写步骤。
+  // 写侧需要编排器:未接线时(旧测试桩)以明确错误拒绝,不做静默桩。
+  handle(Channels.AgentRunCreate, async (input: { mode?: RunMode; input: string; timezone?: string }) => {
+    if (!deps.orchestrator) {
+      throw new OperationError(appError('MODEL_UNAVAILABLE', 'Agent 编排器未接线', { retryable: false }))
+    }
+    const run = await writeMutation(db, deps, 'agent:run-create', input, () =>
+      deps.orchestrator!.createQueuedRun({
+        mode: input.mode ?? 'personal_ops',
+        input: input.input,
+        timezone: input.timezone
+      })
+    )
+    void deps.orchestrator.drivePlanning(run.runId).catch((err: unknown) => {
+      console.error('[agent] 规划驱动异常:', err instanceof Error ? err.message : String(err))
+    })
+    return { runId: run.runId, status: run.status }
+  })
+  handle(Channels.AgentRunAnswers, (runId: string, answers: AnswerItem[]) => {
+    if (!deps.orchestrator) {
+      throw new OperationError(appError('MODEL_UNAVAILABLE', 'Agent 编排器未接线', { retryable: false }))
+    }
+    const run = deps.orchestrator.acceptAnswers(runId, answers)
+    void deps.orchestrator.drivePlanning(runId, answers).catch((err: unknown) => {
+      console.error('[agent] 重新规划异常:', err instanceof Error ? err.message : String(err))
+    })
+    return { runId: run.runId, status: run.status }
+  })
+  handle(Channels.AgentRunCancel, (runId: string) => {
+    if (!deps.orchestrator) {
+      throw new OperationError(appError('MODEL_UNAVAILABLE', 'Agent 编排器未接线', { retryable: false }))
+    }
+    return deps.orchestrator.cancel(runId)
+  })
+  handle(Channels.AgentApprovalDecide, (approvalId: string, decision: 'approved' | 'rejected') => {
+    if (!deps.orchestrator) {
+      throw new OperationError(appError('MODEL_UNAVAILABLE', 'Agent 编排器未接线', { retryable: false }))
+    }
+    return deps.orchestrator.decide(approvalId, decision)
   })
 
   // ---- providers ----
