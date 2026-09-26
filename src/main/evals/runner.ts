@@ -157,6 +157,8 @@ export class EvalRunner {
   /** 执行整批;返回最终状态(单案例失败不会中断批次) */
   async run(): Promise<EvalRunState> {
     mkdirSync(this.deps.artifactRoot, { recursive: true })
+    // case 临时目录的父目录:createIsolatedCaseEnv 的 mkdtemp 需要它存在
+    mkdirSync(join(this.deps.artifactRoot, 'cases'), { recursive: true })
     this.state.status = 'running'
     this.persist()
 
@@ -284,6 +286,12 @@ export class EvalRunner {
       base.executedTools = trace
         .filter((e) => e.eventType === 'tool_call')
         .map((e) => String((e.payload as { tool?: string }).tool ?? ''))
+      const errorEvents = trace.filter((e) => e.eventType === 'error')
+      if (after?.status === 'failed' || after?.status === 'partial') {
+        base.failureReasons.push(
+          ...errorEvents.map((e) => `运行错误:${String((e.payload as { code?: string; message?: string }).code ?? '')} ${String((e.payload as { message?: string }).message ?? '')}`)
+        )
+      }
 
       const reasons = base.failureReasons
       if (after?.status !== caseDef.expected.terminal_status) {
