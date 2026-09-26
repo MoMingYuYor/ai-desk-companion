@@ -19,7 +19,7 @@ import {
 } from '../backup/validate'
 
 /** 受支持的备份版本:v3 旧备份受控迁移;v4/v5 必须保留(否则旧备份无法恢复);v6 为当前格式 */
-export const SUPPORTED_BACKUP_VERSIONS: readonly number[] = [3, 4, 5, SCHEMA_VERSION]
+export const SUPPORTED_BACKUP_VERSIONS: readonly number[] = [3, 4, 5, 6, SCHEMA_VERSION]
 
 type Row = Record<string, unknown>
 

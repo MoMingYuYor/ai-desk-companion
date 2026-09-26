@@ -164,6 +164,11 @@ export interface Approval {
   runId: string
   toolName: string
   argumentsHash: string
+  /**
+   * 已校验的完整参数(JSON)。批准执行需要它:进程重启后
+   * 仅凭 hash 无法还原参数,缺了就无法执行已批准的写操作(OPS-10)。
+   */
+  argumentsJson: string | null
   planVersion: number
   targetVersion: number | null
   /** UTC ISO 8601 */

@@ -187,7 +187,8 @@ export interface CalendarEvent {
   color?: string | null
   location?: string | null
   notes?: string | null
-  source: 'manual' | 'analysis' | 'course'
+  /** agent:由 Personal Ops Agent 经确认后创建 */
+  source: 'manual' | 'analysis' | 'course' | 'agent'
   sourceRef?: string | null
   reminderMinutes?: number | null
   status: 'active' | 'cancelled'
@@ -207,7 +208,8 @@ export interface Todo {
   completedAt?: string | null
   linkedEventId?: string | null
   linkedEvent?: CalendarEvent | null
-  source: 'manual' | 'analysis'
+  /** agent:由 Personal Ops Agent 经确认后创建 */
+  source: 'manual' | 'analysis' | 'agent'
   sourceRef?: string | null
   fingerprint?: string | null
   /** 修订号:初始 1,每次成功业务更新 +1;用户确认时提交所看到的值 */

@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS approvals (
   run_id TEXT NOT NULL,
   tool_name TEXT NOT NULL,
   arguments_hash TEXT NOT NULL,
+  arguments_json TEXT,
   plan_version INTEGER NOT NULL CHECK (plan_version >= 1),
   target_version INTEGER,
   expires_at TEXT NOT NULL,

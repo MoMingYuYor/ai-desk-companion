@@ -59,6 +59,12 @@ function checkField(spec: ToolFieldSpec, value: unknown): unknown {
       if (typeof value !== 'boolean') throw invalid(`字段 ${spec.name} 必须是布尔值`)
       return value
     }
+    case 'string[]': {
+      if (!Array.isArray(value) || value.some((v) => typeof v !== 'string')) {
+        throw invalid(`字段 ${spec.name} 必须是字符串数组`)
+      }
+      return value
+    }
   }
 }
 

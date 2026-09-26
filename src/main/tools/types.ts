@@ -14,7 +14,7 @@ export type { RiskLevel }
 // "schema 单一事实源"取向一致。严格性由 validateToolInput 保证:
 // 未知字段、缺失必填、类型不符、枚举越界、数值越界一律拒绝。
 
-export type ToolFieldType = 'string' | 'number' | 'boolean'
+export type ToolFieldType = 'string' | 'number' | 'boolean' | 'string[]'
 
 export interface ToolFieldSpec {
   name: string
@@ -38,6 +38,12 @@ export interface ToolExecutionContext {
   db: SqliteDb
   /** 注入时钟:领域时间可固定,耗时测量仍走单调钟(C-02 契约) */
   clock: Clock
+  /**
+   * 写工具的已批准目标记录版本(gateway 从审批记录注入)。
+   * update 类工具用它做 assertRevision 双重校验:批准到执行之间
+   * 目标记录若再被修改,执行以 CONFLICT 失败而非覆盖他人修改。
+   */
+  targetVersion?: number | null
 }
 
 /**
@@ -79,6 +85,12 @@ export interface ToolDefinition {
   retryable: boolean
   inputSchema: ToolInputSchema
   /**
+   * 写工具可选:把已校验参数解析为目标记录版本。
+   * 返回 null 表示引用的记录不存在——模型虚构 ID 在 propose 阶段即被拒绝,
+   * 无法形成待批准提案(模块规格第 7 节"得到真实对象 ID 后才能生成修改提案")。
+   */
+  resolveTargetVersion?: (args: Record<string, unknown>, ctx: ToolExecutionContext) => number | null
+  /**
    * 同步执行(sql.js 事务语义:runOperation 的 apply 不等待 Promise,
    * 异步工具会使回执写入未决结果)。失败语义:
    * - 业务级失败以 ToolFailure 返回:该次尝试已完成并写入回执,
@@ -119,11 +131,15 @@ export interface ProposeToolInput {
   approved?: unknown
 }
 
-export interface ExecuteToolInput extends ProposeToolInput {
+export interface ExecuteToolInput extends Omit<ProposeToolInput, 'targetVersion'> {
   /** 幂等键 = runId:tool:callIndex(总体规格第 7 节) */
   callIndex: number
   /** 写工具必须携带 propose 返回的 approvalId */
   approvalId?: string | null
+  /**
+   * 目标版本不由调用方提供:执行时用 resolveTargetVersion 重解析当前版本,
+   * 与批准时绑定版本比对——批准到执行之间目标被再修改即 CONFLICT(OPS-06)。
+   */
 }
 
 /** 网关依赖的注册表最小接口(便于测试注入替身) */

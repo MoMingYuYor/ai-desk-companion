@@ -20,6 +20,7 @@ import { migrateMailV2 } from '../../mail/schema'
 import { migrateM1, OPERATION_RECEIPTS_SQL } from './m1'
 import { migrateM2, rollbackM2 } from './m2'
 import { migrateM3, rollbackM3 } from './m3'
+import { migrateM4, rollbackM4 } from './m4'
 import { nowTimestamp } from '../../../shared/dateUtils'
 
 export interface Migration {
@@ -96,7 +97,14 @@ const V1_BASE: Migration = {
     db.run(SCHEMA_SQL)
   },
   down: (db) => {
-    dropTables(db, [...MAIL_TABLES, ...BASE_TABLES, 'operation_receipts', ...RETRIEVAL_TABLES, 'retrieval_fts'])
+    dropTables(db, [
+      ...MAIL_TABLES,
+      ...BASE_TABLES,
+      'operation_receipts',
+      ...RETRIEVAL_TABLES,
+      'retrieval_fts',
+      'mail_drafts'
+    ])
   }
 }
 
@@ -164,13 +172,26 @@ const V6_RETRIEVAL: Migration = {
   }
 }
 
+/** v7(A-01/A-04):邮件草稿表;审批记录补参数持久化列 */
+const V7_PERSONAL_OPS: Migration = {
+  version: 7,
+  name: 'personal_ops_records',
+  up: (db) => {
+    migrateM4(db)
+  },
+  down: (db) => {
+    rollbackM4(db)
+  }
+}
+
 export const MIGRATIONS: readonly Migration[] = [
   V1_BASE,
   V2_MAIL,
   V3_PROVIDER_JSON_MODE,
   V4_WRITE_BASICS,
   V5_AGENT_RUNS,
-  V6_RETRIEVAL
+  V6_RETRIEVAL,
+  V7_PERSONAL_OPS
 ]
 
 /** 注册表支持的最高版本 */

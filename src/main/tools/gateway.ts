@@ -60,6 +60,7 @@ export class ToolGateway {
 
   /**
    * 生成工具调用提案:校验参数、计算 hash、按注册表风险等级决定是否创建审批。
+   * 写工具先经 resolveTargetVersion 解析目标版本——引用不存在的记录在此拒绝;
    * 读工具直接可执行;写工具返回待批准提案。
    */
   propose(input: ProposeToolInput): ToolProposal {
@@ -67,7 +68,7 @@ export class ToolGateway {
     const def = this.definition(input.tool)
     const args = validateToolInput(def.inputSchema, input.arguments)
     const hash = this.hashOf(input.tool, args)
-    const targetVersion = input.targetVersion ?? null
+    let targetVersion = input.targetVersion ?? null
 
     if (def.riskLevel === 'read') {
       return {
@@ -83,12 +84,26 @@ export class ToolGateway {
       }
     }
 
+    if (def.resolveTargetVersion) {
+      const resolved = def.resolveTargetVersion(args, {
+        db: this.deps.db,
+        clock: this.deps.clock
+      })
+      if (resolved === null) {
+        throw new OperationError(
+          appError('VALIDATION', `目标记录不存在,拒绝虚构 ID 的修改提案(工具:${input.tool})`, { retryable: false })
+        )
+      }
+      targetVersion = resolved
+    }
+
     const ttlHours = this.deps.approvalTtlHours ?? DEFAULT_AGENT_TIMEOUTS.approvalTtlHours
     const expiresAt = new Date(this.deps.clock.now().getTime() + ttlHours * 3600_000).toISOString()
     const approval = createApproval(this.deps.db, {
       runId: input.runId,
       toolName: input.tool,
       argumentsHash: hash,
+      argumentsJson: JSON.stringify(args),
       planVersion: input.planVersion,
       targetVersion,
       expiresAt
@@ -119,12 +134,14 @@ export class ToolGateway {
     const hash = this.hashOf(input.tool, args)
 
     if (def.riskLevel !== 'read') {
-      this.assertApproved(input, hash)
+      this.assertApproved(def, input, hash)
     }
 
     // 幂等键 = runId:tool:callIndex;同键同参命中回执返回首次结果,
     // 同键不同参由 runOperation 抛 CONFLICT 向上传播
     const operationId = `${input.runId}:${input.tool}:${input.callIndex}`
+    const approval =
+      def.riskLevel !== 'read' && input.approvalId ? getApproval(this.deps.db, input.approvalId) : null
     const { value } = runOperation(
       this.deps.db,
       {
@@ -133,7 +150,12 @@ export class ToolGateway {
         requestHash: hash,
         workspaceEpoch: getWorkspaceEpoch()
       },
-      () => def.execute(args, { db: this.deps.db, clock: this.deps.clock })
+      () =>
+        def.execute(args, {
+          db: this.deps.db,
+          clock: this.deps.clock,
+          targetVersion: approval?.targetVersion ?? null
+        })
     )
 
     if (this.deps.persistCoordinator) {
@@ -150,8 +172,13 @@ export class ToolGateway {
     }
   }
 
-  /** 写工具的批准校验:存在性、决定、参数 hash、计划版本、目标版本、有效期 */
-  private assertApproved(input: ExecuteToolInput, hash: string): void {
+  /**
+   * 写工具的批准校验:存在性、决定、参数 hash、计划版本、目标版本、有效期。
+   * 目标版本的核对方式:用 resolveTargetVersion 重解析当前版本并与批准时
+   * 绑定的版本比对——批准到执行之间目标被再修改或删除即 CONFLICT(OPS-06),
+   * 调用方无需也无法自行提供目标版本。
+   */
+  private assertApproved(def: ToolDefinition, input: ExecuteToolInput, hash: string): void {
     if (!input.approvalId) {
       throw forbidden('写操作缺少审批记录;必须先经 propose 生成提案')
     }
@@ -166,8 +193,14 @@ export class ToolGateway {
     if (approval.planVersion !== input.planVersion) {
       throw conflict('计划版本与批准时不一致,需重新生成提案')
     }
-    if ((approval.targetVersion ?? null) !== (input.targetVersion ?? null)) {
-      throw conflict('目标记录版本与批准时不一致,需重新生成提案')
+    if (approval.targetVersion !== null && def.resolveTargetVersion) {
+      const current = def.resolveTargetVersion(JSON.parse(approval.argumentsJson ?? '{}'), {
+        db: this.deps.db,
+        clock: this.deps.clock
+      })
+      if (current !== approval.targetVersion) {
+        throw conflict('目标记录版本与批准时不一致,需重新生成提案')
+      }
     }
     if (this.deps.clock.now().getTime() >= new Date(approval.expiresAt).getTime()) {
       throw conflict('提案已过有效期,需重新生成')

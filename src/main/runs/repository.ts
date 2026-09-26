@@ -270,6 +270,8 @@ export interface CreateApprovalInput {
   runId: string
   toolName: string
   argumentsHash: string
+  /** 已校验的完整参数(JSON 串);批准执行依赖它还原参数(OPS-10) */
+  argumentsJson?: string | null
   planVersion: number
   targetVersion?: number | null
   /** 有效期(UTC ISO 8601);默认由调用方按 config 的 approvalTtlHours 计算 */
@@ -287,6 +289,7 @@ export function createApproval(db: SqliteDb, input: CreateApprovalInput): Approv
     runId: input.runId,
     toolName: input.toolName,
     argumentsHash: input.argumentsHash,
+    argumentsJson: input.argumentsJson ?? null,
     planVersion: input.planVersion,
     targetVersion: input.targetVersion ?? null,
     expiresAt: input.expiresAt,
@@ -295,14 +298,15 @@ export function createApproval(db: SqliteDb, input: CreateApprovalInput): Approv
   }
   db.run(
     `INSERT INTO approvals
-       (approval_id, run_id, tool_name, arguments_hash, plan_version, target_version,
+       (approval_id, run_id, tool_name, arguments_hash, arguments_json, plan_version, target_version,
         expires_at, decision, decided_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       approval.approvalId,
       approval.runId,
       approval.toolName,
       approval.argumentsHash,
+      approval.argumentsJson,
       approval.planVersion,
       approval.targetVersion,
       approval.expiresAt,
@@ -318,6 +322,7 @@ interface ApprovalRow {
   run_id: string
   tool_name: string
   arguments_hash: string
+  arguments_json: string | null
   plan_version: number
   target_version: number | null
   expires_at: string
@@ -331,6 +336,7 @@ function toApproval(row: ApprovalRow): Approval {
     runId: row.run_id,
     toolName: row.tool_name,
     argumentsHash: row.arguments_hash,
+    argumentsJson: row.arguments_json,
     planVersion: row.plan_version,
     targetVersion: row.target_version,
     expiresAt: row.expires_at,

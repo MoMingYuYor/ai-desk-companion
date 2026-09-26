@@ -138,6 +138,11 @@ const RETRIEVAL_CHUNKS: BackupColumnSpec[] = [
   t('chunk_id'), t('document_id'), i('chunk_index'), i('start_offset'), i('end_offset'),
   t('content'), t('search_text'), i('search_version')
 ]
+// v7(A-01):邮件草稿。无发送状态字段(设计边界:草稿不能被发送)。
+const MAIL_DRAFTS: BackupColumnSpec[] = [
+  t('draft_id'), t('recipients'), t('subject'), t('body'), t('source_ref', true),
+  i('revision'), t('created_at'), t('updated_at')
+]
 
 /** 备份写入/清除顺序:被依赖的表在前,回执最后(回执随其引用的业务实体一起替换) */
 export const BACKUP_TABLE_ORDER = [
@@ -148,7 +153,8 @@ export const BACKUP_TABLE_ORDER = [
   'mail_analysis_links', 'mail_analysis_versions', 'mail_confirmations',
   'operation_receipts',
   'agent_runs', 'trace_events', 'approvals',
-  'retrieval_documents', 'retrieval_chunks'
+  'retrieval_documents', 'retrieval_chunks',
+  'mail_drafts'
 ] as const
 
 const BUSINESS_REFERENCES: BackupReferenceSpec[] = [
@@ -167,7 +173,8 @@ const PRIMARY_KEY_OVERRIDES: Readonly<Record<string, readonly string[]>> = {
   trace_events: ['run_id', 'seq'],
   approvals: ['approval_id'],
   retrieval_documents: ['document_id'],
-  retrieval_chunks: ['chunk_id']
+  retrieval_chunks: ['chunk_id'],
+  mail_drafts: ['draft_id']
 }
 
 function buildTables(columns: Array<[string, BackupColumnSpec[]]>, pkColumn = 'id'): Record<string, BackupTableSpec> {
@@ -227,11 +234,24 @@ const V6_REFERENCES: BackupReferenceSpec[] = [
   { table: 'retrieval_chunks', column: 'document_id', targetTable: 'retrieval_documents', targetColumn: 'document_id', nullable: false }
 ]
 
+const V7_TABLES = buildTables([
+  ['conversations', CONVERSATIONS], ['messages', MESSAGES], ['materials', MATERIALS],
+  ['analyses', ANALYSES], ['events', EVENTS_V4], ['todos', TODOS_V4], ['pending_items', PENDING_V4],
+  ['semesters', SEMESTERS], ['courses', COURSES], ['course_overrides', COURSE_OVERRIDES],
+  ['school_events', SCHOOL_EVENTS], ['profile_facts', PROFILE_FACTS],
+  ['mail_analysis_links', MAIL_ANALYSIS_LINKS], ['mail_analysis_versions', MAIL_ANALYSIS_VERSIONS],
+  ['mail_confirmations', MAIL_CONFIRMATIONS], ['operation_receipts', OPERATION_RECEIPTS],
+  ['agent_runs', AGENT_RUNS], ['trace_events', TRACE_EVENTS], ['approvals', APPROVALS],
+  ['retrieval_documents', RETRIEVAL_DOCUMENTS], ['retrieval_chunks', RETRIEVAL_CHUNKS],
+  ['mail_drafts', MAIL_DRAFTS]
+])
+
 const VERSION_SPECS: Readonly<Record<number, BackupVersionSpec>> = {
   3: { version: 3, requiredTables: Object.keys(V3_TABLES), tables: V3_TABLES, references: BUSINESS_REFERENCES },
   4: { version: 4, requiredTables: Object.keys(V4_TABLES), tables: V4_TABLES, references: BUSINESS_REFERENCES },
   5: { version: 5, requiredTables: Object.keys(V5_TABLES), tables: V5_TABLES, references: BUSINESS_REFERENCES },
-  6: { version: 6, requiredTables: Object.keys(V6_TABLES), tables: V6_TABLES, references: V6_REFERENCES }
+  6: { version: 6, requiredTables: Object.keys(V6_TABLES), tables: V6_TABLES, references: V6_REFERENCES },
+  7: { version: 7, requiredTables: Object.keys(V7_TABLES), tables: V7_TABLES, references: V6_REFERENCES }
 }
 
 /** 取指定备份版本的规格;未登记版本(未来/未知)拒绝 */
