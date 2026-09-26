@@ -19,6 +19,7 @@ import { SCHEMA_SQL } from '../schema'
 import { migrateMailV2 } from '../../mail/schema'
 import { migrateM1, OPERATION_RECEIPTS_SQL } from './m1'
 import { migrateM2, rollbackM2 } from './m2'
+import { migrateM3, rollbackM3 } from './m3'
 import { nowTimestamp } from '../../../shared/dateUtils'
 
 export interface Migration {
@@ -84,6 +85,9 @@ function dropTables(db: SqliteDb, tables: readonly string[]): void {
   for (const table of tables) db.run(`DROP TABLE IF EXISTS ${table}`)
 }
 
+/** v6 拥有的检索表(fts 虚表为派生索引,由 rollbackM3 一并删除) */
+const RETRIEVAL_TABLES: readonly string[] = ['retrieval_documents', 'retrieval_chunks']
+
 /** v1:基础 schema。up 施加的是当前完整形状,见文件头说明 */
 const V1_BASE: Migration = {
   version: 1,
@@ -92,7 +96,7 @@ const V1_BASE: Migration = {
     db.run(SCHEMA_SQL)
   },
   down: (db) => {
-    dropTables(db, [...MAIL_TABLES, ...BASE_TABLES, 'operation_receipts'])
+    dropTables(db, [...MAIL_TABLES, ...BASE_TABLES, 'operation_receipts', ...RETRIEVAL_TABLES, 'retrieval_fts'])
   }
 }
 
@@ -148,12 +152,25 @@ const V5_AGENT_RUNS: Migration = {
 }
 
 /** 注册表:按 version 升序执行;新增迁移只允许追加,不回改已发布条目 */
+/** v6(C-05):检索文档、分块与 FTS4 外部内容索引 */
+const V6_RETRIEVAL: Migration = {
+  version: 6,
+  name: 'retrieval_index',
+  up: (db) => {
+    migrateM3(db)
+  },
+  down: (db) => {
+    rollbackM3(db)
+  }
+}
+
 export const MIGRATIONS: readonly Migration[] = [
   V1_BASE,
   V2_MAIL,
   V3_PROVIDER_JSON_MODE,
   V4_WRITE_BASICS,
-  V5_AGENT_RUNS
+  V5_AGENT_RUNS,
+  V6_RETRIEVAL
 ]
 
 /** 注册表支持的最高版本 */

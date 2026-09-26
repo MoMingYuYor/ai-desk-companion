@@ -129,6 +129,15 @@ const APPROVALS: BackupColumnSpec[] = [
   t('approval_id'), t('run_id'), t('tool_name'), t('arguments_hash'), i('plan_version'),
   i('target_version', true), t('expires_at'), t('decision'), t('decided_at', true)
 ]
+// v6(C-05):检索文档与分块。FTS4 虚表是派生索引,不进备份;恢复后由 rebuild 重建。
+const RETRIEVAL_DOCUMENTS: BackupColumnSpec[] = [
+  t('document_id'), t('source_name'), t('source_type'), t('raw_sha256'), t('text_sha256'),
+  t('normalized_text'), i('size_bytes'), t('created_at')
+]
+const RETRIEVAL_CHUNKS: BackupColumnSpec[] = [
+  t('chunk_id'), t('document_id'), i('chunk_index'), i('start_offset'), i('end_offset'),
+  t('content'), t('search_text'), i('search_version')
+]
 
 /** 备份写入/清除顺序:被依赖的表在前,回执最后(回执随其引用的业务实体一起替换) */
 export const BACKUP_TABLE_ORDER = [
@@ -138,7 +147,8 @@ export const BACKUP_TABLE_ORDER = [
   'profile_facts',
   'mail_analysis_links', 'mail_analysis_versions', 'mail_confirmations',
   'operation_receipts',
-  'agent_runs', 'trace_events', 'approvals'
+  'agent_runs', 'trace_events', 'approvals',
+  'retrieval_documents', 'retrieval_chunks'
 ] as const
 
 const BUSINESS_REFERENCES: BackupReferenceSpec[] = [
@@ -155,7 +165,9 @@ const PRIMARY_KEY_OVERRIDES: Readonly<Record<string, readonly string[]>> = {
   mail_confirmations: ['analysis_id', 'candidate_index'],
   agent_runs: ['run_id'],
   trace_events: ['run_id', 'seq'],
-  approvals: ['approval_id']
+  approvals: ['approval_id'],
+  retrieval_documents: ['document_id'],
+  retrieval_chunks: ['chunk_id']
 }
 
 function buildTables(columns: Array<[string, BackupColumnSpec[]]>, pkColumn = 'id'): Record<string, BackupTableSpec> {
@@ -198,10 +210,28 @@ const V5_TABLES = buildTables([
   ['agent_runs', AGENT_RUNS], ['trace_events', TRACE_EVENTS], ['approvals', APPROVALS]
 ])
 
+const V6_TABLES = buildTables([
+  ['conversations', CONVERSATIONS], ['messages', MESSAGES], ['materials', MATERIALS],
+  ['analyses', ANALYSES], ['events', EVENTS_V4], ['todos', TODOS_V4], ['pending_items', PENDING_V4],
+  ['semesters', SEMESTERS], ['courses', COURSES], ['course_overrides', COURSE_OVERRIDES],
+  ['school_events', SCHOOL_EVENTS], ['profile_facts', PROFILE_FACTS],
+  ['mail_analysis_links', MAIL_ANALYSIS_LINKS], ['mail_analysis_versions', MAIL_ANALYSIS_VERSIONS],
+  ['mail_confirmations', MAIL_CONFIRMATIONS], ['operation_receipts', OPERATION_RECEIPTS],
+  ['agent_runs', AGENT_RUNS], ['trace_events', TRACE_EVENTS], ['approvals', APPROVALS],
+  ['retrieval_documents', RETRIEVAL_DOCUMENTS], ['retrieval_chunks', RETRIEVAL_CHUNKS]
+])
+
+/** v6 追加分块对文档的引用;低版本规格没有检索表,共用会因缺表定义崩溃 */
+const V6_REFERENCES: BackupReferenceSpec[] = [
+  ...BUSINESS_REFERENCES,
+  { table: 'retrieval_chunks', column: 'document_id', targetTable: 'retrieval_documents', targetColumn: 'document_id', nullable: false }
+]
+
 const VERSION_SPECS: Readonly<Record<number, BackupVersionSpec>> = {
   3: { version: 3, requiredTables: Object.keys(V3_TABLES), tables: V3_TABLES, references: BUSINESS_REFERENCES },
   4: { version: 4, requiredTables: Object.keys(V4_TABLES), tables: V4_TABLES, references: BUSINESS_REFERENCES },
-  5: { version: 5, requiredTables: Object.keys(V5_TABLES), tables: V5_TABLES, references: BUSINESS_REFERENCES }
+  5: { version: 5, requiredTables: Object.keys(V5_TABLES), tables: V5_TABLES, references: BUSINESS_REFERENCES },
+  6: { version: 6, requiredTables: Object.keys(V6_TABLES), tables: V6_TABLES, references: V6_REFERENCES }
 }
 
 /** 取指定备份版本的规格;未登记版本(未来/未知)拒绝 */

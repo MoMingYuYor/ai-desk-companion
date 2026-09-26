@@ -8,6 +8,7 @@ import { SCHEMA_VERSION } from '../db/schema'
 import { nowTimestamp } from '../../shared/dateUtils'
 import { appError } from '../../shared/operations'
 import { bumpWorkspaceEpoch, OperationError } from '../db/operations'
+import { rebuildSearchIndex } from '../retrieval/search'
 import {
   BACKUP_APP_ID,
   BACKUP_TABLE_ORDER,
@@ -17,8 +18,8 @@ import {
   type ValidatedBackup
 } from '../backup/validate'
 
-/** 受支持的备份版本:v3 旧备份受控迁移;v4 必须保留(否则旧备份无法恢复);v5 为当前格式 */
-export const SUPPORTED_BACKUP_VERSIONS: readonly number[] = [3, 4, SCHEMA_VERSION]
+/** 受支持的备份版本:v3 旧备份受控迁移;v4/v5 必须保留(否则旧备份无法恢复);v6 为当前格式 */
+export const SUPPORTED_BACKUP_VERSIONS: readonly number[] = [3, 4, 5, SCHEMA_VERSION]
 
 type Row = Record<string, unknown>
 
@@ -101,6 +102,9 @@ function replaceBusinessTables(db: SqliteDb, backup: ValidatedBackup): Record<st
     db.run(
       'UPDATE mail_analysis_links SET message_id = NULL WHERE message_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM mail_messages WHERE id = mail_analysis_links.message_id)'
     )
+    // C-05:chunks 行被整体替换,rowid 可能变化,FTS 索引必须重建对齐。
+    // 旧版本备份不含检索表时,恢复即清空检索语料(语料可由原始文件重新导入)。
+    rebuildSearchIndex(db)
   })
   return imported
 }
@@ -119,7 +123,7 @@ function captureSnapshot(db: SqliteDb): BusinessSnapshot {
   return { tables }
 }
 
-/** 回到恢复前快照:当前库是 v4,快照行按 v4 规格写回 */
+/** 回到恢复前快照:当前库是 v6,快照行按 v6 规格写回;替换后重建检索索引 */
 function restoreSnapshot(db: SqliteDb, snapshot: BusinessSnapshot): void {
   const spec = getBackupVersionSpec(SCHEMA_VERSION)
   db.transaction(() => {
@@ -127,6 +131,7 @@ function restoreSnapshot(db: SqliteDb, snapshot: BusinessSnapshot): void {
     for (const table of BACKUP_TABLE_ORDER) {
       insertRows(db, table, spec.tables[table]!.columns, snapshot.tables[table] ?? [])
     }
+    rebuildSearchIndex(db)
   })
 }
 
