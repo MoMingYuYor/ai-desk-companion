@@ -150,6 +150,8 @@ export const Channels = {
   AgentRunCreate: 'agent:run-create',
   AgentRunGet: 'agent:run-get',
   AgentRunEvents: 'agent:run-events',
+  AgentRunList: 'agent:run-list',
+  AgentRunApprovals: 'agent:run-approvals',
   AgentRunAnswers: 'agent:run-answers',
   AgentRunCancel: 'agent:run-cancel',
   AgentApprovalDecide: 'agent:approval-decide',
@@ -227,6 +229,33 @@ export interface ActiveChatRun {
   runId: string
   runGeneration: number
   text: string
+}
+
+// ---------- Agent 运行界面契约(A-06) ----------
+
+/** 最近运行列表条目 */
+export interface AgentRunListItem {
+  runId: string
+  mode: string
+  status: string
+  input: string
+  errorCode: string | null
+  startedAt: string
+  finishedAt: string | null
+}
+
+/** 审批记录的界面形态(含已校验参数) */
+export interface AgentApprovalView {
+  approvalId: string
+  runId: string
+  toolName: string
+  argumentsHash: string
+  arguments: Record<string, unknown> | null
+  planVersion: number
+  targetVersion: number | null
+  expiresAt: string
+  decision: string
+  decidedAt: string | null
 }
 
 export interface ImportPreview {
@@ -323,6 +352,15 @@ export interface RendererApi {
   // backup
   exportBackup(): Promise<string | null>
   importBackup(): Promise<boolean>
+  // agent(个人事务 Agent)
+  createAgentRun(input: { input: string; mode?: 'personal_ops' | 'research' }): Promise<{ runId: string; status: string }>
+  getAgentRun(runId: string): Promise<import('./agent').AgentRunView | null>
+  listAgentRuns(): Promise<AgentRunListItem[]>
+  getAgentRunEvents(runId: string, afterSeq?: number): Promise<import('./agent').AgentRunEventsResult>
+  getAgentRunApprovals(runId: string): Promise<AgentApprovalView[]>
+  submitAgentAnswers(runId: string, answers: Array<{ questionId: string; answer: string }>): Promise<{ runId: string; status: string }>
+  cancelAgentRun(runId: string): Promise<import('./agent').AgentRunView>
+  decideAgentApproval(approvalId: string, decision: 'approved' | 'rejected'): Promise<{ already: boolean }>
   // mail
   mail: MailApi
   subscribeMail: MailSubscribe
@@ -333,3 +371,4 @@ export interface RendererApi {
 }
 
 export type { Analysis, BackupFile, CalendarEvent, ChatMessage, ConfirmResult, Conversation, Course, CourseOverride, CourseOccurrence, DayAgenda, EventInput, Material, ModelProtocol, ModelSwitchNotice, PendingImport, PendingItem, ProfileFact, ProviderInfo, ProviderInput, ProviderTestResult, ReminderNotice, SchoolEvent, Semester, Todo, TodoInput }
+export type { AgentRunView, AgentRunEventPayload, AgentRunFinishedPayload, AgentRunEventsResult, TraceEvent } from './agent'

@@ -81,7 +81,7 @@ import type { PersistenceCoordinator } from './db/operations'
 import type { AgentEventStream } from './agent/eventStream'
 import type { RunOrchestrator, AnswerItem } from './agent/orchestrator'
 import type { RunMode } from '../shared/agent'
-import { getRun, listTraceEvents } from './runs/repository'
+import { getRun, listTraceEvents, listRecentRuns, listApprovals } from './runs/repository'
 import { buildDayAgenda } from './services/context'
 import { exportBackup } from './services/backup'
 import { decryptApiKey, encryptApiKey } from './keys'
@@ -296,6 +296,32 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     const cursor = typeof afterSeq === 'number' && Number.isInteger(afterSeq) && afterSeq >= 0 ? afterSeq : 0
     return { run, events: listTraceEvents(db, runId, cursor) }
   })
+  // 最近运行与运行审批(历史页与确认卡数据源;只读)
+  handle(Channels.AgentRunList, () =>
+    listRecentRuns(db, 20).map((r) => ({
+      runId: r.runId,
+      mode: r.mode,
+      status: r.status,
+      input: r.input,
+      errorCode: r.errorCode,
+      startedAt: r.startedAt,
+      finishedAt: r.finishedAt
+    }))
+  )
+  handle(Channels.AgentRunApprovals, (runId: string) =>
+    listApprovals(db, runId).map((a) => ({
+      approvalId: a.approvalId,
+      runId: a.runId,
+      toolName: a.toolName,
+      argumentsHash: a.argumentsHash,
+      arguments: a.argumentsJson ? (JSON.parse(a.argumentsJson) as Record<string, unknown>) : null,
+      planVersion: a.planVersion,
+      targetVersion: a.targetVersion,
+      expiresAt: a.expiresAt,
+      decision: a.decision,
+      decidedAt: a.decidedAt
+    }))
+  )
   // Agent 写侧(A-05):创建只落库排队(202 语义),规划异步驱动;
   // 澄清受理同步返回,重新规划异步;取消同步;审批决定同步执行写步骤。
   // 写侧需要编排器:未接线时(旧测试桩)以明确错误拒绝,不做静默桩。

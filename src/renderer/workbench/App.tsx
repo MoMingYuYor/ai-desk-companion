@@ -8,12 +8,13 @@ import { PendingPage } from './pages/PendingPage'
 import { TimetablePage } from './pages/TimetablePage'
 import { ProfilePage } from './pages/ProfilePage'
 import { SettingsPage } from './pages/SettingsPage'
+import { AgentPage } from './pages/AgentPage'
 import { MailPage } from './mail/MailPage'
 import { TopBar } from './TopBar'
 import { useSubscribe } from '../shared/util'
 import type { PendingItem, Todo } from '../../shared/types'
 
-type PageName = 'overview' | 'chat' | 'mail' | 'calendar' | 'todos' | 'pending' | 'timetable' | 'profile' | 'settings'
+type PageName = 'overview' | 'chat' | 'agent' | 'mail' | 'calendar' | 'todos' | 'pending' | 'timetable' | 'profile' | 'settings'
 
 interface NavItem {
   key: PageName
@@ -28,6 +29,7 @@ const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
     items: [
       { key: 'overview', icon: '🏠', label: '今日概览' },
       { key: 'chat', icon: '💬', label: 'AI 工作台' },
+      { key: 'agent', icon: '🤖', label: '事务 Agent' },
       { key: 'mail', icon: '📧', label: '邮箱' },
       { key: 'calendar', icon: '📅', label: '日历' },
       { key: 'todos', icon: '✅', label: '待办' },
@@ -185,6 +187,7 @@ export default function App(): JSX.Element {
         {page === 'chat' && (
           <ChatPage refreshKey={refreshKey} petAction={petAction} locateConversationId={locateConversation} />
         )}
+        {page === 'agent' && <AgentPage refreshKey={refreshKey} />}
         {page === 'mail' && (
           <MailPage
             api={window.api.mail}

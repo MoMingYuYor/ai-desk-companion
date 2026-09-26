@@ -168,6 +168,13 @@ export function listRunsByStatus(db: SqliteDb, status: RunStatus): AgentRunRecor
     .map(toRun)
 }
 
+/** 最近运行(倒序,历史列表用);终态在前由排序自然体现 */
+export function listRecentRuns(db: SqliteDb, limit = 20): AgentRunRecord[] {
+  return db
+    .all<RunRow>('SELECT * FROM agent_runs ORDER BY started_at DESC, run_id DESC LIMIT ?', [limit])
+    .map(toRun)
+}
+
 /** 按多个状态列出运行,按开始时间升序(队列判定"谁占用执行权"用) */
 export function listRunsByStatuses(db: SqliteDb, statuses: readonly RunStatus[]): AgentRunRecord[] {
   if (statuses.length === 0) return []

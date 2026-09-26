@@ -176,6 +176,15 @@ const api: RendererApi = {
 
   exportBackup: invoke(Channels.BackupExport),
   importBackup: invoke(Channels.BackupImport),
+  // agent(个人事务 Agent):薄 invoke 包装,渲染层不持有任何业务状态
+  createAgentRun: invoke(Channels.AgentRunCreate),
+  getAgentRun: invoke(Channels.AgentRunGet),
+  listAgentRuns: invoke(Channels.AgentRunList),
+  getAgentRunEvents: invoke(Channels.AgentRunEvents),
+  getAgentRunApprovals: invoke(Channels.AgentRunApprovals),
+  submitAgentAnswers: invoke(Channels.AgentRunAnswers),
+  cancelAgentRun: invoke(Channels.AgentRunCancel),
+  decideAgentApproval: invoke(Channels.AgentApprovalDecide),
 
   on: (channel, listener) => {
     if (!channel.startsWith(EVENT_CHANNEL_PREFIX)) {
