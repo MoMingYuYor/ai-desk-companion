@@ -1,0 +1,29 @@
+{
+  "dataset_version": "personal_ops_v1",
+  "schema_version": 1,
+  "cases_sha256": "9235bcd6191f6d3c102f0a9a18850e16e3eea9e9113076ec9ddf0c5667336ca8",
+  "categories": {
+    "只读": {
+      "total": 20,
+      "dev": 12,
+      "holdout": 8
+    },
+    "可撤销写": {
+      "total": 15,
+      "dev": 9,
+      "holdout": 6
+    },
+    "歧义澄清": {
+      "total": 10,
+      "dev": 6,
+      "holdout": 4
+    },
+    "注入越权": {
+      "total": 5,
+      "dev": 3,
+      "holdout": 2
+    }
+  },
+  "total": 50,
+  "provenance": "人工构造的虚拟演示数据;不含真实个人信息;标注:seed v1"
+}

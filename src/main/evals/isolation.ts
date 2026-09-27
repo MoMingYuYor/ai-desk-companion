@@ -40,6 +40,40 @@ registerFixtureById('ops-empty', {
   }
 })
 
+// 内置 fixture:预置固定 ID 的演示待办与日程(更新类案例的起点)。
+// 固定 ID 使数据集案例可以引用目标记录;revision 初始为 1。
+registerFixtureById('ops-seeded', {
+  description: '预置 3 条待办与 2 条日程(固定 ID,供更新类案例引用)',
+  seed: (db) => {
+    const ts = '2026-09-28T00:00'
+    db.run(
+      `INSERT INTO todos (id, title, notes, due_at, priority, completed_at, linked_event_id, source, source_ref, fingerprint, revision, created_at, updated_at)
+       VALUES ('seed-todo-1', '完成作品集简介页面', NULL, '2026-09-30', 'high', NULL, NULL, 'manual', NULL, NULL, 1, ?, ?)`,
+      [ts, ts]
+    )
+    db.run(
+      `INSERT INTO todos (id, title, notes, due_at, priority, completed_at, linked_event_id, source, source_ref, fingerprint, revision, created_at, updated_at)
+       VALUES ('seed-todo-2', '整理实习 JD 清单', '从收藏的招聘页摘录', '2026-10-05', 'normal', NULL, NULL, 'manual', NULL, NULL, 1, ?, ?)`,
+      [ts, ts]
+    )
+    db.run(
+      `INSERT INTO todos (id, title, notes, due_at, priority, completed_at, linked_event_id, source, source_ref, fingerprint, revision, created_at, updated_at)
+       VALUES ('seed-todo-3', '配置本地模型服务', NULL, NULL, 'normal', '2026-09-27T18:00', NULL, 'manual', NULL, NULL, 1, ?, ?)`,
+      [ts, ts]
+    )
+    db.run(
+      `INSERT INTO events (id, title, start_at, end_at, all_day, location, notes, status, revision, created_at, updated_at)
+       VALUES ('seed-event-1', '项目周会', '2026-09-29T10:00', '2026-09-29T11:00', 0, '线上', NULL, 'active', 1, ?, ?)`,
+      [ts, ts]
+    )
+    db.run(
+      `INSERT INTO events (id, title, start_at, end_at, all_day, location, notes, status, revision, created_at, updated_at)
+       VALUES ('seed-event-2', '简历投递截止', '2026-10-03T09:00', '2026-10-03T09:00', 1, NULL, NULL, 'active', 1, ?, ?)`,
+      [ts, ts]
+    )
+  }
+})
+
 /** 已隔离的 case 执行环境 */
 export interface IsolatedCaseEnv {
   db: SqliteDb
