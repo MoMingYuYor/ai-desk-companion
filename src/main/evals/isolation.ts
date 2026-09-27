@@ -16,8 +16,8 @@ import { initSchema } from '../db/dao'
 import type { EvalCase } from './types'
 
 export interface EvalFixture {
-  /** fixture 初始状态播种(在 initSchema 之后执行) */
-  seed(db: SqliteDb): void
+  /** fixture 初始状态播种(在 initSchema 之后执行);返回值进 IsolatedCaseEnv.seedResult */
+  seed(db: SqliteDb): unknown
   description: string
 }
 
@@ -82,6 +82,11 @@ export interface IsolatedCaseEnv {
   caseDef: EvalCase
   /** 临时目录(评测根目录之下) */
   dir: string
+  /**
+   * fixture seed 的返回值(如研究侧的 snapshot_id 映射);内置 ops fixture 为 undefined。
+   * 供评测判定读取 fixture 播种产物,不改变隔离契约。
+   */
+  seedResult: unknown
   dispose(): void
 }
 
@@ -105,7 +110,7 @@ export async function createIsolatedCaseEnv(
     rmSync(dir, { recursive: true, force: true })
     throw new Error(`未注册的评测 fixture:${caseDef.fixture_id}(案例 ${caseDef.case_id})`)
   }
-  fixture.seed(db)
+  const seedResult: unknown = fixture.seed(db)
 
   return {
     db,
@@ -113,6 +118,7 @@ export async function createIsolatedCaseEnv(
     clock: fixedClock(caseDef.clock),
     caseDef,
     dir,
+    seedResult,
     dispose: () => {
       try {
         db.close()

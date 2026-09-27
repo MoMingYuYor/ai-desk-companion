@@ -20,8 +20,10 @@ import { ToolGateway } from '../tools/gateway'
 import { ToolRegistry } from '../tools/registry'
 import { registerOpsTools } from '../tools/definitions'
 import { FakeProvider } from '../providers/fake'
-import { getRun, listTraceEvents, transitionRun, listApprovals } from '../runs/repository'
+import { getRun, listTraceEvents, listApprovals } from '../runs/repository'
 import { initWorkspaceEpoch } from '../db/operations'
+import { ResearchWorkflow } from '../research/workflow'
+import { registerResearchFixture, researchFakeScriptFor } from './researchAdapter'
 
 export type ExecutionKind = 'fake' | 'real'
 
@@ -47,6 +49,8 @@ export interface EvalCaseOutcome {
   failureReasons: string[]
   executedTools: string[]
   confirmedBypass: boolean
+  /** research case 的完整轨迹可经该 run_id 在评测产物内回放(R-07 最小扩展) */
+  traceRunId?: string | null
 }
 
 export interface EvalRunState {
@@ -81,6 +85,16 @@ function outcomeKey(configId: string, caseId: string, repeat: number): string {
 
 function nowIso(): string {
   return new Date().toISOString()
+}
+
+/** 轮询等待条件成立(研究链为 startRun 异步驱动;timeout 内不成立返回 false) */
+async function waitUntilTerminal(predicate: () => boolean, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return true
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  return predicate()
 }
 
 /** 从案例 expected 推导 fake 模式的模型脚本:
@@ -225,6 +239,9 @@ export class EvalRunner {
   }
 
   private async runSingle(configId: string, caseDef: EvalCase, repeat: number): Promise<EvalCaseOutcome> {
+    // research 分支(R-07 最小扩展):研究链与 personal_ops 编排器完全独立,
+    // 走 ResearchWorkflow 驱动;既有 personal_ops 路径零变化。
+    if (caseDef.mode === 'research') return this.runSingleResearch(configId, caseDef, repeat)
     const base: EvalCaseOutcome = {
       configId,
       caseId: caseDef.case_id,
@@ -345,4 +362,109 @@ export class EvalRunner {
     }
   }
 
+  /**
+   * research case 的隔离执行(R-07 集成):
+   * - createIsolatedCaseEnv 时 research fixture seed 经 importResearchSources 导入
+   *   该 case 的全部语料;seedResult 携带逻辑/真实 snapshot_id 映射;
+   * - fake 模式由 researchFakeScriptFor 生成脚本(规划→抽取→审核→组织),
+   *   real 模式的 completer 与 personal_ops 相同由调用方注入;
+   * - 判定:终态比对 + forbidden_tools 的 trace 断言(注入组);研究运行不产生
+   *   tool_call 轨迹,tool_sequence/state_assertions 对 research case 不适用;
+   * - 结果记录保留 run_id(traceRunId),失败案例可经其回放完整研究轨迹。
+   */
+  private async runSingleResearch(configId: string, caseDef: EvalCase, repeat: number): Promise<EvalCaseOutcome> {
+    const base: EvalCaseOutcome = {
+      configId,
+      caseId: caseDef.case_id,
+      repeatIndex: repeat,
+      status: 'failed',
+      runId: null,
+      terminalStatus: null,
+      failureReasons: [],
+      executedTools: [],
+      confirmedBypass: false
+    }
+    let env: IsolatedCaseEnv | null = null
+    try {
+      // research fixture 惰性注册(幂等):seed 从 fixtures/research/<id>/ 按需读取
+      registerResearchFixture(caseDef.fixture_id)
+      env = await createIsolatedCaseEnv(join(this.deps.artifactRoot, 'cases'), caseDef, this.deps.sqlJsDistDir)
+      initWorkspaceEpoch()
+      const seed = env.seedResult as import('./researchAdapter').ResearchSeedResult | undefined
+      if (!seed) {
+        throw new Error(`research case 缺少 fixture 播种结果:${caseDef.case_id}(${caseDef.fixture_id})`)
+      }
+
+      const queue = new RunQueue(env.db)
+      const provider =
+        this.state.executionKind === 'fake'
+          ? new FakeProvider({ script: researchFakeScriptFor(caseDef, seed), clock: env.clock })
+          : (this.deps.realCompleter as never)
+      const workflow = new ResearchWorkflow({
+        db: env.db,
+        queue,
+        completer: provider as never,
+        clock: env.clock
+      })
+      base.runId = workflow.startRun(
+        {
+          request: {
+            question: caseDef.input,
+            // 冻结清单 = 该 fixture 导入的全部真实快照(逻辑 id → documentId)
+            snapshot_ids: [...new Set(seed.records.map((r) => r.documentId))],
+            snapshot_policy: 'fixed',
+            // 数据集预算只允许下调;上限形状与 DEFAULT_RESEARCH_BUDGET 对齐
+            budget: {
+              ...(caseDef.budgets.max_model_calls !== undefined
+                ? { max_model_calls: caseDef.budgets.max_model_calls }
+                : {}),
+              ...(caseDef.budgets.max_active_seconds !== undefined
+                ? { max_active_seconds: caseDef.budgets.max_active_seconds }
+                : {})
+            }
+          },
+          timezone: caseDef.timezone
+        },
+        `eval-${caseDef.case_id}-${configId}-${repeat}`
+      ).run.runId
+      base.traceRunId = base.runId
+
+      // startRun 异步驱动;轮询到终态(awaiting_input 仅当脚本请求澄清,本集成脚本不产生)
+      const finished = await waitUntilTerminal(() => {
+        const run = getRun(env!.db, base.runId!)
+        return run !== null && run.finishedAt !== null && run !== undefined
+      }, 15_000)
+      if (!finished) {
+        base.failureReasons.push('研究运行在时限内未到达终态')
+        return base
+      }
+      const after = getRun(env.db, base.runId)
+      base.terminalStatus = after?.status ?? null
+
+      // 规则判定:研究链无业务工具调用,trace 检查只承载 forbidden_tools 断言
+      const trace = listTraceEvents(env.db, base.runId)
+      base.executedTools = trace
+        .filter((e) => e.eventType === 'tool_call')
+        .map((e) => String((e.payload as { tool?: string }).tool ?? ''))
+      const reasons = base.failureReasons
+      if (after?.status !== caseDef.expected.terminal_status) {
+        reasons.push(`终态 ${after?.status ?? '未知'} ≠ 期望 ${caseDef.expected.terminal_status}`)
+      }
+      if (caseDef.expected.requires_confirmation === true) {
+        reasons.push('research case 不支持确认流程断言(预算表无该槽位)')
+      }
+      for (const forbidden of caseDef.expected.forbidden_tools ?? []) {
+        if (base.executedTools.includes(forbidden)) {
+          reasons.push(`出现禁止的工具:${forbidden}`)
+        }
+      }
+      base.status = reasons.length === 0 ? 'passed' : 'failed'
+      return base
+    } catch (err) {
+      base.failureReasons.push(err instanceof Error ? err.message : String(err))
+      return base
+    } finally {
+      env?.dispose()
+    }
+  }
 }
