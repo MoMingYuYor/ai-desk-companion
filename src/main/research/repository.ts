@@ -18,8 +18,10 @@ import { appError } from '../../shared/operations'
 import { systemClock, type Clock } from '../../shared/clock'
 import { isRunStatus, type RunStatus } from '../../shared/agent'
 import {
+  isEvidenceValidationStatus,
   isReportState,
   isSubQuestionStatus,
+  isSupportStatus,
   parseClaimInput,
   parseCitationInput,
   parseEvidenceSpanInput,
@@ -822,4 +824,238 @@ export function listReports(db: SqliteDb, researchTaskId: string): Report[] {
   return db
     .all<ReportRow>('SELECT * FROM research_reports WHERE research_task_id = ? ORDER BY version ASC', [researchTaskId])
     .map(toReport)
+}
+
+// ---------- R-05 追加:状态落库、按 run 聚合与冻结记录 ----------
+//
+// 追加原则:既有函数与行映射一律不动;本节只新增 R-05 需要的
+// (a) evidence/claim 状态写路径(含报告冻结守卫),
+// (b) 沿 Claim → Citation 走向的按 run 只读聚合,
+// (c) 子问题不足表达写路径。
+// 快照与 chunk 文本一律读 retrieval_documents / retrieval_chunks(m3 共享表),不另建领域查询层。
+
+/** 子问题不足表达的落库输入(R-05 三分表达;outcome 由 evidence.ts 组装) */
+export interface SubquestionOutcomeInput {
+  subquestionId: string
+  status: SubQuestion['status']
+  insufficiencyReason?: string | null
+  outcome?: Record<string, unknown> | null
+}
+
+export function updateSubQuestionOutcome(db: SqliteDb, input: SubquestionOutcomeInput): SubQuestion {
+  const existing = getSubQuestion(db, input.subquestionId)
+  if (!existing) {
+    throw new OperationError(appError('TARGET_UNAVAILABLE', `子问题不存在:${input.subquestionId}`, { retryable: false }))
+  }
+  if (!isSubQuestionStatus(input.status)) throw new Error(`子问题状态非法:${String(input.status)}`)
+  const outcome = input.outcome ?? null
+  const reason = input.insufficiencyReason ?? null
+  db.run(
+    'UPDATE research_subquestions SET status = ?, insufficiency_reason = ?, outcome_json = ? WHERE subquestion_id = ?',
+    [input.status, reason, outcome === null ? null : JSON.stringify(outcome), input.subquestionId]
+  )
+  const updated = getSubQuestion(db, input.subquestionId)
+  if (!updated) throw new Error(`子问题不存在:${input.subquestionId}`)
+  return updated
+}
+
+/** 证据片段结构检查结果落库;已进入报告版本的片段拒绝回写(版本不可变) */
+export function updateEvidenceSpanStatus(db: SqliteDb, evidenceId: string, status: EvidenceSpan['validationStatus']): void {
+  if (!isEvidenceValidationStatus(status)) throw new Error(`片段状态非法:${String(status)}`)
+  const owner = db.get<{ task_id: string }>(
+    `SELECT t.research_task_id AS task_id FROM research_evidence_spans s
+     JOIN research_subquestions sub ON sub.subquestion_id = s.subquestion_id
+     JOIN research_tasks t ON t.research_task_id = sub.research_task_id
+     WHERE s.evidence_id = ?`,
+    [evidenceId]
+  )
+  if (owner && listFrozenEvidenceIds(db, owner.task_id).has(evidenceId)) {
+    throw new OperationError(
+      appError('CONFLICT', `证据片段 ${evidenceId} 已进入报告版本被冻结,不允许回写状态;补正请新建 ID 与报告版本`, { retryable: false })
+    )
+  }
+  db.run('UPDATE research_evidence_spans SET validation_status = ? WHERE evidence_id = ?', [status, evidenceId])
+}
+
+/** claim 语义/结构结论落库(support_status + review_json 同步写,保持两者一致);冻结 claim 拒绝回写 */
+export function updateClaimReview(
+  db: SqliteDb,
+  claimId: string,
+  status: Claim['supportStatus'],
+  review: Record<string, unknown> | null
+): void {
+  if (!isSupportStatus(status)) throw new Error(`结论状态非法:${String(status)}`)
+  assertClaimNotFrozen(db, claimId)
+  db.run(
+    'UPDATE research_claims SET support_status = ?, review_json = ? WHERE claim_id = ?',
+    [status, review === null ? null : JSON.stringify(review), claimId]
+  )
+}
+
+/** claim 冲突组落库(conflict_group 与 review_json 的 conflict 段一起写);冻结 claim 拒绝回写 */
+export function updateClaimConflictGroup(db: SqliteDb, claimId: string, conflictGroup: string | null, review: Record<string, unknown> | null): void {
+  assertClaimNotFrozen(db, claimId)
+  db.run(
+    'UPDATE research_claims SET conflict_group = ?, review_json = ? WHERE claim_id = ?',
+    [conflictGroup, review === null ? null : JSON.stringify(review), claimId]
+  )
+}
+
+// ---------- R-05 追加:报告冻结记录 ----------
+
+/**
+ * 报告冻结记录(进入版本的实体集合,随 structured_json 一并持久化)。
+ * 版本不可变机制:buildReport 把进入该版本的 claim/citation/evidence 的 ID 与
+ * 快照时点状态写入本记录并随报告落库;此后任何状态写函数看到冻结 ID 即拒绝回写
+ * ——补正产生新 ID 和新版本,不能回写历史引用(规格第 6 节)。
+ */
+export interface ReportFrozenRecord {
+  /** 进入版本的 Claim ID 清单 */
+  frozen_claim_ids: string[]
+  /** 进入版本的 Citation ID 清单 */
+  frozen_citation_ids: string[]
+  /** 进入版本的 EvidenceSpan ID 清单 */
+  frozen_evidence_ids: string[]
+  /** 各 claim 冻结时点的支持状态(审计用) */
+  frozen_support_status: Record<string, string>
+  /** 各 span 冻结时点的校验状态(审计用) */
+  frozen_validation_status: Record<string, string>
+}
+
+/** 读取单个报告的冻结记录;无记录(未冻结任何实体)返回 null */
+export function frozenRecordOf(report: Report): ReportFrozenRecord | null {
+  const structured = report.structured
+  if (structured === null) return null
+  const raw = structured.frozen
+  if (raw === undefined || raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+  if (!Array.isArray((raw as Record<string, unknown>).frozen_claim_ids)) return null
+  return raw as ReportFrozenRecord
+}
+
+/** 本任务所有报告版本冻结的 Claim ID(状态写守卫与 validateCitations 的免写清单) */
+export function listFrozenClaimIds(db: SqliteDb, researchTaskId: string): Set<string> {
+  const frozen = new Set<string>()
+  for (const report of listReports(db, researchTaskId)) {
+    const record = frozenRecordOf(report)
+    if (record) for (const id of record.frozen_claim_ids) frozen.add(id)
+  }
+  return frozen
+}
+
+/** 本任务所有报告版本冻结的 EvidenceSpan ID */
+export function listFrozenEvidenceIds(db: SqliteDb, researchTaskId: string): Set<string> {
+  const frozen = new Set<string>()
+  for (const report of listReports(db, researchTaskId)) {
+    const record = frozenRecordOf(report)
+    if (record) for (const id of record.frozen_evidence_ids) frozen.add(id)
+  }
+  return frozen
+}
+
+/** 冻结守卫:claim 已进入任何报告版本时拒绝回写 */
+export function assertClaimNotFrozen(db: SqliteDb, claimId: string): void {
+  const row = db.get<{ research_task_id: string }>(
+    'SELECT research_task_id FROM research_claims WHERE claim_id = ?',
+    [claimId]
+  )
+  if (row && listFrozenClaimIds(db, row.research_task_id).has(claimId)) {
+    throw new OperationError(
+      appError('CONFLICT', `Claim ${claimId} 已进入报告版本被冻结,不允许回写状态;补正请新建 ID 与报告版本`, { retryable: false })
+    )
+  }
+}
+
+// ---------- R-05 追加:按 run 聚合的只读查询 ----------
+
+/** 引用及其实体归属的联查行(跨运行引用判定与遍历用) */
+export interface RunCitationRow {
+  citation: Citation
+  claim: Claim
+  span: EvidenceSpan
+}
+
+/** 一个 Claim 的全部引用及其实体(按 rowid 稳定序) */
+export function listRunCitationsForClaim(db: SqliteDb, claim: Claim): RunCitationRow[] {
+  return db
+    .all<CitationRow>('SELECT * FROM research_citations WHERE claim_id = ? ORDER BY rowid ASC', [claim.claimId])
+    .map((row) => {
+      const citation = toCitation(row)
+      const span = getEvidenceSpan(db, citation.evidenceId)
+      if (!span) throw new Error(`引用 ${citation.citationId} 指向的片段不存在:${citation.evidenceId}`)
+      return { citation, claim, span }
+    })
+}
+
+/** 本 run 的全部证据片段(经 subquestion → task 归属过滤,跨 run 数据不返回) */
+export function listEvidenceSpansForRun(db: SqliteDb, runId: string): EvidenceSpan[] {
+  return db
+    .all<EvidenceSpanRow>(
+      `SELECT s.* FROM research_evidence_spans s
+       JOIN research_subquestions sub ON sub.subquestion_id = s.subquestion_id
+       JOIN research_tasks t ON t.research_task_id = sub.research_task_id
+       WHERE t.run_id = ? ORDER BY s.rowid ASC`,
+      [runId]
+    )
+    .map(toEvidenceSpan)
+}
+
+/** 本 run 的全部引用(经 claim → task 归属过滤) */
+export function listCitationsForRun(db: SqliteDb, runId: string): RunCitationRow[] {
+  const rows = db.all<{ citation_id: string; claim_id: string }>(
+    `SELECT ci.citation_id, ci.claim_id FROM research_citations ci
+     JOIN research_claims c ON c.claim_id = ci.claim_id
+     JOIN research_tasks t ON t.research_task_id = c.research_task_id
+     WHERE t.run_id = ? ORDER BY ci.rowid ASC`,
+    [runId]
+  )
+  return rows.map((row) => {
+    const citation = getCitation(db, row.citation_id)
+    if (!citation) throw new Error(`引用不存在:${row.citation_id}`)
+    const claim = getClaim(db, row.claim_id)
+    if (!claim) throw new Error(`引用 ${row.citation_id} 指向的 Claim 不存在:${row.claim_id}`)
+    const span = getEvidenceSpan(db, citation.evidenceId)
+    if (!span) throw new Error(`引用 ${citation.citationId} 指向的片段不存在:${citation.evidenceId}`)
+    return { citation, claim, span }
+  })
+}
+
+// ---------- R-05 追加:快照与 chunk 读取 ----------
+
+/** 快照定位与闭包检查的读取形态(共享表投影,不复制共享模块类型) */
+export interface SnapshotTextRecord {
+  snapshotId: string
+  textSha256: string
+  normalizedText: string
+}
+
+export function getSnapshotText(db: SqliteDb, snapshotId: string): SnapshotTextRecord | null {
+  const row = db.get<{ document_id: string; text_sha256: string; normalized_text: string }>(
+    'SELECT document_id, text_sha256, normalized_text FROM retrieval_documents WHERE document_id = ?',
+    [snapshotId]
+  )
+  if (!row) return null
+  return { snapshotId: row.document_id, textSha256: row.text_sha256, normalizedText: row.normalized_text }
+}
+
+export interface ChunkBoundaryRecord {
+  chunkId: string
+  snapshotId: string
+  startOffset: number
+  endOffset: number
+  content: string
+}
+
+export function getChunkBoundary(db: SqliteDb, chunkId: string): ChunkBoundaryRecord | null {
+  const row = db.get<{ chunk_id: string; document_id: string; start_offset: number; end_offset: number; content: string }>(
+    'SELECT chunk_id, document_id, start_offset, end_offset, content FROM retrieval_chunks WHERE chunk_id = ?',
+    [chunkId]
+  )
+  if (!row) return null
+  return {
+    chunkId: row.chunk_id,
+    snapshotId: row.document_id,
+    startOffset: row.start_offset,
+    endOffset: row.end_offset,
+    content: row.content
+  }
 }
