@@ -901,6 +901,44 @@ export function updateClaimConflictGroup(db: SqliteDb, claimId: string, conflict
   )
 }
 
+// ---------- R-04 追加:工作流 checkpoint 存取 ----------
+//
+// checkpoint 存储位置取舍:research_tasks.config_json(既有列,不迁移 schema)。
+// 工作流把预算账本序列化形态(SerializedLedger)与澄清题组/用户答案一起包进
+// { workflow: 'research.v1', checkpoint } 写入 config_json;每次 reserve/阶段推进后
+// 落一次,供 (a) awaiting_input 恢复续跑与 (b) 进程中断后 restoreLedger 审计使用。
+// 既有函数一律不动;本节只新增读写两个函数,键名冲突即覆盖(workflow 独占该键)。
+
+const WORKFLOW_CONFIG_KEY = 'workflow'
+
+/** 保存工作流 checkpoint(整键覆盖;JSON 序列化失败原样抛出,不静默) */
+export function saveResearchCheckpoint(db: SqliteDb, researchTaskId: string, checkpoint: Record<string, unknown>): void {
+  const config = { [WORKFLOW_CONFIG_KEY]: checkpoint }
+  db.run('UPDATE research_tasks SET config_json = ? WHERE research_task_id = ?', [
+    JSON.stringify(config),
+    researchTaskId
+  ])
+}
+
+/** 读取工作流 checkpoint;未写入或非对象返回 null(读路径,不校验内部形状——由 workflow 负责) */
+export function loadResearchCheckpoint(db: SqliteDb, researchTaskId: string): Record<string, unknown> | null {
+  const row = db.get<{ config_json: string | null }>(
+    'SELECT config_json FROM research_tasks WHERE research_task_id = ?',
+    [researchTaskId]
+  )
+  if (!row || row.config_json === null) return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(row.config_json)
+  } catch {
+    return null
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null
+  const checkpoint = (parsed as Record<string, unknown>)[WORKFLOW_CONFIG_KEY]
+  if (typeof checkpoint !== 'object' || checkpoint === null || Array.isArray(checkpoint)) return null
+  return checkpoint as Record<string, unknown>
+}
+
 // ---------- R-05 追加:报告冻结记录 ----------
 
 /**
