@@ -185,6 +185,10 @@ const api: RendererApi = {
   submitAgentAnswers: invoke(Channels.AgentRunAnswers),
   cancelAgentRun: invoke(Channels.AgentRunCancel),
   decideAgentApproval: invoke(Channels.AgentApprovalDecide),
+  listEvalDatasets: invoke(Channels.EvalListDatasets),
+  startEvalBatch: invoke(Channels.EvalStartBatch),
+  getEvalRun: invoke(Channels.EvalGetRun),
+  getEvalReport: invoke(Channels.EvalGetReport),
 
   on: (channel, listener) => {
     if (!channel.startsWith(EVENT_CHANNEL_PREFIX)) {

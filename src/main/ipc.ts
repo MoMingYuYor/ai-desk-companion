@@ -80,6 +80,7 @@ import type { ReminderService } from './services/reminder'
 import type { PersistenceCoordinator } from './db/operations'
 import type { AgentEventStream } from './agent/eventStream'
 import type { RunOrchestrator, AnswerItem } from './agent/orchestrator'
+import { listEvalDatasets, startEvalBatch, getEvalRunState, getEvalReport, type EvalsDeps } from './evals/api'
 import type { RunMode } from '../shared/agent'
 import { getRun, listTraceEvents, listRecentRuns, listApprovals } from './runs/repository'
 import { buildDayAgenda } from './services/context'
@@ -122,6 +123,8 @@ export interface IpcDeps {
   agentEvents?: AgentEventStream
   /** Agent 运行编排器(A-05):缺省时 Agent 写侧通道不可用(兼容现有测试桩) */
   orchestrator?: RunOrchestrator
+  /** 评测(E-07):缺省时评测通道不可用 */
+  evals?: EvalsDeps
 }
 
 let depsRef: IpcDeps | null = null
@@ -362,6 +365,24 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       throw new OperationError(appError('MODEL_UNAVAILABLE', 'Agent 编排器未接线', { retryable: false }))
     }
     return deps.orchestrator.decide(approvalId, decision)
+  })
+
+  // ---- evals(E-07) ----
+  handle(Channels.EvalListDatasets, () => {
+    if (!deps.evals) throw new OperationError(appError('MODEL_UNAVAILABLE', '评测未接线', { retryable: false }))
+    return listEvalDatasets(deps.evals.evalsRoot)
+  })
+  handle(Channels.EvalStartBatch, (params: { datasetVersion: string; splits: Array<'dev' | 'holdout'> }) => {
+    if (!deps.evals) throw new OperationError(appError('MODEL_UNAVAILABLE', '评测未接线', { retryable: false }))
+    return startEvalBatch(deps.evals, params)
+  })
+  handle(Channels.EvalGetRun, (evalRunId: string) => {
+    if (!deps.evals) throw new OperationError(appError('MODEL_UNAVAILABLE', '评测未接线', { retryable: false }))
+    return getEvalRunState(deps.evals.evalsRoot, evalRunId)
+  })
+  handle(Channels.EvalGetReport, (evalRunId: string) => {
+    if (!deps.evals) throw new OperationError(appError('MODEL_UNAVAILABLE', '评测未接线', { retryable: false }))
+    return getEvalReport(deps.evals.evalsRoot, evalRunId)
   })
 
   // ---- providers ----

@@ -4,7 +4,7 @@
 
 - 数据集:personal_ops_v1(cases sha256 `9235bcd6191f6d3c…`,共 50 条)
 - split:holdout;重复:1;配置:fake_flow
-- 状态:completed;起止:2026-09-28T01:00:00.000Z ~ 2026-09-27T04:08:16.185Z
+- 状态:completed;起止:2026-09-28T01:00:00.000Z ~ 2026-09-27T04:12:37.521Z
 - 复现:`npx vitest run tests/evals/ops50.test.ts`
 
 ## 覆盖

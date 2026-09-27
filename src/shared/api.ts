@@ -155,6 +155,10 @@ export const Channels = {
   AgentRunAnswers: 'agent:run-answers',
   AgentRunCancel: 'agent:run-cancel',
   AgentApprovalDecide: 'agent:approval-decide',
+  EvalListDatasets: 'eval:list-datasets',
+  EvalStartBatch: 'eval:start-batch',
+  EvalGetRun: 'eval:get-run',
+  EvalGetReport: 'eval:get-report',
 
   // main -> renderer 事件
   // R8 会话运行契约:started 先于任何流事件;delta/done/error 均携带 runId,
@@ -361,6 +365,11 @@ export interface RendererApi {
   submitAgentAnswers(runId: string, answers: Array<{ questionId: string; answer: string }>): Promise<{ runId: string; status: string }>
   cancelAgentRun(runId: string): Promise<import('./agent').AgentRunView>
   decideAgentApproval(approvalId: string, decision: 'approved' | 'rejected'): Promise<{ already: boolean }>
+  // evals(E-07)
+  listEvalDatasets(): Promise<Array<{ version: string; total: number }>>
+  startEvalBatch(params: { datasetVersion: string; splits: Array<'dev' | 'holdout'> }): Promise<{ evalRunId: string; status: string }>
+  getEvalRun(evalRunId: string): Promise<Record<string, unknown> | null>
+  getEvalReport(evalRunId: string): Promise<string | null>
   // mail
   mail: MailApi
   subscribeMail: MailSubscribe
