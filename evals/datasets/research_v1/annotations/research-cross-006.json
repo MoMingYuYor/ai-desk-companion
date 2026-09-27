@@ -1,0 +1,52 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-cross-006",
+  "group": "跨文档综合",
+  "split": "dev",
+  "input": "这三份样例文档工程师 JD 中,哪几份支持远程办公?",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-cross-006-1",
+      "text": "a.txt 与 c.md 所指样例岗位支持全远程办公,b.txt 要求到岗。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-006/a.txt",
+            "text_sha256": "a684aac4ebf2488c1f7aa3bbb30957dfd8eb57ec58217dab0df3770f1a464823",
+            "start_offset": 29,
+            "end_offset": 37,
+            "quote": "支持全远程办公。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-006"
+          },
+          {
+            "snapshot_id": "cross-006/c.md",
+            "text_sha256": "8c610ab3b30390e0e5348670632154e9aa79dccc25f61ef87685413256b0c89b",
+            "start_offset": 31,
+            "end_offset": 39,
+            "quote": "支持全远程办公。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-006"
+          },
+          {
+            "snapshot_id": "cross-006/b.txt",
+            "text_sha256": "ce54747e005d2dcc4a5f9064b06a5ba1b9aaf2e3273d22a92834b967cf2e4fce",
+            "start_offset": 29,
+            "end_offset": 35,
+            "quote": "需到岗办公。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-006"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

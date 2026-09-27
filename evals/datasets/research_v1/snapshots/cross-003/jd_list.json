@@ -1,0 +1,18 @@
+[
+  {
+    "title": "算法研究实习生",
+    "company": "样例岗位 算法组",
+    "location": "北京",
+    "description": "参与序列建模研究。\n要求:在读硕士及以上;发表过论文者优先。\n",
+    "source_url": "https://careers.example.invalid/jobs/cross-003-a",
+    "published_at": "2026-07-05"
+  },
+  {
+    "title": "数据标注组长",
+    "company": "样例岗位 算法组",
+    "location": "北京",
+    "description": "带领标注小组完成质检。\n要求:本科及以上;有标注团队管理经验。\n",
+    "source_url": "https://careers.example.invalid/jobs/cross-003-b",
+    "published_at": "2026-07-06"
+  }
+]

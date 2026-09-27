@@ -1,0 +1,18 @@
+[
+  {
+    "title": "电商运营专员",
+    "company": "样例岗位 电商事业部",
+    "location": "杭州",
+    "description": "负责店铺日常运营。\n要求:一到两年电商运营经验。\n",
+    "source_url": "https://careers.example.invalid/jobs/conflict-003-a",
+    "published_at": "2026-06-15"
+  },
+  {
+    "title": "电商运营专员",
+    "company": "样例岗位 电商事业部",
+    "location": "义乌",
+    "description": "负责店铺日常运营。\n要求:一到两年电商运营经验。\n",
+    "source_url": "https://careers.example.invalid/jobs/conflict-003-b",
+    "published_at": "2026-06-20"
+  }
+]

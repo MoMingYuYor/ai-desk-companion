@@ -1,0 +1,53 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-conflict-003",
+  "group": "冲突",
+  "split": "dev",
+  "input": "这个样例岗位的两条记录在工作地点上是否冲突?",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-conflict-003-1",
+      "text": "发布于 2026-06-15 的记录将岗位地点标为杭州。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "conflict-003/jd_list.json",
+            "text_sha256": "0db35924e831746b910f41d83152ba9bd14ef9729ea6364711430d6b5bbb3b6d",
+            "start_offset": 37,
+            "end_offset": 39,
+            "quote": "杭州",
+            "relation": "supports",
+            "provenance_group_id": "pg-conflict-003"
+          }
+        ]
+      ]
+    },
+    {
+      "gold_claim_id": "gc-conflict-003-2",
+      "text": "发布于 2026-06-20 的记录将岗位地点标为义乌。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "conflict-003/jd_list.json",
+            "text_sha256": "0db35924e831746b910f41d83152ba9bd14ef9729ea6364711430d6b5bbb3b6d",
+            "start_offset": 147,
+            "end_offset": 149,
+            "quote": "义乌",
+            "relation": "contradicts",
+            "provenance_group_id": "pg-conflict-003"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [
+    "conflict.location.city"
+  ],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

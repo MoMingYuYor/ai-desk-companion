@@ -1,0 +1,43 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-duplicate-003",
+  "group": "重复来源",
+  "split": "dev",
+  "input": "这两份样例材料指向几个独立来源?岗位对普通话等级的要求是什么?",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-duplicate-003-1",
+      "text": "两份文本同源,独立来源数为 1。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "duplicate-003/first.txt",
+            "text_sha256": "d52adf23f6558e4e376320e8ad3e1f3f38148e47c9d2a2ffe473de9dcf15a7df",
+            "start_offset": 19,
+            "end_offset": 33,
+            "quote": "普通话二级甲等;周末可出勤。",
+            "relation": "supports",
+            "provenance_group_id": "pg-dup-3"
+          },
+          {
+            "snapshot_id": "duplicate-003/second.txt",
+            "text_sha256": "ec3dc7ab46f30b8d514e7afc699f93496ada44402a7f54cf8ecbfd4d4d092ce8",
+            "start_offset": 25,
+            "end_offset": 39,
+            "quote": "普通话二级甲等;周末可出勤。",
+            "relation": "supports",
+            "provenance_group_id": "pg-dup-3"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

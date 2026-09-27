@@ -1,0 +1,53 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-conflict-005",
+  "group": "冲突",
+  "split": "holdout",
+  "input": "这个样例岗位对自动化脚本经验的要求是否冲突?",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-conflict-005-1",
+      "text": "快照甲要求必须掌握自动化测试脚本。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "conflict-005/jd_a.md",
+            "text_sha256": "ad264ff1f140e84d3275be35626ff8c6f9b77e2b7f5ff1ba1529a58197c5f651",
+            "start_offset": 27,
+            "end_offset": 39,
+            "quote": "必须掌握自动化测试脚本。",
+            "relation": "supports",
+            "provenance_group_id": "pg-conflict-005"
+          }
+        ]
+      ]
+    },
+    {
+      "gold_claim_id": "gc-conflict-005-2",
+      "text": "快照乙明确不要求自动化脚本经验。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "conflict-005/jd_b.md",
+            "text_sha256": "6d1949a8b011851e951bb9bd5c401477a1b3080c225b93b4db5faa0ce9732857",
+            "start_offset": 27,
+            "end_offset": 45,
+            "quote": "手工测试即可,不要求自动化脚本经验。",
+            "relation": "contradicts",
+            "provenance_group_id": "pg-conflict-005"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [
+    "conflict.skill.automation"
+  ],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

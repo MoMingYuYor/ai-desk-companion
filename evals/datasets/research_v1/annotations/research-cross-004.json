@@ -1,0 +1,51 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-cross-004",
+  "group": "跨文档综合",
+  "split": "dev",
+  "input": "这两份同名样例客服培训生 JD 的工作地点分别在哪里?",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-cross-004-1",
+      "text": "post_a 所指样例岗位的工作地点在苏州工业园区。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-004/post_a.txt",
+            "text_sha256": "0d65a71c77be5e6001f2009520a446f851929e8bfe56cfbd059593cac2bbf13a",
+            "start_offset": 31,
+            "end_offset": 43,
+            "quote": "工作地点:苏州工业园区。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-004"
+          }
+        ]
+      ]
+    },
+    {
+      "gold_claim_id": "gc-cross-004-2",
+      "text": "post_b 所指样例岗位的工作地点在合肥高新区。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-004/post_b.txt",
+            "text_sha256": "cd3032bedc2d2944c99ac89f2f5e21a70c91c8ef0304bdc4e0e243469915d2f1",
+            "start_offset": 31,
+            "end_offset": 42,
+            "quote": "工作地点:合肥高新区。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-004"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

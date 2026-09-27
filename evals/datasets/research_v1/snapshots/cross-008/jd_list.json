@@ -1,0 +1,18 @@
+[
+  {
+    "title": "出海产品实习生",
+    "company": "样例岗位 出海业务线",
+    "location": "远程",
+    "description": "协助整理海外市场反馈。\n要求:能阅读英文资料;每周三天。\n",
+    "source_url": "https://careers.example.invalid/jobs/cross-008-a",
+    "published_at": "2026-07-20"
+  },
+  {
+    "title": "本地市场实习生",
+    "company": "样例岗位 出海业务线",
+    "location": "远程",
+    "description": "整理本地渠道素材。\n要求:中文文案能力强;每周三天。\n",
+    "source_url": "https://careers.example.invalid/jobs/cross-008-b",
+    "published_at": "2026-07-21"
+  }
+]

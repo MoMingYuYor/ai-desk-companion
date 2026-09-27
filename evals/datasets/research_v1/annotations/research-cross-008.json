@@ -1,0 +1,34 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-cross-008",
+  "group": "跨文档综合",
+  "split": "holdout",
+  "input": "这两条样例记录中,哪条要求能阅读英文资料?",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-cross-008-1",
+      "text": "样例出海产品实习生要求能阅读英文资料。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-008/jd_list.json",
+            "text_sha256": "64c51cda77df7e74c2139bcc025fd16a74deeedc4a8b0e32a64815e8bf35cbf0",
+            "start_offset": 23,
+            "end_offset": 34,
+            "quote": "要求:能阅读英文资料;",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-008"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

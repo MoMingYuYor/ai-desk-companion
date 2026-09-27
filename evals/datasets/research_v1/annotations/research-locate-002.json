@@ -1,0 +1,51 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-locate-002",
+  "group": "单文档定位",
+  "split": "dev",
+  "input": "这份样例算法实习 JD 对学历有什么要求?",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-locate-002-1",
+      "text": "该样例岗位明确说明不需要博士学历。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "locate-002/jd.txt",
+            "text_sha256": "0ea3c15845121571d261aed4f5f160c67e4b37abbec9485fa29499b18cf4e670",
+            "start_offset": 56,
+            "end_offset": 64,
+            "quote": "不需要博士学历。",
+            "relation": "supports",
+            "provenance_group_id": "pg-locate-002"
+          }
+        ]
+      ]
+    },
+    {
+      "gold_claim_id": "gc-locate-002-2",
+      "text": "该样例岗位要求硕士在读或本科高年级。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "locate-002/jd.txt",
+            "text_sha256": "0ea3c15845121571d261aed4f5f160c67e4b37abbec9485fa29499b18cf4e670",
+            "start_offset": 42,
+            "end_offset": 53,
+            "quote": "硕士在读或本科高年级。",
+            "relation": "supports",
+            "provenance_group_id": "pg-locate-002"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

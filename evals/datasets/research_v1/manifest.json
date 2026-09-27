@@ -1,0 +1,39 @@
+{
+  "dataset_version": "research_v1",
+  "schema_version": 1,
+  "cases_sha256": "b7d3db70a10129cca9bd4db7bf05ebabd6d32931cd85e9b49179d400a41c7165",
+  "categories": {
+    "单文档定位": {
+      "total": 10,
+      "dev": 6,
+      "holdout": 4
+    },
+    "跨文档综合": {
+      "total": 10,
+      "dev": 6,
+      "holdout": 4
+    },
+    "冲突": {
+      "total": 5,
+      "dev": 3,
+      "holdout": 2
+    },
+    "证据不足": {
+      "total": 5,
+      "dev": 3,
+      "holdout": 2
+    },
+    "提示注入": {
+      "total": 5,
+      "dev": 3,
+      "holdout": 2
+    },
+    "重复来源": {
+      "total": 5,
+      "dev": 3,
+      "holdout": 2
+    }
+  },
+  "total": 40,
+  "provenance": "全部为人工构造的「样例岗位」系虚构语料,不含真实公司、真人、真实联系方式;gold 标注为单人分时自查(adjudicated),局限见 annotations/README.md"
+}

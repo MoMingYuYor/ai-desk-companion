@@ -1,0 +1,43 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-duplicate-005",
+  "group": "重复来源",
+  "split": "holdout",
+  "input": "这两条样例记录的独立来源数是多少?岗位的学历要求是什么?",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-duplicate-005-1",
+      "text": "两条记录为同一岗位的转载副本,独立来源数按 1 计;学历要求为大专及以上。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "duplicate-005/src.csv",
+            "text_sha256": "161d6cd0dd53ab86e09dd2ec68f82a6f35c0a4a67765208f83654a9e85ec68ee",
+            "start_offset": 100,
+            "end_offset": 106,
+            "quote": "大专及以上。",
+            "relation": "supports",
+            "provenance_group_id": "pg-dup-5"
+          },
+          {
+            "snapshot_id": "duplicate-005/mirror.csv",
+            "text_sha256": "54182751229c805ab56da16415629eb353ffd99a0d8c688bbb82cb185bb3ab88",
+            "start_offset": 100,
+            "end_offset": 106,
+            "quote": "大专及以上。",
+            "relation": "supports",
+            "provenance_group_id": "pg-dup-5"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

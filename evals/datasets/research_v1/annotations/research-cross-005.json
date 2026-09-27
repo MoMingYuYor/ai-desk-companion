@@ -1,0 +1,51 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-cross-005",
+  "group": "跨文档综合",
+  "split": "dev",
+  "input": "比较这两份样例 JD 的核心技能要求,分别是什么?",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-cross-005-1",
+      "text": "样例用户运营实习生要求会用数据分析工具。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-005/ops_role.csv",
+            "text_sha256": "a48f9b2c7b86425c298ea97bf4168f37bbe3ab9ae043f35b05df1f3869ec8a38",
+            "start_offset": 94,
+            "end_offset": 106,
+            "quote": "要求:会用数据分析工具。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-005"
+          }
+        ]
+      ]
+    },
+    {
+      "gold_claim_id": "gc-cross-005-2",
+      "text": "样例前端开发实习生要求会用组件库搭建页面。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-005/dev_role.md",
+            "text_sha256": "2fa3414a7bb96ce6e08b677e04e8794ffb60e4e1b380f333084e713717a42de6",
+            "start_offset": 26,
+            "end_offset": 36,
+            "quote": "会用组件库搭建页面。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-005"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-locate-005",
+  "group": "单文档定位",
+  "split": "dev",
+  "input": "这份样例检索方向 JD 提到哪些检索与协议相关的技术?",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-locate-005-1",
+      "text": "该样例岗位描述提到 RAG(检索增强生成)与 MCP(模型上下文协议)。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "locate-005/jd.json",
+            "text_sha256": "b50fc3b62599cc6582d838b22e1f0fecb1970fae59722bcdda5a60a3518fe86f",
+            "start_offset": 11,
+            "end_offset": 43,
+            "quote": "负责检索增强生成(RAG)与模型上下文协议(MCP)工具链开发。",
+            "relation": "supports",
+            "provenance_group_id": "pg-locate-005"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

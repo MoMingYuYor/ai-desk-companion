@@ -1,0 +1,51 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-cross-009",
+  "group": "跨文档综合",
+  "split": "holdout",
+  "input": "比较这两份样例实验室助理材料的出勤天数要求。",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-cross-009-1",
+      "text": "ta 所指样例岗位要求每周出勤四天。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-009/ta.txt",
+            "text_sha256": "9f9f1f82c730b9979865c34a38f6a765f787301cb9a7ea20e36aede650905584",
+            "start_offset": 16,
+            "end_offset": 31,
+            "quote": "每周出勤四天,连续实习六个月。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-009"
+          }
+        ]
+      ]
+    },
+    {
+      "gold_claim_id": "gc-cross-009-2",
+      "text": "tb 所指样例岗位要求每周出勤两天。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-009/tb.csv",
+            "text_sha256": "0bb3995f0c9dda97df1959a5812f1c40c0578c0e001a043a29869a03769c65bd",
+            "start_offset": 78,
+            "end_offset": 93,
+            "quote": "每周出勤两天,连续实习三个月。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-009"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

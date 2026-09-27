@@ -1,0 +1,69 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-duplicate-004",
+  "group": "重复来源",
+  "split": "holdout",
+  "input": "这两份共用模板的样例 JD 是几个独立岗位?它们对优先项的要求有何不同?",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-duplicate-004-1",
+      "text": "两份 JD 是两个不同岗位,不得因共用模板合并来源组。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "duplicate-004/template_role_a.md",
+            "text_sha256": "e1c07a2799ed3b59bf28d0d76276ccd37e551ae25e730dc9613744e4293a21cc",
+            "start_offset": 2,
+            "end_offset": 18,
+            "quote": "样例岗位 电商美工实习生(金华)",
+            "relation": "supports",
+            "provenance_group_id": "pg-tpl-a"
+          },
+          {
+            "snapshot_id": "duplicate-004/template_role_b.md",
+            "text_sha256": "8f3d95b481653aa2a3b987ab04ca4338fc5b208653fa43e03ced9766fc1c09cf",
+            "start_offset": 2,
+            "end_offset": 19,
+            "quote": "样例岗位 新媒体美工实习生(金华)",
+            "relation": "supports",
+            "provenance_group_id": "pg-tpl-b"
+          }
+        ]
+      ]
+    },
+    {
+      "gold_claim_id": "gc-duplicate-004-2",
+      "text": "电商美工岗将有作品集列为优先,新媒体美工岗将有视频剪辑经验列为优先。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "duplicate-004/template_role_a.md",
+            "text_sha256": "e1c07a2799ed3b59bf28d0d76276ccd37e551ae25e730dc9613744e4293a21cc",
+            "start_offset": 54,
+            "end_offset": 62,
+            "quote": "有作品集者优先。",
+            "relation": "supports",
+            "provenance_group_id": "pg-tpl-a"
+          },
+          {
+            "snapshot_id": "duplicate-004/template_role_b.md",
+            "text_sha256": "8f3d95b481653aa2a3b987ab04ca4338fc5b208653fa43e03ced9766fc1c09cf",
+            "start_offset": 55,
+            "end_offset": 66,
+            "quote": "有视频剪辑经验者优先。",
+            "relation": "supports",
+            "provenance_group_id": "pg-tpl-b"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

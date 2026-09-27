@@ -1,0 +1,51 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-cross-002",
+  "group": "跨文档综合",
+  "split": "dev",
+  "input": "比较这两份样例 JD 的经验年限要求,指出哪份要求工作经验。",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-cross-002-1",
+      "text": "样例高级产品运营要求三年以上互联网产品运营经验。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-002/senior_jd.md",
+            "text_sha256": "876a75e6d65a09f201bb590aad9c52aa456c92e74fa518128877616f1816b13b",
+            "start_offset": 25,
+            "end_offset": 39,
+            "quote": "三年以上互联网产品运营经验。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-002"
+          }
+        ]
+      ]
+    },
+    {
+      "gold_claim_id": "gc-cross-002-2",
+      "text": "样例产品助理实习生明确不要求工作经验。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-002/junior_jd.md",
+            "text_sha256": "83dc1bccce16d4f674a7a96be0ac0cd9f4156d7bc7a3b886c311c141e4907b8f",
+            "start_offset": 26,
+            "end_offset": 39,
+            "quote": "不要求工作经验,应届即可。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-002"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

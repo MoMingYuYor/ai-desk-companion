@@ -1,0 +1,13 @@
+{
+  "fixture_id": "insufficient-003",
+  "case_id": "research-insufficient-003",
+  "normalization_version": 1,
+  "note": "fixtures/research 同名目录的副本;raw_sha256 对应原始字节,text_sha256 对应规范化全文 UTF-8 字节",
+  "entries": [
+    {
+      "file": "jd.md",
+      "raw_sha256": "2c6d023223095976dbc0e19de4b74984762f2b442b3c11634c6520db25be6c71",
+      "text_sha256": "2c6d023223095976dbc0e19de4b74984762f2b442b3c11634c6520db25be6c71"
+    }
+  ]
+}

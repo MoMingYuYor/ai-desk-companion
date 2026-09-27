@@ -1,0 +1,53 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-conflict-002",
+  "group": "冲突",
+  "split": "dev",
+  "input": "这个样例岗位的经验年限要求是否前后不一致?引用两份快照原文。",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-conflict-002-1",
+      "text": "2026-05 快照要求两年以上新媒体运营经验。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "conflict-002/jd_old.txt",
+            "text_sha256": "6d0b53d052baaa63d7a7b3c36f4dc2c12c2dd1b47a30b92b1226b311a1dbdc74",
+            "start_offset": 38,
+            "end_offset": 50,
+            "quote": "两年以上新媒体运营经验。",
+            "relation": "supports",
+            "provenance_group_id": "pg-conflict-002"
+          }
+        ]
+      ]
+    },
+    {
+      "gold_claim_id": "gc-conflict-002-2",
+      "text": "2026-06 快照放宽为一年以上即可。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "conflict-002/jd_new.txt",
+            "text_sha256": "4d7edc392d4680b1219e177190dc9320b947ecb88690c8d8ba50c065c955cba9",
+            "start_offset": 38,
+            "end_offset": 52,
+            "quote": "一年以上新媒体运营经验即可。",
+            "relation": "contradicts",
+            "provenance_group_id": "pg-conflict-002"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [
+    "conflict.experience.years"
+  ],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

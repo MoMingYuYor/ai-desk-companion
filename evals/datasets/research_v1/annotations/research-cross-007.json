@@ -1,0 +1,51 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-cross-007",
+  "group": "跨文档综合",
+  "split": "holdout",
+  "input": "比较这两份样例视频剪辑 JD 的实习薪资。",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-cross-007-1",
+      "text": "role_a 所指样例岗位实习期薪资为每天 150 元。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-007/role_a.md",
+            "text_sha256": "ed8b0b3bde1dfc02fefe91bae0a06f2f4d36b2efb9bb64162bd4f6153a107a02",
+            "start_offset": 20,
+            "end_offset": 32,
+            "quote": "实习期每天 150 元。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-007"
+          }
+        ]
+      ]
+    },
+    {
+      "gold_claim_id": "gc-cross-007-2",
+      "text": "role_b 所指样例岗位实习期薪资为每天 120 元。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-007/role_b.md",
+            "text_sha256": "d43c67f5dbf8f2875716bfee1ee364075590c93f5a9ae7062ad6cddc332506e2",
+            "start_offset": 20,
+            "end_offset": 32,
+            "quote": "实习期每天 120 元。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-007"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-insufficient-004",
+  "group": "证据不足",
+  "split": "holdout",
+  "input": "这个样例仓储管理培训生岗位的薪资范围是什么?",
+  "gold_claims": [],
+  "conflict_flags": [],
+  "missing_requirements": [
+    "salary"
+  ],
+  "fabrication_bans": [
+    "不得引用任何外部薪资行情数据",
+    "不得编造「面议」以外的具体数字"
+  ],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

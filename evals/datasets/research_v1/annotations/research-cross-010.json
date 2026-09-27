@@ -1,0 +1,51 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-cross-010",
+  "group": "跨文档综合",
+  "split": "holdout",
+  "input": "这两份样例财务助理 JD 中,哪份要求持有会计证书?",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-cross-010-1",
+      "text": "role_a 所指样例岗位要求持有初级会计证书。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-010/role_a.md",
+            "text_sha256": "164f613531c0fd300e502363c9c14946fbbf471721f052d47d0d1924a8f0d551",
+            "start_offset": 26,
+            "end_offset": 35,
+            "quote": "持有初级会计证书。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-010"
+          }
+        ]
+      ]
+    },
+    {
+      "gold_claim_id": "gc-cross-010-2",
+      "text": "role_b 所指样例岗位要求会计相关专业在读,未提及证书。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-010/role_b.md",
+            "text_sha256": "2b45b0ccf40c8d1f8dac0b6c968470e624f0bf23e363665ec4e95692033c8a55",
+            "start_offset": 26,
+            "end_offset": 35,
+            "quote": "会计相关专业在读。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-010"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

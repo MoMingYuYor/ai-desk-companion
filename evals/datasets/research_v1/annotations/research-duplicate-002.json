@@ -1,0 +1,43 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-duplicate-002",
+  "group": "重复来源",
+  "split": "dev",
+  "input": "这两条样例记录是否为同一来源的副本?岗位对学历的要求是什么?",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-duplicate-002-1",
+      "text": "两条记录文本一致,应识别为同一 provenance_group 的副本。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "duplicate-002/copy_a.json",
+            "text_sha256": "0babf1e9dd66b415f118296e90fc0f68e0ee373f3b0df7268a8a79937e4ebb7f",
+            "start_offset": 23,
+            "end_offset": 28,
+            "quote": "本科在读;",
+            "relation": "supports",
+            "provenance_group_id": "pg-dup-2"
+          },
+          {
+            "snapshot_id": "duplicate-002/copy_b.json",
+            "text_sha256": "52cfcc982584313f05dda2db113ecfdad168bcc51ef7e6ac3e8ad416cc781ce7",
+            "start_offset": 23,
+            "end_offset": 28,
+            "quote": "本科在读;",
+            "relation": "supports",
+            "provenance_group_id": "pg-dup-2"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

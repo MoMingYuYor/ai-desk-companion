@@ -1,0 +1,68 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-cross-001",
+  "group": "跨文档综合",
+  "split": "dev",
+  "input": "比较这三条样例岗位记录中 Python 要求的出现情况,分别指出哪个岗位明确要求 Python。",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-cross-001-1",
+      "text": "样例数据工程实习生明确要求精通 Python。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-001/data_engineer.csv",
+            "text_sha256": "c62163e721367edc2fb943a72bae9e92f758a928dc3a7626347a6ba3b6dcbfc6",
+            "start_offset": 94,
+            "end_offset": 116,
+            "quote": "精通 Python 与常用数据 ETL 库。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-001"
+          }
+        ]
+      ]
+    },
+    {
+      "gold_claim_id": "gc-cross-001-2",
+      "text": "样例研究助理实习生明确要求精通 Python。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-001/research_engineer.csv",
+            "text_sha256": "c459ec21b0455af66a085eddda741941d695981142a042ff02e33b0a25aa2689",
+            "start_offset": 80,
+            "end_offset": 103,
+            "quote": "岗位要求:精通 Python,有数据仓库经验。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-001"
+          }
+        ]
+      ]
+    },
+    {
+      "gold_claim_id": "gc-cross-001-3",
+      "text": "样例数据运营实习生同时要求 SQL 与 Python。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-001/data_engineer.csv",
+            "text_sha256": "c62163e721367edc2fb943a72bae9e92f758a928dc3a7626347a6ba3b6dcbfc6",
+            "start_offset": 220,
+            "end_offset": 238,
+            "quote": "熟练使用 SQL 与 Python。",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-001"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

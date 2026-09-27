@@ -1,0 +1,51 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-locate-008",
+  "group": "单文档定位",
+  "split": "holdout",
+  "input": "这份样例知识库运营 JD 是否要求前端开发经验?",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-locate-008-1",
+      "text": "该样例岗位明确说明不要求前端开发经验。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "locate-008/jd.json",
+            "text_sha256": "fcdef5ca1f63935f8f3eba47de82a530a5c6f0d1b4ea136214a0cf08d45f7552",
+            "start_offset": 36,
+            "end_offset": 46,
+            "quote": "不要求前端开发经验;",
+            "relation": "supports",
+            "provenance_group_id": "pg-locate-008"
+          }
+        ]
+      ]
+    },
+    {
+      "gold_claim_id": "gc-locate-008-2",
+      "text": "该样例岗位将会 SQL 列为优先条件。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "locate-008/jd.json",
+            "text_sha256": "fcdef5ca1f63935f8f3eba47de82a530a5c6f0d1b4ea136214a0cf08d45f7552",
+            "start_offset": 46,
+            "end_offset": 56,
+            "quote": "会 SQL 者优先。",
+            "relation": "supports",
+            "provenance_group_id": "pg-locate-008"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

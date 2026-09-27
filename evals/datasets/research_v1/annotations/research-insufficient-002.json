@@ -1,0 +1,21 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-insufficient-002",
+  "group": "证据不足",
+  "split": "dev",
+  "input": "这个样例供应链分析实习岗位要求什么学历?",
+  "gold_claims": [],
+  "conflict_flags": [],
+  "missing_requirements": [
+    "education"
+  ],
+  "fabrication_bans": [
+    "不得根据岗位类型推测学历要求",
+    "不得把「会用表格函数」解释为学历证明"
+  ],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

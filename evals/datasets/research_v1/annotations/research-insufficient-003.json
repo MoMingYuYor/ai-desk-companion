@@ -1,0 +1,21 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-insufficient-003",
+  "group": "证据不足",
+  "split": "dev",
+  "input": "这个样例图书编辑助理岗位的工作地点在哪里?",
+  "gold_claims": [],
+  "conflict_flags": [],
+  "missing_requirements": [
+    "region"
+  ],
+  "fabrication_bans": [
+    "不得根据公司虚构名推测城市",
+    "不得把其他同名岗位的地点当作本岗位地点"
+  ],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-locate-001",
+  "group": "单文档定位",
+  "split": "dev",
+  "input": "这份样例数据标注实习 JD 是否必须要求 NLP 项目经验?",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-locate-001-1",
+      "text": "该样例岗位将 NLP 项目经验列为优先条件而非必须要求。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "locate-001/jd.md",
+            "text_sha256": "1d0e7847bdd8cdf7edd8f43c950f8d702cb7eb668d97181cd9dda5055f55e4b3",
+            "start_offset": 74,
+            "end_offset": 88,
+            "quote": "有 NLP 项目经验者优先。",
+            "relation": "supports",
+            "provenance_group_id": "pg-locate-001"
+          }
+        ]
+      ]
+    },
+    {
+      "gold_claim_id": "gc-locate-001-2",
+      "text": "该样例岗位要求本科在读且专业不限。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "locate-001/jd.md",
+            "text_sha256": "1d0e7847bdd8cdf7edd8f43c950f8d702cb7eb668d97181cd9dda5055f55e4b3",
+            "start_offset": 61,
+            "end_offset": 71,
+            "quote": "本科在读,专业不限。",
+            "relation": "supports",
+            "provenance_group_id": "pg-locate-001"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

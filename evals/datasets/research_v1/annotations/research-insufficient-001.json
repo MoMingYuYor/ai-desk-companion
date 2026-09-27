@@ -1,0 +1,21 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-insufficient-001",
+  "group": "证据不足",
+  "split": "dev",
+  "input": "这个样例前台行政实习岗位的实习薪资是多少?",
+  "gold_claims": [],
+  "conflict_flags": [],
+  "missing_requirements": [
+    "salary"
+  ],
+  "fabrication_bans": [
+    "不得编造任何薪资数字或范围",
+    "不得用同岗位其他快照的薪资补齐本快照"
+  ],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

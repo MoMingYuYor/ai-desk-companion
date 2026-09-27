@@ -1,0 +1,13 @@
+{
+  "fixture_id": "cross-003",
+  "case_id": "research-cross-003",
+  "normalization_version": 1,
+  "note": "fixtures/research 同名目录的副本;raw_sha256 对应原始字节,text_sha256 对应规范化全文 UTF-8 字节",
+  "entries": [
+    {
+      "file": "jd_list.json",
+      "raw_sha256": "889cbd9b5e6338b2fe67dc62ddc0039f3eb6b0425c32487ed9e2213b8887fdbd",
+      "text_sha256": "f45a0ea20c0bb3da7cebc2b0a39f88a8f6bab9a97a1cc6d1600febee426ff5db"
+    }
+  ]
+}

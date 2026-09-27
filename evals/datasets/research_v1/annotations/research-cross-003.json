@@ -1,0 +1,51 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-cross-003",
+  "group": "跨文档综合",
+  "split": "dev",
+  "input": "比较这两条样例记录的学历要求差异。",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-cross-003-1",
+      "text": "样例算法研究实习生要求在读硕士及以上。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-003/jd_list.json",
+            "text_sha256": "f45a0ea20c0bb3da7cebc2b0a39f88a8f6bab9a97a1cc6d1600febee426ff5db",
+            "start_offset": 19,
+            "end_offset": 30,
+            "quote": "要求:在读硕士及以上;",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-003"
+          }
+        ]
+      ]
+    },
+    {
+      "gold_claim_id": "gc-cross-003-2",
+      "text": "样例数据标注组长要求本科及以上。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "cross-003/jd_list.json",
+            "text_sha256": "f45a0ea20c0bb3da7cebc2b0a39f88a8f6bab9a97a1cc6d1600febee426ff5db",
+            "start_offset": 133,
+            "end_offset": 142,
+            "quote": "要求:本科及以上;",
+            "relation": "supports",
+            "provenance_group_id": "pg-cross-003"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

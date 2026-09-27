@@ -1,0 +1,18 @@
+{
+  "fixture_id": "duplicate-002",
+  "case_id": "research-duplicate-002",
+  "normalization_version": 1,
+  "note": "fixtures/research 同名目录的副本;raw_sha256 对应原始字节,text_sha256 对应规范化全文 UTF-8 字节",
+  "entries": [
+    {
+      "file": "copy_a.json",
+      "raw_sha256": "65c0056e03e28690b0dea91276529a4ffab90d40db1a1579e136dd2bf74df2ca",
+      "text_sha256": "0babf1e9dd66b415f118296e90fc0f68e0ee373f3b0df7268a8a79937e4ebb7f"
+    },
+    {
+      "file": "copy_b.json",
+      "raw_sha256": "11a8e4a75fc81de200c1b12fa8763da6e40ecddb449447762c43df32b51293d4",
+      "text_sha256": "52cfcc982584313f05dda2db113ecfdad168bcc51ef7e6ac3e8ad416cc781ce7"
+    }
+  ]
+}

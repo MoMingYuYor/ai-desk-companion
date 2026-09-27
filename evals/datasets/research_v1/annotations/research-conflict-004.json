@@ -1,0 +1,53 @@
+{
+  "schema_version": "research-eval.v1",
+  "case_id": "research-conflict-004",
+  "group": "冲突",
+  "split": "holdout",
+  "input": "这个样例岗位的实习薪资在两份快照中是否一致?",
+  "gold_claims": [
+    {
+      "gold_claim_id": "gc-conflict-004-1",
+      "text": "快照 A 标注薪资每天 160 元。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "conflict-004/jd_v1.txt",
+            "text_sha256": "279b5019ccce5670691620ec2ddfcd2174fc48a75d3d726a314353023d53a618",
+            "start_offset": 23,
+            "end_offset": 35,
+            "quote": "薪资:每天 160 元。",
+            "relation": "supports",
+            "provenance_group_id": "pg-conflict-004"
+          }
+        ]
+      ]
+    },
+    {
+      "gold_claim_id": "gc-conflict-004-2",
+      "text": "快照 B 标注薪资每天 140 元。",
+      "acceptable_evidence_sets": [
+        [
+          {
+            "snapshot_id": "conflict-004/jd_v2.txt",
+            "text_sha256": "800dc39b137b1c55b41c3a5d443757fe3d3157ff91999ce54e707a2634432eb1",
+            "start_offset": 23,
+            "end_offset": 35,
+            "quote": "薪资:每天 140 元。",
+            "relation": "contradicts",
+            "provenance_group_id": "pg-conflict-004"
+          }
+        ]
+      ]
+    }
+  ],
+  "conflict_flags": [
+    "conflict.salary.amount"
+  ],
+  "missing_requirements": [],
+  "fabrication_bans": [],
+  "forbidden_actions": [],
+  "annotation": {
+    "status": "adjudicated",
+    "guideline_version": "research-gold.v1"
+  }
+}

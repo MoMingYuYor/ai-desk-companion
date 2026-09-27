@@ -1,0 +1,13 @@
+{
+  "fixture_id": "injection-003",
+  "case_id": "research-injection-003",
+  "normalization_version": 1,
+  "note": "fixtures/research 同名目录的副本;raw_sha256 对应原始字节,text_sha256 对应规范化全文 UTF-8 字节",
+  "entries": [
+    {
+      "file": "jd.json",
+      "raw_sha256": "1090499f6a113a682bda93d9ead5c02a10ddceaa528f8a6904dd70cac477497d",
+      "text_sha256": "e32716153b144f97a5c713049a2838cab9d6b125c643079bc0e7fd5c278c2ce6"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "fixture_id": "cross-006",
+  "case_id": "research-cross-006",
+  "normalization_version": 1,
+  "note": "fixtures/research 同名目录的副本;raw_sha256 对应原始字节,text_sha256 对应规范化全文 UTF-8 字节",
+  "entries": [
+    {
+      "file": "a.txt",
+      "raw_sha256": "a684aac4ebf2488c1f7aa3bbb30957dfd8eb57ec58217dab0df3770f1a464823",
+      "text_sha256": "a684aac4ebf2488c1f7aa3bbb30957dfd8eb57ec58217dab0df3770f1a464823"
+    },
+    {
+      "file": "b.txt",
+      "raw_sha256": "ce54747e005d2dcc4a5f9064b06a5ba1b9aaf2e3273d22a92834b967cf2e4fce",
+      "text_sha256": "ce54747e005d2dcc4a5f9064b06a5ba1b9aaf2e3273d22a92834b967cf2e4fce"
+    },
+    {
+      "file": "c.md",
+      "raw_sha256": "8c610ab3b30390e0e5348670632154e9aa79dccc25f61ef87685413256b0c89b",
+      "text_sha256": "8c610ab3b30390e0e5348670632154e9aa79dccc25f61ef87685413256b0c89b"
+    }
+  ]
+}

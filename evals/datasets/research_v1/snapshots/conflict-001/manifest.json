@@ -1,0 +1,18 @@
+{
+  "fixture_id": "conflict-001",
+  "case_id": "research-conflict-001",
+  "normalization_version": 1,
+  "note": "fixtures/research 同名目录的副本;raw_sha256 对应原始字节,text_sha256 对应规范化全文 UTF-8 字节",
+  "entries": [
+    {
+      "file": "jd_2026-06.txt",
+      "raw_sha256": "7798f787b2b34cb800a9f0d20c28835c1d2cce513187e265355e21b5690c8ec4",
+      "text_sha256": "7798f787b2b34cb800a9f0d20c28835c1d2cce513187e265355e21b5690c8ec4"
+    },
+    {
+      "file": "jd_2026-07.txt",
+      "raw_sha256": "b728cad3cf52f41f3ad883a61bce96056b02207195cff0f0f3671b1c98c39cad",
+      "text_sha256": "b728cad3cf52f41f3ad883a61bce96056b02207195cff0f0f3671b1c98c39cad"
+    }
+  ]
+}

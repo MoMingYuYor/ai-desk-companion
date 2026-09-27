@@ -1,0 +1,13 @@
+{
+  "fixture_id": "locate-008",
+  "case_id": "research-locate-008",
+  "normalization_version": 1,
+  "note": "fixtures/research 同名目录的副本;raw_sha256 对应原始字节,text_sha256 对应规范化全文 UTF-8 字节",
+  "entries": [
+    {
+      "file": "jd.json",
+      "raw_sha256": "3aae89cddb757841d59494de9ed823ee25f242ef8c30ff60c718fa3686ea5ffd",
+      "text_sha256": "fcdef5ca1f63935f8f3eba47de82a530a5c6f0d1b4ea136214a0cf08d45f7552"
+    }
+  ]
+}
