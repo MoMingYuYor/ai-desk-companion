@@ -143,6 +143,36 @@ const MAIL_DRAFTS: BackupColumnSpec[] = [
   t('draft_id'), t('recipients'), t('subject'), t('body'), t('source_ref', true),
   i('revision'), t('created_at'), t('updated_at')
 ]
+// v8(R-01):研究领域表。清单条目与 JSON 列均为文本;研究实体时间列为 UTC ISO 8601。
+const RESEARCH_SNAPSHOT_MANIFESTS: BackupColumnSpec[] = [
+  t('manifest_id'), i('schema_version'), t('entries_json'), t('manifest_sha256'), t('created_at')
+]
+const RESEARCH_TASKS: BackupColumnSpec[] = [
+  t('research_task_id'), t('run_id'), t('question'), t('constraints_json', true),
+  t('snapshot_manifest_id'), t('budget_json'), t('phase'), t('config_json', true),
+  t('parent_run_id', true), t('created_at')
+]
+const RESEARCH_SUBQUESTIONS: BackupColumnSpec[] = [
+  t('subquestion_id'), t('research_task_id'), i('ordinal'), t('question'), t('query_json', true),
+  t('status'), t('insufficiency_reason', true), t('outcome_json', true)
+]
+const RESEARCH_EVIDENCE_SPANS: BackupColumnSpec[] = [
+  t('evidence_id'), t('subquestion_id'), t('snapshot_id'), t('chunk_id'),
+  i('start_offset'), i('end_offset'), t('quote'), t('span_sha256'), t('validation_status')
+]
+const RESEARCH_CLAIMS: BackupColumnSpec[] = [
+  t('claim_id'), t('research_task_id'), t('subquestion_id'), t('text'), t('claim_type'),
+  t('subject_json', true), t('qualifier_json', true), t('support_status'),
+  t('conflict_group', true), t('review_json', true)
+]
+const RESEARCH_CITATIONS: BackupColumnSpec[] = [
+  t('citation_id'), t('claim_id'), t('evidence_id'), t('relation'),
+  t('evidence_group_id', true), t('group_operator', true)
+]
+const RESEARCH_REPORTS: BackupColumnSpec[] = [
+  t('report_id'), t('research_task_id'), i('version'), t('report_state'),
+  t('structured_json', true), t('markdown'), t('report_sha256'), t('manifest_sha256'), t('created_at')
+]
 
 /** 备份写入/清除顺序:被依赖的表在前,回执最后(回执随其引用的业务实体一起替换) */
 export const BACKUP_TABLE_ORDER = [
@@ -154,7 +184,10 @@ export const BACKUP_TABLE_ORDER = [
   'operation_receipts',
   'agent_runs', 'trace_events', 'approvals',
   'retrieval_documents', 'retrieval_chunks',
-  'mail_drafts'
+  'mail_drafts',
+  // v8(R-01):研究表。依赖顺序:清单/任务在前,子问题/证据/结论/引用/报告在后
+  'research_snapshot_manifests', 'research_tasks', 'research_subquestions',
+  'research_evidence_spans', 'research_claims', 'research_citations', 'research_reports'
 ] as const
 
 const BUSINESS_REFERENCES: BackupReferenceSpec[] = [
@@ -174,7 +207,14 @@ const PRIMARY_KEY_OVERRIDES: Readonly<Record<string, readonly string[]>> = {
   approvals: ['approval_id'],
   retrieval_documents: ['document_id'],
   retrieval_chunks: ['chunk_id'],
-  mail_drafts: ['draft_id']
+  mail_drafts: ['draft_id'],
+  research_snapshot_manifests: ['manifest_id'],
+  research_tasks: ['research_task_id'],
+  research_subquestions: ['subquestion_id'],
+  research_evidence_spans: ['evidence_id'],
+  research_claims: ['claim_id'],
+  research_citations: ['citation_id'],
+  research_reports: ['report_id']
 }
 
 function buildTables(columns: Array<[string, BackupColumnSpec[]]>, pkColumn = 'id'): Record<string, BackupTableSpec> {
@@ -246,12 +286,45 @@ const V7_TABLES = buildTables([
   ['mail_drafts', MAIL_DRAFTS]
 ])
 
+const V8_TABLES = buildTables([
+  ['conversations', CONVERSATIONS], ['messages', MESSAGES], ['materials', MATERIALS],
+  ['analyses', ANALYSES], ['events', EVENTS_V4], ['todos', TODOS_V4], ['pending_items', PENDING_V4],
+  ['semesters', SEMESTERS], ['courses', COURSES], ['course_overrides', COURSE_OVERRIDES],
+  ['school_events', SCHOOL_EVENTS], ['profile_facts', PROFILE_FACTS],
+  ['mail_analysis_links', MAIL_ANALYSIS_LINKS], ['mail_analysis_versions', MAIL_ANALYSIS_VERSIONS],
+  ['mail_confirmations', MAIL_CONFIRMATIONS], ['operation_receipts', OPERATION_RECEIPTS],
+  ['agent_runs', AGENT_RUNS], ['trace_events', TRACE_EVENTS], ['approvals', APPROVALS],
+  ['retrieval_documents', RETRIEVAL_DOCUMENTS], ['retrieval_chunks', RETRIEVAL_CHUNKS],
+  ['mail_drafts', MAIL_DRAFTS],
+  ['research_snapshot_manifests', RESEARCH_SNAPSHOT_MANIFESTS], ['research_tasks', RESEARCH_TASKS],
+  ['research_subquestions', RESEARCH_SUBQUESTIONS], ['research_evidence_spans', RESEARCH_EVIDENCE_SPANS],
+  ['research_claims', RESEARCH_CLAIMS], ['research_citations', RESEARCH_CITATIONS],
+  ['research_reports', RESEARCH_REPORTS]
+])
+
+/** v8 追加研究表的文件内引用;运行归属经 agent_runs,子问题经 research_tasks 间接归属 */
+const V8_REFERENCES: BackupReferenceSpec[] = [
+  ...V6_REFERENCES,
+  { table: 'research_tasks', column: 'run_id', targetTable: 'agent_runs', targetColumn: 'run_id', nullable: false },
+  { table: 'research_tasks', column: 'snapshot_manifest_id', targetTable: 'research_snapshot_manifests', targetColumn: 'manifest_id', nullable: false },
+  { table: 'research_subquestions', column: 'research_task_id', targetTable: 'research_tasks', targetColumn: 'research_task_id', nullable: false },
+  { table: 'research_evidence_spans', column: 'subquestion_id', targetTable: 'research_subquestions', targetColumn: 'subquestion_id', nullable: false },
+  { table: 'research_evidence_spans', column: 'snapshot_id', targetTable: 'retrieval_documents', targetColumn: 'document_id', nullable: false },
+  { table: 'research_evidence_spans', column: 'chunk_id', targetTable: 'retrieval_chunks', targetColumn: 'chunk_id', nullable: false },
+  { table: 'research_claims', column: 'research_task_id', targetTable: 'research_tasks', targetColumn: 'research_task_id', nullable: false },
+  { table: 'research_claims', column: 'subquestion_id', targetTable: 'research_subquestions', targetColumn: 'subquestion_id', nullable: false },
+  { table: 'research_citations', column: 'claim_id', targetTable: 'research_claims', targetColumn: 'claim_id', nullable: false },
+  { table: 'research_citations', column: 'evidence_id', targetTable: 'research_evidence_spans', targetColumn: 'evidence_id', nullable: false },
+  { table: 'research_reports', column: 'research_task_id', targetTable: 'research_tasks', targetColumn: 'research_task_id', nullable: false }
+]
+
 const VERSION_SPECS: Readonly<Record<number, BackupVersionSpec>> = {
   3: { version: 3, requiredTables: Object.keys(V3_TABLES), tables: V3_TABLES, references: BUSINESS_REFERENCES },
   4: { version: 4, requiredTables: Object.keys(V4_TABLES), tables: V4_TABLES, references: BUSINESS_REFERENCES },
   5: { version: 5, requiredTables: Object.keys(V5_TABLES), tables: V5_TABLES, references: BUSINESS_REFERENCES },
   6: { version: 6, requiredTables: Object.keys(V6_TABLES), tables: V6_TABLES, references: V6_REFERENCES },
-  7: { version: 7, requiredTables: Object.keys(V7_TABLES), tables: V7_TABLES, references: V6_REFERENCES }
+  7: { version: 7, requiredTables: Object.keys(V7_TABLES), tables: V7_TABLES, references: V6_REFERENCES },
+  8: { version: 8, requiredTables: Object.keys(V8_TABLES), tables: V8_TABLES, references: V8_REFERENCES }
 }
 
 /** 取指定备份版本的规格;未登记版本(未来/未知)拒绝 */

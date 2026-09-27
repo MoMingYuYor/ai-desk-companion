@@ -21,6 +21,7 @@ import { migrateM1, OPERATION_RECEIPTS_SQL } from './m1'
 import { migrateM2, rollbackM2 } from './m2'
 import { migrateM3, rollbackM3 } from './m3'
 import { migrateM4, rollbackM4 } from './m4'
+import { migrateM5, rollbackM5 } from './m5'
 import { nowTimestamp } from '../../../shared/dateUtils'
 
 export interface Migration {
@@ -184,6 +185,18 @@ const V7_PERSONAL_OPS: Migration = {
   }
 }
 
+/** v8(R-01):研究领域表(任务、子问题、证据、结论、引用、报告、快照清单) */
+const V8_RESEARCH: Migration = {
+  version: 8,
+  name: 'research_domain',
+  up: (db) => {
+    migrateM5(db)
+  },
+  down: (db) => {
+    rollbackM5(db)
+  }
+}
+
 export const MIGRATIONS: readonly Migration[] = [
   V1_BASE,
   V2_MAIL,
@@ -191,7 +204,8 @@ export const MIGRATIONS: readonly Migration[] = [
   V4_WRITE_BASICS,
   V5_AGENT_RUNS,
   V6_RETRIEVAL,
-  V7_PERSONAL_OPS
+  V7_PERSONAL_OPS,
+  V8_RESEARCH
 ]
 
 /** 注册表支持的最高版本 */
