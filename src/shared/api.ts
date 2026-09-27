@@ -160,6 +160,14 @@ export const Channels = {
   EvalGetRun: 'eval:get-run',
   EvalGetReport: 'eval:get-report',
 
+  // 研究契约(R-06):API 语义经 IPC 通道实现(错误码代替 HTTP 状态码)。
+  // 详情与事件订阅复用 Agent 通道(getAgentRun/getAgentRunEvents 已有);
+  // 事件复用 evt:agent-run-updated / finished——研究运行就是 AgentRun,不另设事件通道。
+  ResearchRunCreate: 'research:run-create',
+  ResearchReportGet: 'research:report-get',
+  ResearchSnapshotGet: 'research:snapshot-get',
+  ResearchImportDocuments: 'research:import-documents',
+
   // main -> renderer 事件
   // R8 会话运行契约:started 先于任何流事件;delta/done/error 均携带 runId,
   // 页面只接收与当前运行精确匹配的事件,迟到事件零 UI 副作用
@@ -270,6 +278,51 @@ export interface ImportPreview {
   error?: string | null
 }
 
+// ---------- 研究契约(R-06;§7 API 语义经 IPC 映射) ----------
+
+/** 研究导入的逐文件结果载荷(渲染层可见形态,源自 R-02 importResearchSources) */
+export interface ResearchSourceOutcomeView {
+  ok: boolean
+  documentId?: string
+  sourceName: string
+  sourceType: string | null
+  sourceLocator: string | null
+  recordIndex: number | null
+  /** 成功侧元数据 */
+  sourceIdentity?: string
+  provenanceGroupId?: string
+  textSha256?: string
+  codePointLength?: number
+  chunkCount?: number
+  deduped?: boolean
+  /** 失败侧错误(UNSAFE_FORMAT/DOCUMENT_PARSE_ERROR/IMPORT_LIMIT_EXCEEDED 语义) */
+  error?: { code: string; message: string }
+}
+
+/** 证据抽屉的快照读取结果:授权快照元数据 + 规范正文(按 document_id 查,不暴露任意路径) */
+export interface ResearchSnapshotView {
+  snapshotId: string
+  sourceName: string
+  sourceType: string
+  sourceIdentity: string
+  provenanceGroupId: string
+  textSha256: string
+  /** 规范全文;offset 是 Array.from(text) 码点索引 */
+  normalizedText: string
+  codePointLength: number
+  collectedAt: string
+  collectionTimeBasis: string
+}
+
+/** 研究运行创建响应:§7 的 202 语义(run_id,status=queued,replayed) */
+export interface ResearchRunCreateResult {
+  runId: string
+  status: string
+  replayed: boolean
+  researchTaskId: string
+  snapshotManifestId: string
+}
+
 export interface RendererApi {
   // app
   getAppInfo(): Promise<AppInfo>
@@ -370,6 +423,21 @@ export interface RendererApi {
   startEvalBatch(params: { datasetVersion: string; splits: Array<'dev' | 'holdout'> }): Promise<{ evalRunId: string; status: string }>
   getEvalRun(evalRunId: string): Promise<Record<string, unknown> | null>
   getEvalReport(evalRunId: string): Promise<string | null>
+  // research(R-06):API 语义经 IPC;错误以研究错误码前缀(message `[CODE] …`)与公共 AppError 体系透传
+  /** 创建研究运行:幂等键 operationId,同键同请求回放原运行(replayed=true) */
+  createResearchRun(input: {
+    question: string
+    snapshotIds: string[]
+    constraints?: Record<string, string | number | boolean>
+    budget?: Record<string, number>
+    operationId: string
+  }): Promise<ResearchRunCreateResult>
+  /** 报告读取:省略 version 取最大版本;REPORT_NOT_READY/REPORT_VERSION_NOT_FOUND 以错误抛出 */
+  getResearchReport(runId: string, version?: number): Promise<import('./researchReport').ResearchReportResponse>
+  /** 证据抽屉:按 document_id 读取授权快照元数据与规范全文 */
+  getResearchSnapshot(snapshotId: string): Promise<ResearchSnapshotView>
+  /** 导入研究资料:渲染层经文件对话框选取后传字节;逐文件结果 */
+  importResearchDocuments(files: Array<{ name: string; bytes: Uint8Array }>): Promise<ResearchSourceOutcomeView[]>
   // mail
   mail: MailApi
   subscribeMail: MailSubscribe
@@ -381,3 +449,4 @@ export interface RendererApi {
 
 export type { Analysis, BackupFile, CalendarEvent, ChatMessage, ConfirmResult, Conversation, Course, CourseOverride, CourseOccurrence, DayAgenda, EventInput, Material, ModelProtocol, ModelSwitchNotice, PendingImport, PendingItem, ProfileFact, ProviderInfo, ProviderInput, ProviderTestResult, ReminderNotice, SchoolEvent, Semester, Todo, TodoInput }
 export type { AgentRunView, AgentRunEventPayload, AgentRunFinishedPayload, AgentRunEventsResult, TraceEvent } from './agent'
+export type { ResearchReportResponse, ResearchReportSection, ResearchReportClaim, ResearchReportCitation, ResearchReportSource, ResearchUnansweredSubquestion } from './researchReport'

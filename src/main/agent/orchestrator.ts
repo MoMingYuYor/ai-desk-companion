@@ -40,6 +40,11 @@ export interface OrchestratorDeps {
   /** 结构化补全;缺省时规划以 MODEL_UNAVAILABLE 失败(生产接线见 A-05) */
   completer?: StructuredCompleter
   clock?: Clock
+  /**
+   * R-06 收口:队列接力钩子——Ops 收尾驱动下一个排队运行时,
+   * 若下一个是其他 mode(如 research)则转交组合层,避免用 Ops 规划路径误驱。
+   */
+  onNonOpsQueued?: (runId: string) => void
 }
 
 export interface StartRunInput {
@@ -55,6 +60,14 @@ export interface AnswerItem {
 
 export class RunOrchestrator {
   constructor(private readonly deps: OrchestratorDeps) {}
+
+  /**
+   * R-06 收口:组合层在两套工作流都构造完成后注入接力钩子
+   * (构造期互相引用,构造后再注入比在 deps 里传更简单)。
+   */
+  setOnNonOpsQueued(hook: (runId: string) => void): void {
+    this.deps.onNonOpsQueued = hook
+  }
 
   /** 创建运行:只落库排队,立即返回;规划异步驱动 */
   startRun(input: StartRunInput): AgentRunRecord {
@@ -112,6 +125,11 @@ export class RunOrchestrator {
   async drivePlanning(runId: string, answers?: AnswerItem[]): Promise<void> {
     const run = getRun(this.deps.db, runId)
     if (!run || run.status !== 'queued') return
+    // R-06 收口:研究运行由 ResearchWorkflow 驱动,不走 Ops 规划路径
+    if (run.mode !== 'personal_ops') {
+      this.deps.onNonOpsQueued?.(runId)
+      return
+    }
 
     if (!this.deps.queue.tryStart(runId)) {
       // 执行权被占:保持排队,由当前运行的收尾驱动下一个
@@ -236,11 +254,15 @@ export class RunOrchestrator {
 
   private driveNextQueued(): void {
     const next = this.deps.queue.nextQueued()
-    if (next) {
-      void this.drivePlanning(next.runId).catch((err: unknown) => {
-        console.error('[orchestrator] 后续运行驱动异常:', err instanceof Error ? err.message : String(err))
-      })
+    if (!next) return
+    // R-06 收口:接力按 mode 分发——研究运行转交组合层钩子
+    if (next.mode !== 'personal_ops') {
+      this.deps.onNonOpsQueued?.(next.runId)
+      return
     }
+    void this.drivePlanning(next.runId).catch((err: unknown) => {
+      console.error('[orchestrator] 后续运行驱动异常:', err instanceof Error ? err.message : String(err))
+    })
   }
 
   /**

@@ -9,13 +9,14 @@ import { TimetablePage } from './pages/TimetablePage'
 import { ProfilePage } from './pages/ProfilePage'
 import { SettingsPage } from './pages/SettingsPage'
 import { AgentPage } from './pages/AgentPage'
+import { ResearchPage } from './pages/ResearchPage'
 import { EvalsPage } from './pages/EvalsPage'
 import { MailPage } from './mail/MailPage'
 import { TopBar } from './TopBar'
 import { useSubscribe } from '../shared/util'
 import type { PendingItem, Todo } from '../../shared/types'
 
-type PageName = 'overview' | 'chat' | 'agent' | 'evals' | 'mail' | 'calendar' | 'todos' | 'pending' | 'timetable' | 'profile' | 'settings'
+type PageName = 'overview' | 'chat' | 'agent' | 'research' | 'evals' | 'mail' | 'calendar' | 'todos' | 'pending' | 'timetable' | 'profile' | 'settings'
 
 interface NavItem {
   key: PageName
@@ -31,6 +32,7 @@ const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
       { key: 'overview', icon: '🏠', label: '今日概览' },
       { key: 'chat', icon: '💬', label: 'AI 工作台' },
       { key: 'agent', icon: '🤖', label: '事务 Agent' },
+      { key: 'research', icon: '🔎', label: '研究' },
       { key: 'evals', icon: '📊', label: '评测' },
       { key: 'mail', icon: '📧', label: '邮箱' },
       { key: 'calendar', icon: '📅', label: '日历' },
@@ -190,6 +192,7 @@ export default function App(): JSX.Element {
           <ChatPage refreshKey={refreshKey} petAction={petAction} locateConversationId={locateConversation} />
         )}
         {page === 'agent' && <AgentPage refreshKey={refreshKey} />}
+        {page === 'research' && <ResearchPage refreshKey={refreshKey} />}
         {page === 'evals' && <EvalsPage refreshKey={refreshKey} />}
         {page === 'mail' && (
           <MailPage

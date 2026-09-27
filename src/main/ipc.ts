@@ -83,6 +83,16 @@ import type { RunOrchestrator, AnswerItem } from './agent/orchestrator'
 import { listEvalDatasets, startEvalBatch, getEvalRunState, getEvalReport, type EvalsDeps } from './evals/api'
 import type { RunMode } from '../shared/agent'
 import { getRun, listTraceEvents, listRecentRuns, listApprovals } from './runs/repository'
+import {
+  handleResearchImportDocuments,
+  handleResearchReportGet,
+  handleResearchRunCreate,
+  handleResearchSnapshotGet,
+  type IpcResearchWorkflow,
+  type ResearchImportFilePayload,
+  type ResearchRunCreatePayload
+} from './research/api'
+import { getResearchTaskByRun, loadResearchCheckpoint } from './research/repository'
 import { buildDayAgenda } from './services/context'
 import { exportBackup } from './services/backup'
 import { decryptApiKey, encryptApiKey } from './keys'
@@ -125,6 +135,11 @@ export interface IpcDeps {
   orchestrator?: RunOrchestrator
   /** 评测(E-07):缺省时评测通道不可用 */
   evals?: EvalsDeps
+  /**
+   * 研究工作流(R-04,最小结构接口;实现在 research/workflow.ts)。
+   * 缺省时研究运行仍创建落库,但启动驱动报明确错误——由主代理在 R-04 分支合并后注入。
+   */
+  researchWorkflow?: IpcResearchWorkflow
 }
 
 let depsRef: IpcDeps | null = null
@@ -202,7 +217,10 @@ const WRITE_CHANNELS: ReadonlySet<string> = new Set([
   Channels.AgentRunCreate,
   Channels.AgentRunAnswers,
   Channels.AgentRunCancel,
-  Channels.AgentApprovalDecide
+  Channels.AgentApprovalDecide,
+  // 研究(R-06):创建/导入为修改型通道;报告与快照读取为只读
+  Channels.ResearchRunCreate,
+  Channels.ResearchImportDocuments
 ])
 
 /** IPC 失败日志与错误透传:只含通道、错误分类、操作 ID 与面向用户的消息(脱敏,不含参数/正文/凭据) */
@@ -247,6 +265,27 @@ async function writeMutation<T>(db: SqliteDb, deps: IpcDeps, command: string, pa
 
 function writeNotify<T>(db: SqliteDb, deps: IpcDeps, command: string, payload: unknown, apply: () => T): Promise<T> {
   return writeMutation(db, deps, command, payload, apply).then((value) => notifyChange(value))
+}
+
+/**
+ * R-06 收口:Agent 公共通道按 run.mode 路由——研究运行是 AgentRun,
+ * 但澄清/取消语义归 ResearchWorkflow(Ops 的 acceptAnswers/drivePlanning
+ * 语义不适用于研究;mode 判断以 research_tasks 行存在为准)。
+ */
+function isResearchRun(db: SqliteDb, runId: string): boolean {
+  return getResearchTaskByRun(db, runId) !== null
+}
+
+/** 读取研究运行当前待回答的澄清题组 ID(必须在 awaiting_input 状态下调用) */
+function answersOfResearchRun(db: SqliteDb, runId: string): { questionSetId: string } {
+  const task = getResearchTaskByRun(db, runId)
+  if (!task) throw new OperationError(appError('TARGET_UNAVAILABLE', `研究运行不存在:${runId}`, { retryable: false }))
+  const ckpt = loadResearchCheckpoint(db, task.researchTaskId) as { clarifications?: { questionSetId?: string } } | null
+  const questionSetId = ckpt?.clarifications?.questionSetId
+  if (typeof questionSetId !== 'string' || questionSetId === '') {
+    throw new OperationError(appError('CONFLICT', '[STALE_QUESTION_SET] 运行没有待回答的澄清题组', { retryable: false }))
+  }
+  return { questionSetId }
 }
 
 export function registerIpcHandlers(deps: IpcDeps): void {
@@ -345,6 +384,23 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     return { runId: run.runId, status: run.status }
   })
   handle(Channels.AgentRunAnswers, (runId: string, answers: AnswerItem[]) => {
+    // R-06:研究运行的澄清走 ResearchWorkflow 通道(答案只填约束槽位,不重新规划);
+    // 形态适配:渲染层 AnswerItem[] → workflow 的 {question_set_id, answers}。
+    if (isResearchRun(db, runId)) {
+      if (!deps.researchWorkflow) {
+        throw new OperationError(appError('MODEL_UNAVAILABLE', '研究工作流未接线', { retryable: false }))
+      }
+      const set = answersOfResearchRun(db, runId)
+      deps.researchWorkflow.acceptAnswers(runId, {
+        question_set_id: set.questionSetId,
+        answers: answers.map((a) => ({ question_id: a.questionId, value: a.answer }))
+      })
+      void Promise.resolve(deps.researchWorkflow.startDriver(runId)).catch((err: unknown) => {
+        console.error('[research] 澄清驱动异常:', err instanceof Error ? err.message : String(err))
+      })
+      const run = getRun(db, runId)!
+      return { runId: run.runId, status: run.status }
+    }
     if (!deps.orchestrator) {
       throw new OperationError(appError('MODEL_UNAVAILABLE', 'Agent 编排器未接线', { retryable: false }))
     }
@@ -355,6 +411,13 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     return { runId: run.runId, status: run.status }
   })
   handle(Channels.AgentRunCancel, (runId: string) => {
+    // R-06:研究运行的取消走协作取消(终态幂等,取消不伪装 partial)。
+    if (isResearchRun(db, runId)) {
+      if (!deps.researchWorkflow) {
+        throw new OperationError(appError('MODEL_UNAVAILABLE', '研究工作流未接线', { retryable: false }))
+      }
+      return deps.researchWorkflow.cancel(runId)
+    }
     if (!deps.orchestrator) {
       throw new OperationError(appError('MODEL_UNAVAILABLE', 'Agent 编排器未接线', { retryable: false }))
     }
@@ -384,6 +447,23 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     if (!deps.evals) throw new OperationError(appError('MODEL_UNAVAILABLE', '评测未接线', { retryable: false }))
     return getEvalReport(deps.evals.evalsRoot, evalRunId)
   })
+
+  // ---- research(R-06):API 语义经 IPC(错误码代替 HTTP 状态码) ----
+  // 创建:幂等键 operationId(走 R-01 createResearchRun 的幂等回执);
+  // 202 语义——校验冻结成功即返回 queued,执行由 R-04 工作流异步驱动。
+  handle(Channels.ResearchRunCreate, (payload: ResearchRunCreatePayload) =>
+    handleResearchRunCreate(db, deps.researchWorkflow, payload)
+  )
+  // 报告读取:省略 version 取最大版本;REPORT_NOT_READY/REPORT_VERSION_NOT_FOUND 以错误码前缀抛出
+  handle(Channels.ResearchReportGet, (runId: string, version?: number) =>
+    handleResearchReportGet(db, runId, version)
+  )
+  // 证据抽屉:按 document_id 读取授权快照(不暴露任意路径)
+  handle(Channels.ResearchSnapshotGet, (snapshotId: string) => handleResearchSnapshotGet(db, snapshotId))
+  // 资料导入:渲染层经文件对话框选取后传字节;逐文件结果
+  handle(Channels.ResearchImportDocuments, (files: ResearchImportFilePayload[]) =>
+    handleResearchImportDocuments(db, files)
+  )
 
   // ---- providers ----
   handle(Channels.ProvidersList, (): ProviderInfo[] => listProviders(db))

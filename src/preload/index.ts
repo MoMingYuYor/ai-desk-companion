@@ -190,6 +190,12 @@ const api: RendererApi = {
   getEvalRun: invoke(Channels.EvalGetRun),
   getEvalReport: invoke(Channels.EvalGetReport),
 
+  // research(R-06):薄 invoke 包装;错误码与幂等语义在主进程 handler 实现
+  createResearchRun: invoke(Channels.ResearchRunCreate),
+  getResearchReport: invoke(Channels.ResearchReportGet),
+  getResearchSnapshot: invoke(Channels.ResearchSnapshotGet),
+  importResearchDocuments: invoke(Channels.ResearchImportDocuments),
+
   on: (channel, listener) => {
     if (!channel.startsWith(EVENT_CHANNEL_PREFIX)) {
       throw new Error(`不允许订阅通道:${String(channel)}`)

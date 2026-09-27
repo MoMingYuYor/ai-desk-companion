@@ -28,6 +28,7 @@ import { ToolGateway } from './tools/gateway'
 import { registerOpsTools } from './tools/definitions'
 import { seedDemoData } from './agent/seed'
 import { recoverInterruptedRuns } from './agent/recovery'
+import { ResearchWorkflow } from './research/workflow'
 import { createTray, destroyTray } from './tray'
 import { markPetBubble, markPetState } from './petBridge'
 import { createPetActivityRegistry } from './pet/activity'
@@ -200,7 +201,43 @@ function bootstrap(): void {
       completer: new ModelCompleter({ db, router })
     })
 
-    registerIpcHandlers({ db, engine, router, reminders, petActivity, mail, persistCoordinator, agentEvents, orchestrator })
+    // R-06:研究工作流与 Ops 编排器共享同一 RunQueue(单执行权);
+    // 两条链收尾后把执行权交还:研究→Ops 经 onNonResearchQueued,
+    // Ops→研究经 onNonOpsQueued(组合层互相转交,避免用对方规划路径误驱)。
+    const researchWorkflow = new ResearchWorkflow({
+      db,
+      queue: agentQueue,
+      completer: new ModelCompleter({ db, router }),
+      events: agentEvents,
+      onNonResearchQueued: (runId) => {
+        void orchestrator.drivePlanning(runId).catch((err: unknown) => {
+          console.error('[research] Ops 接力驱动异常:', err instanceof Error ? err.message : String(err))
+        })
+      }
+    })
+    orchestrator.setOnNonOpsQueued((runId) => {
+      void researchWorkflow.driveResearch(runId).catch((err: unknown) => {
+        console.error('[agent] 研究接力驱动异常:', err instanceof Error ? err.message : String(err))
+      })
+    })
+
+    registerIpcHandlers({
+      db,
+      engine,
+      router,
+      reminders,
+      petActivity,
+      mail,
+      persistCoordinator,
+      agentEvents,
+      orchestrator,
+      // IpcResearchWorkflow 适配:创建路径由 api.ts 自己落库,这里只出驱动方法
+      researchWorkflow: {
+        startDriver: (runId) => void researchWorkflow.driveResearch(runId),
+        acceptAnswers: (runId, answers) => researchWorkflow.acceptResearchAnswers(runId, answers as never),
+        cancel: (runId) => researchWorkflow.requestCancel(runId)
+      }
+    })
     setDataChangedListener(() => {
       broadcastToAll('evt:data-changed', { at: Date.now() })
     })
