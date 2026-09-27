@@ -22,6 +22,7 @@ import { migrateM2, rollbackM2 } from './m2'
 import { migrateM3, rollbackM3 } from './m3'
 import { migrateM4, rollbackM4 } from './m4'
 import { migrateM5, rollbackM5 } from './m5'
+import { migrateM6, rollbackM6 } from './m6'
 import { nowTimestamp } from '../../../shared/dateUtils'
 
 export interface Migration {
@@ -197,6 +198,18 @@ const V8_RESEARCH: Migration = {
   }
 }
 
+/** v9(R-02):检索文档表补研究侧来源元数据与定位列(source_identity 等) */
+const V9_RESEARCH_SOURCE: Migration = {
+  version: 9,
+  name: 'research_source_metadata',
+  up: (db) => {
+    migrateM6(db)
+  },
+  down: (db) => {
+    rollbackM6(db)
+  }
+}
+
 export const MIGRATIONS: readonly Migration[] = [
   V1_BASE,
   V2_MAIL,
@@ -205,7 +218,8 @@ export const MIGRATIONS: readonly Migration[] = [
   V5_AGENT_RUNS,
   V6_RETRIEVAL,
   V7_PERSONAL_OPS,
-  V8_RESEARCH
+  V8_RESEARCH,
+  V9_RESEARCH_SOURCE
 ]
 
 /** 注册表支持的最高版本 */

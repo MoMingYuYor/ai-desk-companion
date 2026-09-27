@@ -1,0 +1,111 @@
+{
+  "note": "R-02 规范化 golden 样例:输入字节在仓库内;normalized_text 为期望规范化全文(码点串),anchors 为 offset 标定点(码点索引,左闭右开,必须恰好命中一处)。重放契约:JSON=normalizePlainText(projectJsonSource(整文件));CSV=normalizePlainText(表头+数据行列序展平);md/txt=decodeBytes+normalizePlainText。",
+  "normalization_version": 1,
+  "entries": [
+    {
+      "file": "bom_crlf.txt",
+      "raw_sha256": "6111788b85c955792cdeeccc05203eb0f5812aa22d2ec9b32a5a78d3e05bb726",
+      "text_sha256": "85c2930b51f7e2a820e11e68a1e8723b8bd393e0c335eb01877a58285424039e",
+      "code_points": 32,
+      "normalized_text": "样例岗位数据标注实习（西安）\n\n要求：熟练使用 Python。\n",
+      "anchors": [
+        {
+          "quote": "要求：熟练使用 Python。",
+          "start_offset": 16,
+          "end_offset": 31,
+          "occurrences": 1
+        },
+        {
+          "quote": "样例岗位数据标注实习（西安）",
+          "start_offset": 0,
+          "end_offset": 14,
+          "occurrences": 1
+        }
+      ]
+    },
+    {
+      "file": "nfd_combining.txt",
+      "raw_sha256": "7172badc8e819aa28260a1e4b8f3833bf14eefbedd2923823796119a9617f04d",
+      "text_sha256": "2c397bb5f46184145e45cda55cab585360043fc334f8e770e3fa7c0272cbc2b2",
+      "code_points": 36,
+      "normalized_text": "样例岗位咖啡师(成都)\n\n要求:掌握 café 拉花与手冲;周末出勤。\n",
+      "anchors": [
+        {
+          "quote": "café 拉花与手冲",
+          "start_offset": 19,
+          "end_offset": 29,
+          "occurrences": 1
+        },
+        {
+          "quote": "周末出勤。",
+          "start_offset": 30,
+          "end_offset": 35,
+          "occurrences": 1
+        }
+      ]
+    },
+    {
+      "file": "emoji.txt",
+      "raw_sha256": "a5da9544267ad0fb9694d00b8f7f46c247ce3a9032e2f48785a93ccd18393288",
+      "text_sha256": "a5da9544267ad0fb9694d00b8f7f46c247ce3a9032e2f48785a93ccd18393288",
+      "code_points": 35,
+      "normalized_text": "样例岗位客服实习生(线上)\n\n要求:沟通顺畅 🙌 每周提交周报 📊。\n",
+      "anchors": [
+        {
+          "quote": "沟通顺畅 🙌 每周提交周报 📊。",
+          "start_offset": 18,
+          "end_offset": 34,
+          "occurrences": 1
+        },
+        {
+          "quote": "每周提交周报 📊。",
+          "start_offset": 25,
+          "end_offset": 34,
+          "occurrences": 1
+        }
+      ]
+    },
+    {
+      "file": "projected.json",
+      "raw_sha256": "c078fccfd71355c2d0562eddfe842f7a83661aec01a2c359b2350473487b148d",
+      "text_sha256": "fcb0fce87b8183868b0da7299918b14a271e1a8a4d925e7cd466b89961e85050",
+      "code_points": 122,
+      "normalized_text": "样例岗位 运营中心\n负责样例岗位的数据整理。\n要求:会用表格函数。\n\n武汉\n2026-09-01\nhttps://careers.example.invalid/jobs/normalization-json\n样例\n办公\n样例岗位数据整理实习生",
+      "anchors": [
+        {
+          "quote": "负责样例岗位的数据整理。",
+          "start_offset": 10,
+          "end_offset": 22,
+          "occurrences": 1
+        },
+        {
+          "quote": "2026-09-01",
+          "start_offset": 38,
+          "end_offset": 48,
+          "occurrences": 1
+        }
+      ]
+    },
+    {
+      "file": "projected.csv",
+      "raw_sha256": "65da9d14c6c3f813cc7b415016a2fe9a1c1fb0adac40f65dab78927134d33639",
+      "text_sha256": "94072b6bc17ada9b3d353288db426b7ab5cd47623052efb6e6788522906f84d8",
+      "code_points": 160,
+      "normalized_text": "title\ncompany\nlocation\ndescription\nsource_url\npublished_at\n样例岗位仓储实习生\n样例岗位 物流部\n郑州\n负责出入库扫描,要求细心。\nhttps://careers.example.invalid/jobs/normalization-csv\n2026-09-02",
+      "anchors": [
+        {
+          "quote": "负责出入库扫描,要求细心。",
+          "start_offset": 81,
+          "end_offset": 94,
+          "occurrences": 1
+        },
+        {
+          "quote": "样例岗位 物流部",
+          "start_offset": 69,
+          "end_offset": 77,
+          "occurrences": 1
+        }
+      ]
+    }
+  ]
+}

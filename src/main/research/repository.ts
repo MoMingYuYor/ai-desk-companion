@@ -351,11 +351,23 @@ export function createResearchRun(db: SqliteDb, input: CreateResearchRunInput, o
     () => {
       const request = parseResearchRequest(input.request)
 
-      // 冻结清单:快照必须已导入(SourceSnapshot 即 retrieval_documents,m3 共享表)
+      // 冻结清单:快照必须已导入(SourceSnapshot 即 retrieval_documents,m3 共享表;
+      // v9 起补研究侧来源列——source_identity/provenance_group_id/collection_time_basis)
       const entries: SnapshotManifestEntry[] = []
       for (const snapshotId of request.snapshot_ids) {
-        const doc = db.get<{ document_id: string; source_name: string; source_type: string; raw_sha256: string; text_sha256: string }>(
-          'SELECT document_id, source_name, source_type, raw_sha256, text_sha256 FROM retrieval_documents WHERE document_id = ?',
+        const doc = db.get<{
+          document_id: string
+          source_name: string
+          source_type: string
+          raw_sha256: string
+          text_sha256: string
+          source_identity: string | null
+          provenance_group_id: string | null
+          collection_time_basis: string | null
+        }>(
+          `SELECT document_id, source_name, source_type, raw_sha256, text_sha256,
+                  source_identity, provenance_group_id, collection_time_basis
+           FROM retrieval_documents WHERE document_id = ?`,
           [snapshotId]
         )
         if (!doc) {
@@ -366,7 +378,13 @@ export function createResearchRun(db: SqliteDb, input: CreateResearchRunInput, o
           text_sha256: doc.text_sha256,
           raw_sha256: doc.raw_sha256,
           source_type: doc.source_type,
-          source_name: doc.source_name
+          source_name: doc.source_name,
+          source_identity: doc.source_identity ?? undefined,
+          provenance_group_id: doc.provenance_group_id ?? undefined,
+          collection_time_basis:
+            doc.collection_time_basis === 'imported' || doc.collection_time_basis === 'source'
+              ? doc.collection_time_basis
+              : undefined
         })
       }
       const manifest: SnapshotManifest = {
@@ -455,8 +473,10 @@ export function getSnapshotManifest(db: SqliteDb, manifestId: string): SnapshotM
 }
 
 /**
- * 清单复核:逐个快照核对存在性与 text_sha256 是否仍与冻结时一致。
- * 不一致说明快照在运行创建后被改动(损坏或被替换),抛 CONFLICT(SNAPSHOT_HASH_MISMATCH)。
+ * 清单复核:逐个快照核对存在性、双 hash(text/raw)及 R-02 来源元数据
+ * (source_identity/provenance_group_id/collection_time_basis)是否与冻结时一致。
+ * 任一项不一致说明快照在运行创建后被改动(损坏或被替换),抛 CONFLICT(SNAPSHOT_HASH_MISMATCH)。
+ * 旧清单(无扩展字段)只核对双 hash,视为导入路径未知。
  */
 export function verifySnapshotManifest(db: SqliteDb, manifestId: string): SnapshotManifest {
   const manifest = getSnapshotManifest(db, manifestId)
@@ -464,15 +484,35 @@ export function verifySnapshotManifest(db: SqliteDb, manifestId: string): Snapsh
     throw new OperationError(appError('TARGET_UNAVAILABLE', `快照清单不存在:${manifestId}`, { retryable: false }))
   }
   for (const entry of manifest.entries) {
-    const doc = db.get<{ text_sha256: string }>(
-      'SELECT text_sha256 FROM retrieval_documents WHERE document_id = ?',
+    const doc = db.get<{
+      raw_sha256: string
+      text_sha256: string
+      source_identity: string | null
+      provenance_group_id: string | null
+      collection_time_basis: string | null
+    }>(
+      `SELECT raw_sha256, text_sha256, source_identity, provenance_group_id, collection_time_basis
+       FROM retrieval_documents WHERE document_id = ?`,
       [entry.snapshot_id]
     )
     if (!doc) {
       throw researchFailure('CONFLICT', 'SNAPSHOT_HASH_MISMATCH', `快照已不存在:${entry.snapshot_id}`)
     }
-    if (doc.text_sha256 !== entry.text_sha256) {
-      throw researchFailure('CONFLICT', 'SNAPSHOT_HASH_MISMATCH', `快照文本 hash 与冻结清单不一致:${entry.snapshot_id}`)
+    if (doc.text_sha256 !== entry.text_sha256 || doc.raw_sha256 !== entry.raw_sha256) {
+      throw researchFailure('CONFLICT', 'SNAPSHOT_HASH_MISMATCH', `快照 hash 与冻结清单不一致:${entry.snapshot_id}`)
+    }
+    // R-02 扩展字段仅在该条目冻结过时才复核(旧清单条目没有这些键)
+    if (entry.source_identity !== undefined && doc.source_identity !== entry.source_identity) {
+      throw researchFailure('CONFLICT', 'SNAPSHOT_HASH_MISMATCH', `快照 source_identity 与冻结清单不一致:${entry.snapshot_id}`)
+    }
+    if (entry.provenance_group_id !== undefined && doc.provenance_group_id !== entry.provenance_group_id) {
+      throw researchFailure('CONFLICT', 'SNAPSHOT_HASH_MISMATCH', `快照 provenance_group_id 与冻结清单不一致:${entry.snapshot_id}`)
+    }
+    if (
+      entry.collection_time_basis !== undefined &&
+      doc.collection_time_basis !== entry.collection_time_basis
+    ) {
+      throw researchFailure('CONFLICT', 'SNAPSHOT_HASH_MISMATCH', `快照采集时间依据与冻结清单不一致:${entry.snapshot_id}`)
     }
   }
   return manifest

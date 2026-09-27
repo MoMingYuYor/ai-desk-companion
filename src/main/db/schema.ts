@@ -3,6 +3,7 @@
 // v6(C-05):检索文档、分块与 FTS4 索引。
 // v7(A-01/A-04):邮件草稿表;审批记录补参数持久化列。
 // v8(R-01):研究领域表(任务、子问题、证据、结论、引用、报告、快照清单)。
+// v9(R-02):检索文档表补研究侧来源元数据与定位列(source_identity/provenance_group_id 等)。
 // 版本号由集成负责人按合入顺序唯一分配;迁移路径见 src/main/db/migrations/registry.ts。
 import { AGENT_RUNS_SQL, APPROVALS_SQL, TRACE_EVENTS_SQL } from './migrations/m2'
 import {
@@ -20,8 +21,9 @@ import {
   RESEARCH_SUBQUESTIONS_SQL,
   RESEARCH_TASKS_SQL
 } from './migrations/m5'
+import { RESEARCH_SOURCE_COLUMNS_SQL } from './migrations/m6'
 
-export const SCHEMA_VERSION = 8
+export const SCHEMA_VERSION = 9
 
 const BASE_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -214,6 +216,7 @@ CREATE TABLE IF NOT EXISTS operation_receipts (
 // v6(C-05):检索文档、分块与 FTS4 外部内容索引。
 // v7(A-01):邮件草稿表(approvals.arguments_json 的追加由 m4 对旧库执行)。
 // v8(R-01):研究领域表。
+// v9(R-02):检索文档表的研究侧来源列(与迁移共用同一 ALTER 定义,避免两处漂移)。
 // DDL 与迁移共用同一份定义,避免"当前库形状"与"迁移脚本"两处漂移。
 export const SCHEMA_SQL =
   BASE_SCHEMA_SQL + AGENT_RUNS_SQL + TRACE_EVENTS_SQL + APPROVALS_SQL +
@@ -221,4 +224,5 @@ export const SCHEMA_SQL =
   MAIL_DRAFTS_SQL +
   RESEARCH_SNAPSHOT_MANIFESTS_SQL + RESEARCH_TASKS_SQL + RESEARCH_SUBQUESTIONS_SQL +
   RESEARCH_EVIDENCE_SPANS_SQL + RESEARCH_CLAIMS_SQL + RESEARCH_CITATIONS_SQL +
-  RESEARCH_REPORTS_SQL
+  RESEARCH_REPORTS_SQL +
+  RESEARCH_SOURCE_COLUMNS_SQL

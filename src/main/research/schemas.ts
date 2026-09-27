@@ -166,13 +166,22 @@ export function isReportState(value: unknown): value is ReportState {
 
 // ---------- 领域实体类型(持久化形态;规格第 5 节字段清单) ----------
 
-/** 冻结清单条目:有序快照 ID/hash 与来源元数据 */
+/**
+ * 冻结清单条目:有序快照 ID/hash 与来源元数据(R-02 扩展)。
+ * 扩展字段是清单复核的一部分:任何一项与当前库不一致都判 SNAPSHOT_HASH_MISMATCH。
+ * 旧清单(无扩展字段)兼容:复核时把旧条目视为"导入路径未知",仅核对双 hash。
+ */
 export interface SnapshotManifestEntry {
   snapshot_id: string
   text_sha256: string
   raw_sha256: string
   source_type: string
   source_name: string
+  /** 来源稳定身份(R-02):与 provenance_group_id 一起冻结,供分组审计 */
+  source_identity?: string
+  provenance_group_id?: string
+  /** 采集时间依据:imported=未知用导入时间;source=调用方提供 */
+  collection_time_basis?: 'imported' | 'source'
 }
 
 export interface SnapshotManifest {

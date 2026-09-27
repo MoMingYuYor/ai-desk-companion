@@ -134,6 +134,12 @@ const RETRIEVAL_DOCUMENTS: BackupColumnSpec[] = [
   t('document_id'), t('source_name'), t('source_type'), t('raw_sha256'), t('text_sha256'),
   t('normalized_text'), i('size_bytes'), t('created_at')
 ]
+// v9(R-02):研究侧来源元数据与定位列(全部可空;v8 及更早备份没有它们)。
+const RETRIEVAL_DOCUMENTS_V9: BackupColumnSpec[] = [
+  ...RETRIEVAL_DOCUMENTS,
+  t('source_identity', true), t('provenance_group_id', true), t('source_locator', true),
+  t('source_metadata_json', true), t('collection_time_basis', true)
+]
 const RETRIEVAL_CHUNKS: BackupColumnSpec[] = [
   t('chunk_id'), t('document_id'), i('chunk_index'), i('start_offset'), i('end_offset'),
   t('content'), t('search_text'), i('search_version')
@@ -288,13 +294,30 @@ const V7_TABLES = buildTables([
 
 const V8_TABLES = buildTables([
   ['conversations', CONVERSATIONS], ['messages', MESSAGES], ['materials', MATERIALS],
-  ['analyses', ANALYSES], ['events', EVENTS_V4], ['todos', TODOS_V4], ['pending_items', PENDING_V4],
+  ['events', EVENTS_V4], ['todos', TODOS_V4], ['pending_items', PENDING_V4],
   ['semesters', SEMESTERS], ['courses', COURSES], ['course_overrides', COURSE_OVERRIDES],
   ['school_events', SCHOOL_EVENTS], ['profile_facts', PROFILE_FACTS],
   ['mail_analysis_links', MAIL_ANALYSIS_LINKS], ['mail_analysis_versions', MAIL_ANALYSIS_VERSIONS],
   ['mail_confirmations', MAIL_CONFIRMATIONS], ['operation_receipts', OPERATION_RECEIPTS],
   ['agent_runs', AGENT_RUNS], ['trace_events', TRACE_EVENTS], ['approvals', APPROVALS],
   ['retrieval_documents', RETRIEVAL_DOCUMENTS], ['retrieval_chunks', RETRIEVAL_CHUNKS],
+  ['mail_drafts', MAIL_DRAFTS],
+  ['research_snapshot_manifests', RESEARCH_SNAPSHOT_MANIFESTS], ['research_tasks', RESEARCH_TASKS],
+  ['research_subquestions', RESEARCH_SUBQUESTIONS], ['research_evidence_spans', RESEARCH_EVIDENCE_SPANS],
+  ['research_claims', RESEARCH_CLAIMS], ['research_citations', RESEARCH_CITATIONS],
+  ['research_reports', RESEARCH_REPORTS]
+])
+
+/** v9(R-02):研究侧来源列追加到检索文档表;其余表与 v8 相同 */
+const V9_TABLES = buildTables([
+  ['conversations', CONVERSATIONS], ['messages', MESSAGES], ['materials', MATERIALS],
+  ['analyses', ANALYSES], ['events', EVENTS_V4], ['todos', TODOS_V4], ['pending_items', PENDING_V4],
+  ['semesters', SEMESTERS], ['courses', COURSES], ['course_overrides', COURSE_OVERRIDES],
+  ['school_events', SCHOOL_EVENTS], ['profile_facts', PROFILE_FACTS],
+  ['mail_analysis_links', MAIL_ANALYSIS_LINKS], ['mail_analysis_versions', MAIL_ANALYSIS_VERSIONS],
+  ['mail_confirmations', MAIL_CONFIRMATIONS], ['operation_receipts', OPERATION_RECEIPTS],
+  ['agent_runs', AGENT_RUNS], ['trace_events', TRACE_EVENTS], ['approvals', APPROVALS],
+  ['retrieval_documents', RETRIEVAL_DOCUMENTS_V9], ['retrieval_chunks', RETRIEVAL_CHUNKS],
   ['mail_drafts', MAIL_DRAFTS],
   ['research_snapshot_manifests', RESEARCH_SNAPSHOT_MANIFESTS], ['research_tasks', RESEARCH_TASKS],
   ['research_subquestions', RESEARCH_SUBQUESTIONS], ['research_evidence_spans', RESEARCH_EVIDENCE_SPANS],
@@ -324,7 +347,8 @@ const VERSION_SPECS: Readonly<Record<number, BackupVersionSpec>> = {
   5: { version: 5, requiredTables: Object.keys(V5_TABLES), tables: V5_TABLES, references: BUSINESS_REFERENCES },
   6: { version: 6, requiredTables: Object.keys(V6_TABLES), tables: V6_TABLES, references: V6_REFERENCES },
   7: { version: 7, requiredTables: Object.keys(V7_TABLES), tables: V7_TABLES, references: V6_REFERENCES },
-  8: { version: 8, requiredTables: Object.keys(V8_TABLES), tables: V8_TABLES, references: V8_REFERENCES }
+  8: { version: 8, requiredTables: Object.keys(V8_TABLES), tables: V8_TABLES, references: V8_REFERENCES },
+  9: { version: 9, requiredTables: Object.keys(V9_TABLES), tables: V9_TABLES, references: V8_REFERENCES }
 }
 
 /** 取指定备份版本的规格;未登记版本(未来/未知)拒绝 */
