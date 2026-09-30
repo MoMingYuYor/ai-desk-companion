@@ -42,6 +42,23 @@ jobs:
       - name: Build
         run: npm run build
 
+      # PKG-01:生成构建信息并校验产物与只读数据资源完整性(缺失即失败);
+      # build-info 与检查日志作为 workflow artifact 留存,便于分发记录溯源
+      - name: Write build info
+        run: node scripts/write-build-info.mjs
+
+      - name: Check build artifacts and resources
+        run: node scripts/check-build.mjs 2>&1 | tee check-build.log
+
+      - name: Upload build info and check log
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-info-${{ github.sha }}
+          path: |
+            artifacts/build/build-info.json
+            check-build.log
+          if-no-files-found: error
+
       # Node 基准只留数据,不做任何 300ms/100ms 断言
       - name: Node sql.js baseline (data only)
         run: node scripts/measure-baseline.mjs --output baseline/baseline.json

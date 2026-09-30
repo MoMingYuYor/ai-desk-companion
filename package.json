@@ -31,6 +31,22 @@
       {
         "from": "node_modules/pdfjs-dist/standard_fonts",
         "to": "standard_fonts"
+      },
+      {
+        "from": "evals/datasets",
+        "to": "evals/datasets"
+      },
+      {
+        "from": "fixtures/research",
+        "to": "evals/fixtures/research"
+      },
+      {
+        "from": "evals/prompts",
+        "to": "evals/prompts"
+      },
+      {
+        "from": "artifacts/build/build-info.json",
+        "to": "build-info.json"
       }
     ],
     "win": {
@@ -63,7 +79,7 @@
     "eval:run": "node out/main/eval-cli.js run",
     "eval:report": "node out/main/eval-cli.js report",
     "gen:assets": "node scripts/gen-assets.mjs",
-    "dist": "electron-vite build && electron-builder --win"
+    "dist": "node scripts/write-build-info.mjs && electron-vite build && electron-builder --win"
   },
   "dependencies": {
     "html-to-text": "^10.0.1",
