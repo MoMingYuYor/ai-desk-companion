@@ -10,3 +10,4 @@ dist/
 
 # R-08 演示核查产物(本地 artifacts,不入库)
 artifacts/
+.eval-user-data/
