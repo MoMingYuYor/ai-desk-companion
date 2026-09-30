@@ -6,14 +6,21 @@
 //     空候选诚实不足、injection 组 1 条 forbidden_tools 断言;
 // (c) 结果记录含 run_id(traceRunId),失败案例可经其回放研究轨迹。
 // 其余 37 条以 loader 校验(parse + fixture 语料存在 + gold 结构)覆盖可运行性声明。
+//
+// EVAL-03 扩展:3 条代表 case 的可回放产物(8 文件 + manifest hash)、删除临时库后
+// 仅用产物重建时间线/报告/证据/原文定位、hash 篡改拒绝评分、gold 判分产出
+// (recall/覆盖率数字如实记录——fake 脚本的抽取是为通过构造的,属流程验证
+// 而非语义成绩;正式 holdout 支持度由 EVAL-04 人工审阅产生)。
 import { describe, expect, it } from 'vitest'
-import { mkdtempSync, existsSync, readFileSync } from 'node:fs'
+import { mkdtempSync, existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { loadDatasetFromDir } from '../../src/main/evals/dataset'
 import { EvalRunner } from '../../src/main/evals/runner'
 import type { EvalCase } from '../../src/main/evals/types'
 import { registerResearchFixtures, RESEARCH_FIXTURE_ROOT } from '../../src/main/evals/researchAdapter'
+import { CASE_ARTIFACT_FILES, caseArtifactDir, loadCaseArtifacts, verifyCaseArtifacts } from '../../src/main/evals/artifacts'
+import type { ResearchScoreResult } from '../../src/main/evals/researchRules'
 
 const ROOT = process.cwd()
 const DATA_DIR = join(ROOT, 'evals', 'datasets', 'research_v1')
@@ -29,7 +36,9 @@ function runnerFor(
     {
       artifactRoot,
       sqlJsDistDir: join(process.cwd(), 'node_modules', 'sql.js', 'dist'),
-      dataset: { ...dataset, cases } as typeof dataset
+      dataset: { ...dataset, cases } as typeof dataset,
+      // EVAL-03:gold 标注从数据集目录的 annotations/ 读取(评测判分专用)
+      datasetRoot: DATA_DIR
     },
     {
       evalRunId: `eval-research-${Math.random().toString(36).slice(2, 8)}`,
@@ -161,4 +170,140 @@ describe('R-07 集成:3 条代表性 case 端到端(fake 隔离执行)', () => {
       expect(row.runId).toBe(r.runId)
     }
   })
+})
+
+// ---------- EVAL-03:可回放产物与 gold 判分 ----------
+
+const REPRESENTATIVE = ['research-locate-001', 'research-insufficient-001', 'research-injection-001']
+
+describe('EVAL-03:3 条代表 case 产物齐全且 manifest 完整(fake 隔离执行)', () => {
+  const dataset = loadDatasetFromDir(DATA_DIR)
+  registerResearchFixtures(dataset.cases.map((c) => c.fixture_id))
+
+  it('每条 case 在 <evalRunId>/<configId>/<caseId>/<repeatIndex>/ 下产出 8 个文件', async () => {
+    const { runner, artifactRoot } = runnerFor(dataset, ['dev'], REPRESENTATIVE)
+    const state = await runner.run()
+    expect(state.status).toBe('completed')
+    for (const r of state.results) {
+      expect(r.artifactStatus).toBe('ok')
+      expect(r.artifactDir).toBe([state.evalRunId, r.configId, r.caseId, String(r.repeatIndex)].join('/'))
+      const dir = caseArtifactDir(artifactRoot, state.evalRunId, r.configId, r.caseId, r.repeatIndex)
+      for (const name of [...CASE_ARTIFACT_FILES, 'manifest.json']) {
+        expect(existsSync(join(dir, name)), `${r.caseId} 缺少 ${name}`).toBe(true)
+      }
+      const verified = verifyCaseArtifacts(dir)
+      expect(verified.ok, JSON.stringify(verified)).toBe(true)
+      expect(verified.manifest?.runId).toBe(r.runId)
+      expect(verified.manifest?.complete).toBe(true)
+      // 临时库移入批次 temporary/ 下(隔离目录随 dispose 清理,父目录保留)
+      expect(existsSync(join(artifactRoot, state.evalRunId, 'temporary'))).toBe(true)
+    }
+  }, 60_000)
+
+  it('删除临时库后仅用产物文件重建时间线、报告、证据与原文定位', async () => {
+    const { runner, artifactRoot } = runnerFor(dataset, ['dev'], ['research-locate-001'])
+    const state = await runner.run()
+    const r = state.results.find((x) => x.caseId === 'research-locate-001')!
+    expect(r.artifactStatus).toBe('ok')
+    const dir = caseArtifactDir(artifactRoot, state.evalRunId, r.configId, r.caseId, r.repeatIndex)
+
+    // 关闭后删除临时库(整批 temporary/ 一并删除,模拟批次收尾清理)
+    rmSync(join(artifactRoot, state.evalRunId, 'temporary'), { recursive: true, force: true })
+
+    // 仅用产物文件回放:hash 校验通过后逐文件读取
+    const loaded = loadCaseArtifacts(dir) // 篡改或缺失会抛 ArtifactIntegrityError
+    // 时间线:trace.jsonl 覆盖研究链各阶段(input/plan/retrieval/model/output…)
+    const eventTypes = new Set(loaded.traceEvents.map((e) => e.eventType as string))
+    expect(eventTypes.has('input')).toBe(true)
+    expect(eventTypes.has('retrieval')).toBe(true)
+    expect(eventTypes.has('output')).toBe(true)
+    // 报告:最新版本 + 结构化字段完整
+    const report = loaded.report as { report_applicable: boolean; report: { markdown: string; claims: unknown[]; citations: unknown[]; sections: unknown[] } | null }
+    expect(report.report_applicable).toBe(true)
+    expect(report.report).not.toBeNull()
+    expect(report.report!.markdown).toContain('## ')
+    expect(report.report!.claims.length).toBeGreaterThan(0)
+    // 证据:claim_type 为抽取期保存的分类(不事后改标签)
+    const evidence = loaded.evidence as { applicable: boolean; claims: Array<{ claim_type: string }>; spans: Array<{ evidence_id: string; snapshot_id: string; start_offset: number; end_offset: number; quote: string }> }
+    expect(evidence.applicable).toBe(true)
+    expect(evidence.claims[0]!.claim_type).toBe('fact')
+    // 原文定位:用产物内的规范全文按 span offset 重切片,必须与 quote 逐字一致
+    const snapshots = loaded.snapshots as { applicable: boolean; snapshots: Array<{ snapshot_id: string; normalized_text: string; text_sha256: string }> }
+    expect(snapshots.applicable).toBe(true)
+    const textById = new Map(snapshots.snapshots.map((s) => [s.snapshot_id, s.normalized_text]))
+    expect(evidence.spans.length).toBeGreaterThan(0)
+    for (const span of evidence.spans) {
+      const resliced = Array.from(textById.get(span.snapshot_id) ?? '').slice(span.start_offset, span.end_offset).join('')
+      expect(resliced).toBe(span.quote)
+    }
+  }, 60_000)
+
+  it('篡改一个产物文件:hash 校验失败且拒绝继续评分', async () => {
+    const { runner, artifactRoot } = runnerFor(dataset, ['dev'], ['research-locate-001'])
+    const state = await runner.run()
+    const r = state.results.find((x) => x.caseId === 'research-locate-001')!
+    const dir = caseArtifactDir(artifactRoot, state.evalRunId, r.configId, r.caseId, r.repeatIndex)
+    writeFileSync(join(dir, 'evidence.json'), '{"applicable": true, "tampered": true}', 'utf-8')
+    const verified = verifyCaseArtifacts(dir)
+    expect(verified.ok).toBe(false)
+    expect(verified.mismatched).toEqual(['evidence.json'])
+    expect(() => loadCaseArtifacts(dir)).toThrow(/完整性校验失败/)
+  }, 60_000)
+
+  it('gold 判分产出:结构/语义分列,locate 记录真实数字,insufficient 覆盖 N/A + 不足识别正确', async () => {
+    const { runner, artifactRoot } = runnerFor(dataset, ['dev'], REPRESENTATIVE)
+    const state = await runner.run()
+    const scoringOf = (caseId: string): ResearchScoreResult => {
+      const r = state.results.find((x) => x.caseId === caseId)!
+      expect(r.researchScoring, `${caseId} 缺少 gold 判分`).toBeTruthy()
+      return r.researchScoring as ResearchScoreResult
+    }
+
+    // gold 不得进入运行输入:run.json 的输入只有 question/snapshot_ids
+    const locate = state.results.find((x) => x.caseId === 'research-locate-001')!
+    const dirLocate = caseArtifactDir(artifactRoot, state.evalRunId, locate.configId, locate.caseId, locate.repeatIndex)
+    const runJson = JSON.stringify(loadCaseArtifacts(dirLocate).run)
+    expect(runJson).not.toContain('gold_claim')
+    expect(runJson).not.toContain('acceptable_evidence_sets')
+
+    // 单文档定位:gold 2 条 claim 全部唯一定位;引用结构 100%(冻结引用均过结构终检);
+    // recall 数字如实记录(fake 抽取按构造命中与否不构成语义成绩)
+    const locateScore = scoringOf('research-locate-001')
+    expect(locateScore.applicable).toBe(true)
+    expect(locateScore.questions).toHaveLength(2)
+    for (const q of locateScore.questions) {
+      expect(q.resolutionError).toBeNull()
+      expect(q.resolvedSnapshotIds.length).toBeGreaterThan(0)
+      expect(q.goldChunkIds.length).toBeGreaterThan(0)
+    }
+    expect(locateScore.citationStructure.total).toBeGreaterThan(0)
+    expect(locateScore.citationStructure.precision).toBe(1)
+    expect(locateScore.factCoverage.total).toBeGreaterThan(0)
+    expect(locateScore.factCoverage.value).toBe(1)
+    expect(locateScore.insufficiency).toEqual({ expected: false, recognized: false, pass: null })
+    expect(locateScore.semanticSupport).toBe('pending_human_review')
+    // 流程验证数字(非语义成绩):recall ∈ [0,1] 或 null(gold 定位失败单列)
+    if (locateScore.recallMacro !== null) {
+      expect(locateScore.recallMacro).toBeGreaterThanOrEqual(0)
+      expect(locateScore.recallMacro).toBeLessThanOrEqual(1)
+    }
+    // 实测记录(repeat 1,流程验证而非语义成绩):recallMacro = 1
+    // (gc-locate-001-1/-2 的 gold span 均唯一解析到同一真实快照,交付 chunk 与
+    // 两个 gold span 相交,交付集合命中全部 gold chunk);citationStructure
+    // 2/2(precision 1);factCoverage 2/2 = 1(两条 fact claim 各有 1 条有效
+    // supports 引用)。fake 脚本的抽取按交付 chunk 构造,以上数字只证明判分
+    // 通路,不代表模型检索/命题支持能力。
+
+    // 证据不足:gold_claims 为空 → recall N/A;零事实 claim → 覆盖 N/A;不足识别正确
+    const insuffScore = scoringOf('research-insufficient-001')
+    expect(insuffScore.applicable).toBe(true)
+    expect(insuffScore.recallMacro).toBeNull()
+    expect(insuffScore.factCoverage).toEqual({ covered: 0, total: 0, value: null })
+    expect(insuffScore.insufficiency).toEqual({ expected: true, recognized: true, pass: true })
+
+    // 提示注入:gold 判分同样产出(终态与 forbidden 断言之外的结构/语义单列)
+    const injectionScore = scoringOf('research-injection-001')
+    expect(injectionScore.applicable).toBe(true)
+    expect(injectionScore.semanticSupport).toBe('pending_human_review')
+  }, 90_000)
 })

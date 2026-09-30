@@ -24,6 +24,7 @@ import { join } from 'node:path'
 import type { SqliteDb } from '../db/connection'
 import type { StructuredCompleteRequest } from '../agent/llm'
 import { importResearchSources, type ImportedResearchSource } from '../research/snapshots'
+import type { ScopedSnapshot } from '../research/recordScope'
 import { normalizePlainText } from '../retrieval/normalize'
 import { tokenizeForSearch } from '../retrieval/tokenize'
 import { registerFixtureById, getFixtureById } from './isolation'
@@ -32,12 +33,19 @@ import type { EvalCase } from './types'
 /** 仓库内语料根目录(fixtures 与 snapshots 副本逐字节一致,读 fixtures 侧) */
 export const RESEARCH_FIXTURE_ROOT = join(process.cwd(), 'fixtures', 'research')
 
-/** 一个研究 fixture 播种后的映射信息(逻辑 snapshot_id → 真实 documentId) */
+/** 一个研究 fixture 播种后的映射信息(逻辑 snapshot_id → 真实记录) */
 export interface ResearchSeedResult {
   fixtureId: string
   /** 逻辑形态 `<fixture_id>/<file>` → 导入后的真实 snapshot_id(documentId);
-   *  多记录文件的记录共享同一逻辑 id(同文件共享整文件规范全文),收敛为一条 */
+   *  多记录文件的记录共享同一逻辑 id(同文件共享整文件规范全文),收敛为代表记录 */
   snapshotIdByLogical: Map<string, string>
+  /**
+   * EVAL-03 gold 判分映射:逻辑 snapshot_id → 该逻辑文件的全部真实记录
+   * (documentId + 记录范围 + 整文件规范全文 hash)。gold 相关 span 经
+   * resolveLogicalGoldSpan 在此映射上唯一定位到真实记录;只用于判分,
+   * 不进入运行输入。
+   */
+  recordsByLogical: Map<string, ScopedSnapshot[]>
   /** 逻辑 id → 整文件规范全文(quote/offset 计算的真实内容来源) */
   normalizedTextByLogical: Map<string, string>
   /** 全部成功导入的记录(documentId + sourceLocator + hash,评测导出可复核) */
@@ -63,6 +71,7 @@ export function seedResearchFixture(db: SqliteDb, fixtureId: string): ResearchSe
   })
   const snapshotIdByLogical = new Map<string, string>()
   const normalizedTextByLogical = new Map<string, string>()
+  const recordsByLogical = new Map<string, ScopedSnapshot[]>()
   const records: ImportedResearchSource[] = []
   for (const outcome of outcomes) {
     if (!outcome.ok) {
@@ -72,6 +81,19 @@ export function seedResearchFixture(db: SqliteDb, fixtureId: string): ResearchSe
     // 同一文件的多条记录共享整文件规范全文,收敛为一个逻辑 snapshot_id
     const logical = `${fixtureId}/${outcome.sourceName}`
     if (!snapshotIdByLogical.has(logical)) snapshotIdByLogical.set(logical, outcome.documentId)
+    // EVAL-03:每条真实记录都进入逻辑 id 的记录清单(记录范围供 gold 唯一定位)。
+    // 旧单源条目(md/txt 整文件)无导入期范围时,整文件即记录范围:
+    // [0, codePointLength),与投影同序的码点坐标系一致。
+    const scope = outcome.recordScope ?? {
+      version: 1 as const,
+      coordinateSystem: 'full-file-codepoint-v1' as const,
+      sourceLocator: outcome.sourceLocator,
+      startOffset: 0,
+      endOffset: outcome.codePointLength
+    }
+    const list = recordsByLogical.get(logical) ?? []
+    list.push({ documentId: outcome.documentId, scope, textSha256: outcome.textSha256 })
+    recordsByLogical.set(logical, list)
   }
   for (const [logical, documentId] of snapshotIdByLogical) {
     const row = db.get<{ normalized_text: string }>(
@@ -80,7 +102,7 @@ export function seedResearchFixture(db: SqliteDb, fixtureId: string): ResearchSe
     )
     normalizedTextByLogical.set(logical, row?.normalized_text ?? '')
   }
-  return { fixtureId, snapshotIdByLogical, normalizedTextByLogical, records }
+  return { fixtureId, snapshotIdByLogical, recordsByLogical, normalizedTextByLogical, records }
 }
 
 // ---------- 注册(isolation 注册表的最小适配) ----------

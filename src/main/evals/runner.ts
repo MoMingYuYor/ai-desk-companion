@@ -16,7 +16,12 @@
 //   生产 epoch 在评测前后保持不变;
 // - interaction_script 经 runner 驱动真实入口(decide/acceptAnswers),
 //   不存在"评测模式自动批准"开关;
-// - 每个案例的临时环境用后即弃。
+// - 每个案例的临时环境用后即弃;
+// - EVAL-03(F-11):隔离案例关闭前导出可回放产物到
+//   <artifactRoot>/<evalRunId>/<configId>/<caseId>/<repeatIndex>/,
+//   临时库移入该批次的 temporary/;导出失败保留临时库并标 artifact_failed,
+//   不把案例标成可回放;research case 另做 gold 判分(gold 只进入评分模块,
+//   评测输入只有 question/snapshot_ids)。
 
 import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
@@ -36,7 +41,33 @@ import { registerOpsTools } from '../tools/definitions'
 import { FakeProvider } from '../providers/fake'
 import { getRun, listTraceEvents, listApprovals, appendTraceEvent } from '../runs/repository'
 import { ResearchWorkflow } from '../research/workflow'
-import { registerResearchFixture, researchFakeScriptFor } from './researchAdapter'
+import {
+  getResearchTaskByRun,
+  getSnapshotManifest,
+  latestReport,
+  listClaims,
+  listCitationsForRun,
+  listEvidenceSpansForRun,
+  listSubQuestions
+} from '../research/repository'
+import { assembleReportResponse } from '../research/reports'
+import {
+  registerResearchFixture,
+  researchFakeScriptFor,
+  type ResearchSeedResult
+} from './researchAdapter'
+import {
+  defaultCodeVersion,
+  exportCaseArtifacts,
+  temporaryRoot,
+  type CaseArtifactPayload
+} from './artifacts'
+import {
+  loadResearchGold,
+  scoreResearchCase,
+  type ResearchScoreResult,
+  type ResearchScoringInput
+} from './researchRules'
 
 export type ExecutionKind = 'fake' | 'real'
 
@@ -73,6 +104,15 @@ export interface EvalCaseOutcome {
   durationMs?: number | null
   /** research case 的完整轨迹可经该 run_id 在评测产物内回放(R-07 最小扩展) */
   traceRunId?: string | null
+  /**
+   * EVAL-03:产物导出状态。ok = manifest 完整可回放;artifact_failed =
+   * 导出失败,临时库保留待人工复核,该案例绝不标记为可回放。
+   */
+  artifactStatus?: 'ok' | 'artifact_failed'
+  /** 产物目录(相对 artifactRoot 的批次内路径);导出失败为空 */
+  artifactDir?: string | null
+  /** EVAL-03:research gold 判分结果(仅 research case;gold 缺失时 applicable=false) */
+  researchScoring?: ResearchScoreResult | null
 }
 
 /** 领取日志:组合一旦启动即落盘,是中断检测与预算计数的依据 */
@@ -131,6 +171,12 @@ export interface RunnerDeps {
   realCompleter?: unknown
   /** 每个组合领取前调用(可 await);测试用其注入确定性取消时机 */
   beforeClaim?: BeforeClaimHook
+  /**
+   * EVAL-03:数据集根目录(research gold 标注从 <datasetRoot>/annotations 读取)。
+   * 缺省回退 process.cwd()/evals/datasets/<datasetVersion>(EvalResourcePaths
+   * 接管前的过渡形态,与 RESEARCH_FIXTURE_ROOT 同一约定)。
+   */
+  datasetRoot?: string
 }
 
 /** 状态文件损坏或不兼容:抛出可诊断错误,原文件保留,绝不静默重置 */
@@ -198,6 +244,182 @@ function fakeScriptFor(caseDef: EvalCase): Array<unknown> {
     ]
   }
   return [{ goal: caseDef.input, steps, assumptions: [], clarifications: [] }]
+}
+
+/** trace 事件按交付序收集 retrieval 的 hitChunkIds(Recall@k 的 retrieved 集合来源) */
+function retrievedChunkIdsOf(trace: ReturnType<typeof listTraceEvents>): string[] {
+  const seen = new Set<string>()
+  const ordered: string[] = []
+  for (const event of trace) {
+    if (event.eventType !== 'retrieval') continue
+    const hits = (event.payload as { hitChunkIds?: unknown } | undefined)?.hitChunkIds
+    if (!Array.isArray(hits)) continue
+    for (const id of hits) {
+      if (typeof id === 'string' && !seen.has(id)) {
+        seen.add(id)
+        ordered.push(id)
+      }
+    }
+  }
+  return ordered
+}
+
+type ResearchDb = import('../db/connection').SqliteDb
+
+/** 研究运行数据的一次性收集(gold 判分与产物导出共用;临时库关闭前调用) */
+interface ResearchRunData {
+  task: ReturnType<typeof getResearchTaskByRun>
+  claims: ReturnType<typeof listClaims>
+  citations: ReturnType<typeof listCitationsForRun>
+  spans: ReturnType<typeof listEvidenceSpansForRun>
+  subquestions: ReturnType<typeof listSubQuestions>
+  retrievedChunkIds: string[]
+  chunksBySnapshot: Map<string, Array<{ chunkId: string; startOffset: number; endOffset: number }>>
+  manifest: ReturnType<typeof getSnapshotManifest>
+}
+
+function collectResearchRunData(db: ResearchDb, runId: string): ResearchRunData {
+  const task = getResearchTaskByRun(db, runId)
+  if (!task) {
+    return {
+      task: null,
+      claims: [],
+      citations: [],
+      spans: [],
+      subquestions: [],
+      retrievedChunkIds: [],
+      chunksBySnapshot: new Map(),
+      manifest: null
+    }
+  }
+  const claims = listClaims(db, task.researchTaskId)
+  const citations = listCitationsForRun(db, runId)
+  const spans = listEvidenceSpansForRun(db, runId)
+  const subquestions = listSubQuestions(db, task.researchTaskId)
+  const manifest = getSnapshotManifest(db, task.snapshotManifestId)
+  // 冻结快照的块索引(gold span → 相交 chunk 的映射基础;RES-02 范围内分块)
+  const chunksBySnapshot = new Map<string, Array<{ chunkId: string; startOffset: number; endOffset: number }>>()
+  if (manifest) {
+    for (const entry of manifest.entries) {
+      const rows = db.all<{ chunk_id: string; start_offset: number; end_offset: number }>(
+        'SELECT chunk_id, start_offset, end_offset FROM retrieval_chunks WHERE document_id = ? ORDER BY start_offset ASC',
+        [entry.snapshot_id]
+      )
+      chunksBySnapshot.set(
+        entry.snapshot_id,
+        rows.map((r) => ({ chunkId: r.chunk_id, startOffset: r.start_offset, endOffset: r.end_offset }))
+      )
+    }
+  }
+  return {
+    task,
+    claims,
+    citations,
+    spans,
+    subquestions,
+    retrievedChunkIds: retrievedChunkIdsOf(listTraceEvents(db, runId)),
+    chunksBySnapshot,
+    manifest
+  }
+}
+
+/**
+ * research case 的 report/evidence/snapshots 产物段:内容来自研究链真实产物;
+ * 运行未创建或任务缺失时如实记录原因,不伪造研究成果。
+ */
+function researchArtifactSections(
+  env: IsolatedCaseEnv,
+  caseDef: EvalCase,
+  base: EvalCaseOutcome
+): Pick<CaseArtifactPayload, 'report' | 'evidence' | 'snapshots'> {
+  const db = env.db
+  const runId = base.runId
+  const data = runId ? collectResearchRunData(db, runId) : null
+  if (!runId || !data || !data.task) {
+    return {
+      report: { report_applicable: true, report: null, reason: '研究任务或运行未创建,无报告版本' },
+      evidence: { applicable: true, run_id: runId, question: caseDef.input, claims: [], citations: [], spans: [], subquestions: [] },
+      snapshots: { applicable: true, manifest_id: null, manifest_sha256: null, snapshots: [] }
+    }
+  }
+  const evidence = {
+    applicable: true,
+    run_id: runId,
+    question: caseDef.input,
+    claims: data.claims.map((c) => ({
+      claim_id: c.claimId,
+      text: c.text,
+      claim_type: c.claimType,
+      support_status: c.supportStatus,
+      subquestion_id: c.subquestionId,
+      conflict_group: c.conflictGroup
+    })),
+    citations: data.citations.map((r) => ({
+      citation_id: r.citation.citationId,
+      claim_id: r.claim.claimId,
+      evidence_id: r.citation.evidenceId,
+      relation: r.citation.relation
+    })),
+    spans: data.spans.map((s) => ({
+      evidence_id: s.evidenceId,
+      snapshot_id: s.snapshotId,
+      chunk_id: s.chunkId,
+      start_offset: s.startOffset,
+      end_offset: s.endOffset,
+      quote: s.quote,
+      validation_status: s.validationStatus
+    })),
+    subquestions: data.subquestions.map((s) => ({
+      subquestion_id: s.subquestionId,
+      question: s.question,
+      status: s.status,
+      insufficiency_reason: s.insufficiencyReason,
+      outcome: s.outcome
+    }))
+  }
+  // 快照清单:回放"原文定位"所需——规范全文与块索引随产物落盘,
+  // 临时库删除后仍可按 span offset 重切片并与 quote 比对
+  const snapshots = {
+    applicable: true,
+    manifest_id: data.manifest?.manifestId ?? null,
+    manifest_sha256: data.manifest?.manifestSha256 ?? null,
+    snapshots: (data.manifest?.entries ?? []).map((entry) => {
+      const row = db.get<{ normalized_text: string }>(
+        'SELECT normalized_text FROM retrieval_documents WHERE document_id = ?',
+        [entry.snapshot_id]
+      )
+      return {
+        snapshot_id: entry.snapshot_id,
+        source_name: entry.source_name,
+        source_type: entry.source_type,
+        text_sha256: entry.text_sha256,
+        raw_sha256: entry.raw_sha256,
+        ...(entry.record_scope !== undefined ? { record_scope: entry.record_scope } : {}),
+        normalized_text: row?.normalized_text ?? '',
+        chunks: data.chunksBySnapshot.get(entry.snapshot_id) ?? []
+      }
+    })
+  }
+  // 报告段:最新版本完整装配;装配失败如实记录原因(不中断导出)
+  const reportRow = latestReport(db, data.task.researchTaskId)
+  let report: Record<string, unknown>
+  if (!reportRow) {
+    report = { report_applicable: true, report: null, reason: '研究报告版本未生成(运行未到达组织阶段)' }
+  } else {
+    try {
+      report = {
+        report_applicable: true,
+        report: assembleReportResponse(db, runId, reportRow, { runStatus: data.task.phase })
+      }
+    } catch (err) {
+      report = {
+        report_applicable: true,
+        report: null,
+        reason: `报告响应装配失败:${err instanceof Error ? err.message : String(err)}`
+      }
+    }
+  }
+  return { report, evidence, snapshots }
 }
 
 /** 快照业务表行数(状态断言的基线与事后值) */
@@ -336,8 +558,9 @@ export class EvalRunner {
   /** 执行整批;返回最终状态(单案例失败不会中断批次) */
   async run(): Promise<EvalRunState> {
     mkdirSync(this.deps.artifactRoot, { recursive: true })
-    // case 临时目录的父目录:createIsolatedCaseEnv 的 mkdtemp 需要它存在
-    mkdirSync(join(this.deps.artifactRoot, 'cases'), { recursive: true })
+    // EVAL-03:本批次目录与临时库根目录(<evalRunId>/temporary)预先创建,
+    // createIsolatedCaseEnv 的 mkdtemp 需要父目录存在
+    mkdirSync(temporaryRoot(this.deps.artifactRoot, this.state.evalRunId), { recursive: true })
     this.state.status = 'running'
     this.state.stopReason = null
     this.persist()
@@ -445,6 +668,94 @@ export class EvalRunner {
     }
   }
 
+  // ---------- EVAL-03:可回放产物导出与 research gold 判分 ----------
+
+  /** 本批次案例临时库根目录(<artifactRoot>/<evalRunId>/temporary) */
+  private tempCaseRoot(): string {
+    return temporaryRoot(this.deps.artifactRoot, this.state.evalRunId)
+  }
+
+  /** 产物目录(相对 artifactRoot 的批次内路径,posix 分隔便于跨平台归档) */
+  private artifactRelDir(configId: string, caseId: string, repeat: number): string {
+    return [this.state.evalRunId, configId, caseId, String(repeat)].join('/')
+  }
+
+  /** research gold 加载:datasetRoot 缺省回退 cwd/evals/datasets/<datasetVersion>(过渡形态) */
+  private goldFor(caseDef: EvalCase): ReturnType<typeof loadResearchGold> {
+    const datasetRoot =
+      this.deps.datasetRoot ?? join(process.cwd(), 'evals', 'datasets', this.state.datasetVersion)
+    return loadResearchGold(datasetRoot, caseDef.case_id)
+  }
+
+  /** manifest 扩展元信息(批次与案例的冻结上下文) */
+  private artifactMeta(caseDef: EvalCase, base: EvalCaseOutcome): CaseArtifactPayload['meta'] {
+    return {
+      datasetVersion: this.state.datasetVersion,
+      datasetSha256: this.state.casesSha256,
+      codeVersion: defaultCodeVersion(),
+      executionKind: this.state.executionKind,
+      frozenClock: caseDef.clock,
+      timezone: caseDef.timezone,
+      startedAt: this.state.startedAt,
+      finishedAt: this.state.finishedAt,
+      stopReason: this.state.stopReason ?? null
+    }
+  }
+
+  /** run.json:运行记录 + 案例元信息(评测输入只有 question/snapshot_ids,无 gold) */
+  private runPayload(caseDef: EvalCase, base: EvalCaseOutcome, db: import('../db/connection').SqliteDb): Record<string, unknown> {
+    return {
+      evalRunId: this.state.evalRunId,
+      configId: base.configId,
+      caseId: caseDef.case_id,
+      repeatIndex: base.repeatIndex,
+      datasetVersion: this.state.datasetVersion,
+      executionKind: this.state.executionKind,
+      // 评测输入:问题原文 + 冻结快照清单(gold 不在此出现)
+      caseInput: caseDef.input,
+      timezone: caseDef.timezone,
+      runId: base.runId,
+      run: base.runId ? getRun(db, base.runId) : null,
+      terminalStatus: base.terminalStatus,
+      caseStatus: base.status,
+      failureReasons: base.failureReasons
+    }
+  }
+
+  /**
+   * EVAL-03 外壳:隔离库关闭前导出该案例产物。ops 与 research 共用;
+   * research 额外产出研究报告/证据/快照清单与 gold 判分。
+   */
+  private exportArtifactsFor(env: IsolatedCaseEnv, caseDef: EvalCase, base: EvalCaseOutcome): void {
+    const trace = base.runId ? listTraceEvents(env.db, base.runId) : []
+    const payload: CaseArtifactPayload = {
+      run: this.runPayload(caseDef, base, env.db),
+      traceEvents: trace.map((e) => ({ ...e })),
+      observations: (base.toolObservations ?? []) as unknown as Record<string, unknown>[],
+      ruleChecks: (base.ruleChecks ?? []) as unknown as Record<string, unknown>[],
+      researchScoring: (base.researchScoring ?? null) as unknown as Record<string, unknown> | null,
+      ...(caseDef.mode === 'research'
+        ? researchArtifactSections(env, caseDef, base)
+        : {
+            // Ops 无研究报告:明确 not_applicable,不伪造空研究成果
+            report: { report_applicable: false, reason: 'not_applicable' },
+            evidence: { applicable: false, reason: 'not_applicable' },
+            snapshots: { applicable: false, reason: 'not_applicable' }
+          }),
+      meta: this.artifactMeta(caseDef, base)
+    }
+    exportCaseArtifacts(
+      this.deps.artifactRoot,
+      {
+        evalRunId: this.state.evalRunId,
+        configId: base.configId,
+        caseId: caseDef.case_id,
+        repeatIndex: base.repeatIndex
+      },
+      payload
+    )
+  }
+
   private async runSingle(
     configId: string,
     caseDef: EvalCase,
@@ -468,7 +779,7 @@ export class EvalRunner {
     }
     let env: IsolatedCaseEnv | null = null
     try {
-      env = await createIsolatedCaseEnv(join(this.deps.artifactRoot, 'cases'), caseDef, this.deps.sqlJsDistDir)
+      env = await createIsolatedCaseEnv(this.tempCaseRoot(), caseDef, this.deps.sqlJsDistDir)
       // 基线:fixture 播种后的行数(状态断言的 countDelta 相对此基线)
       const baselineTables = (caseDef.expected.state_assertions ?? []).map((a) => a.table)
       const baseline = tableCounts(env.db, baselineTables)
@@ -593,12 +904,36 @@ export class EvalRunner {
         }
       }
       base.status = reasons.length === 0 ? 'passed' : 'failed'
+
+      // EVAL-03:隔离库关闭前导出可回放产物;失败保留临时库并标 artifact_failed,
+      // 绝不把该案例标成可回放
+      try {
+        this.exportArtifactsFor(env, caseDef, base)
+        base.artifactStatus = 'ok'
+        base.artifactDir = this.artifactRelDir(base.configId, caseDef.case_id, repeat)
+      } catch (err) {
+        base.artifactStatus = 'artifact_failed'
+        base.failureReasons.push(
+          `artifact_failed:产物导出失败,临时库保留待人工复核:${err instanceof Error ? err.message : String(err)}`
+        )
+      }
       return base
     } catch (err) {
       base.failureReasons.push(err instanceof Error ? err.message : String(err))
       return base
     } finally {
-      env?.dispose()
+      if (env) {
+        // artifact_failed:临时库(含隔离 sqlite 文件)保留为证据,只关闭连接
+        if (base.artifactStatus === 'artifact_failed') {
+          try {
+            env.db.close()
+          } catch {
+            /* 已关闭 */
+          }
+        } else {
+          env.dispose()
+        }
+      }
     }
   }
 
@@ -628,11 +963,11 @@ export class EvalRunner {
     try {
       // research fixture 惰性注册(幂等):seed 从 fixtures/research/<id>/ 按需读取
       registerResearchFixture(caseDef.fixture_id)
-      env = await createIsolatedCaseEnv(join(this.deps.artifactRoot, 'cases'), caseDef, this.deps.sqlJsDistDir)
+      env = await createIsolatedCaseEnv(this.tempCaseRoot(), caseDef, this.deps.sqlJsDistDir)
       // EVAL-02(F-12):不调用 initWorkspaceEpoch() 修改生产全局;案例局部 epoch
       // (env.workspaceEpoch)经 ResearchWorkflow.createRun/startRun 的透传入口
       // 显式传入,运行创建记录案例代数,生产全局保持不变。
-      const seed = env.seedResult as import('./researchAdapter').ResearchSeedResult | undefined
+      const seed = env.seedResult as ResearchSeedResult | undefined
       if (!seed) {
         throw new Error(`research case 缺少 fixture 播种结果:${caseDef.case_id}(${caseDef.fixture_id})`)
       }
@@ -679,6 +1014,17 @@ export class EvalRunner {
       }, 15_000)
       if (!finished) {
         base.failureReasons.push('研究运行在时限内未到达终态')
+        // EVAL-03:超时案例同样在关库前导出产物(调试与回放最有价值的正是失败案例)
+        try {
+          this.exportArtifactsFor(env, caseDef, base)
+          base.artifactStatus = 'ok'
+          base.artifactDir = this.artifactRelDir(base.configId, caseDef.case_id, repeat)
+        } catch (err) {
+          base.artifactStatus = 'artifact_failed'
+          base.failureReasons.push(
+            `artifact_failed:产物导出失败,临时库保留待人工复核:${err instanceof Error ? err.message : String(err)}`
+          )
+        }
         return base
       }
       const after = getRun(env.db, base.runId)
@@ -702,12 +1048,74 @@ export class EvalRunner {
         }
       }
       base.status = reasons.length === 0 ? 'passed' : 'failed'
+
+      // EVAL-03:gold 判分(F-11 修复)。gold 只进入评分模块:判分输入全部来自
+      // 运行后观测(claims/citations/spans/交付 chunk)与 gold 标注,不由终态反推;
+      // 评测运行输入只有 question/snapshot_ids,gold 不进入任何输入路径。
+      if (seed) {
+        const runData = collectResearchRunData(env.db, base.runId!)
+        base.researchScoring = scoreResearchCase({
+          gold: this.goldFor(caseDef),
+          recordsByLogical: seed.recordsByLogical,
+          chunksBySnapshot: runData.chunksBySnapshot,
+          claims: runData.claims.map((c) => ({
+            claimId: c.claimId,
+            claimType: c.claimType,
+            supportStatus: c.supportStatus,
+            subquestionId: c.subquestionId
+          })),
+          citations: runData.citations.map((r) => ({
+            citationId: r.citation.citationId,
+            claimId: r.claim.claimId,
+            evidenceId: r.citation.evidenceId,
+            relation: r.citation.relation
+          })),
+          spans: runData.spans.map((s) => ({
+            evidenceId: s.evidenceId,
+            snapshotId: s.snapshotId,
+            chunkId: s.chunkId,
+            startOffset: s.startOffset,
+            endOffset: s.endOffset,
+            quote: s.quote,
+            validationStatus: s.validationStatus
+          })),
+          subquestions: runData.subquestions.map((s) => ({
+            subquestionId: s.subquestionId,
+            status: s.status,
+            insufficiencyReason: s.insufficiencyReason
+          })),
+          retrievedChunkIds: runData.retrievedChunkIds
+        })
+      }
+
+      // EVAL-03:隔离库关闭前导出可回放产物;失败保留临时库并标 artifact_failed
+      try {
+        this.exportArtifactsFor(env, caseDef, base)
+        base.artifactStatus = 'ok'
+        base.artifactDir = this.artifactRelDir(base.configId, caseDef.case_id, repeat)
+      } catch (err) {
+        base.artifactStatus = 'artifact_failed'
+        base.failureReasons.push(
+          `artifact_failed:产物导出失败,临时库保留待人工复核:${err instanceof Error ? err.message : String(err)}`
+        )
+      }
       return base
     } catch (err) {
       base.failureReasons.push(err instanceof Error ? err.message : String(err))
       return base
     } finally {
-      env?.dispose()
+      if (env) {
+        // artifact_failed:临时库(含隔离 sqlite 文件)保留为证据,只关闭连接
+        if (base.artifactStatus === 'artifact_failed') {
+          try {
+            env.db.close()
+          } catch {
+            /* 已关闭 */
+          }
+        } else {
+          env.dispose()
+        }
+      }
     }
   }
 }
