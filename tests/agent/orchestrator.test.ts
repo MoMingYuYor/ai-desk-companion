@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { makeTestDb } from '../helpers'
-import { initWorkspaceEpoch } from '../../src/main/db/operations'
-import { getRun, listTraceEvents } from '../../src/main/runs/repository'
+import { createPersistenceCoordinator, initWorkspaceEpoch } from '../../src/main/db/operations'
+import { appendTraceEvent, getRun, listTraceEvents } from '../../src/main/runs/repository'
 import { createRun } from '../../src/main/runs/repository'
 import { RunOrchestrator, type OrchestratorDeps } from '../../src/main/agent/orchestrator'
+import { AgentEventStream } from '../../src/main/agent/eventStream'
 import { FakeProvider } from '../../src/main/providers/fake'
 import { ToolGateway } from '../../src/main/tools/gateway'
 import { ToolRegistry } from '../../src/main/tools/registry'
@@ -17,6 +18,8 @@ import type { SqliteDb } from '../../src/main/db/connection'
 
 // A-03/A-04:规划器与编排器。逐条覆盖验收用例 OPS-01~OPS-08、OPS-10。
 // FakeProvider 按调用序返回脚本,规划调用是第 1 次,澄清后的重新规划是第 2 次。
+// OPS-03:网关单一出口观测 → tool_call 轨迹(每个 operationId 两 phase 各一条事件);
+// makeHarness 用真实 AgentEventStream 广播状态事件,避免替身签名掩盖事件时序。
 
 const NOW = '2026-09-28T01:00:00.000Z'
 
@@ -54,9 +57,26 @@ async function makeHarness(
       })
     }
   })
-  const gateway = new ToolGateway({ db, registry, clock: systemClock })
+  const gateway = new ToolGateway({
+    db,
+    registry,
+    clock: systemClock,
+    // 与生产组合同构:关键命令落盘确认后才返回(persistence phase 观测随之存在)
+    persistCoordinator: createPersistenceCoordinator(db),
+    // OPS-03 规范接线:网关单一出口观察 → tool_call 轨迹(先落库;广播只在事务提交后另行处理)
+    onObservation: (r) =>
+      appendTraceEvent(db, {
+        runId: r.runId,
+        eventType: 'tool_call',
+        payload: { ...r },
+        durationMs: r.durationMs
+      })
+  })
   const queue = new RunQueue(db)
-  const events: Array<{ channel: string; payload: unknown }> = []
+  const sent: Array<{ channel: string; payload: unknown }> = []
+  const events = new AgentEventStream({
+    send: (channel: string, payload: unknown) => sent.push({ channel, payload })
+  })
   const provider = new FakeProvider(
     Array.isArray(responsesOrScript)
       ? { responses: [...responsesOrScript] }
@@ -67,11 +87,10 @@ async function makeHarness(
     registry,
     gateway,
     queue,
-    provider: undefined,
     completer: provider,
-    events: { emit: (channel: string, payload: unknown) => events.push({ channel, payload }) }
-  } as unknown as OrchestratorDeps)
-  return { db, orchestrator, provider, events, writeFailCalls: () => failCalls }
+    events
+  })
+  return { db, orchestrator, provider, events: sent, writeFailCalls: () => failCalls }
 }
 
 function planOf(steps: unknown[], over: Record<string, unknown> = {}): unknown {
@@ -95,8 +114,13 @@ describe('OPS-01 只读任务:自动完成、零写操作', () => {
 
     expect(getRun(h.db, run.runId)?.status).toBe('succeeded')
     expect(h.db.all('SELECT * FROM todos')).toHaveLength(before.length)
+    // OPS-03:tool_call 观察按 phase 分两条事件(tool + persistence),schemaVersion 不变
     const types = listTraceEvents(h.db, run.runId).map((e) => e.eventType)
-    expect(types).toEqual(['plan', 'tool_call', 'output'])
+    expect(types).toEqual(['plan', 'tool_call', 'tool_call', 'output'])
+    const phases = listTraceEvents(h.db, run.runId)
+      .filter((e) => e.eventType === 'tool_call')
+      .map((e) => (e.payload as { phase?: string }).phase)
+    expect(phases).toEqual(['tool', 'persistence'])
   })
 })
 
@@ -125,16 +149,18 @@ describe('OPS-02 时间含糊:awaiting_input,回答后继续同一运行', () =>
     expect(h.db.all('SELECT * FROM events')).toHaveLength(1)
   })
 
-  it('澄清后重新规划仍提出澄清:最多一轮,不再阻塞', async () => {
+  it('澄清后重新规划仍提出澄清:最多一轮,INPUT_INSUFFICIENT 显式失败', async () => {
     const h = await makeHarness([
       planOf([], { clarifications: [{ question_id: 'q-when', question: '哪天?' }] }),
       planOf([], { clarifications: [{ question_id: 'q-again', question: '具体几点?' }] })
     ])
     const run = createRun(h.db, { mode: 'personal_ops' as RunMode, input: '安排', contextClock: NOW })
     await h.orchestrator.drivePlanning(run.runId)
-    // 第二轮仍要求澄清:按"最多一轮"直接以假设继续(无写步骤则成功收尾)
+    // 第二轮仍要求澄清:澄清后仍缺必填信息必须显式失败,不能空计划伪装成功(OPS-03)
     await h.orchestrator.submitAnswers(run.runId, [{ questionId: 'q-when', answer: '下周' }])
-    expect(getRun(h.db, run.runId)?.status).toBe('succeeded')
+    const after = getRun(h.db, run.runId)
+    expect(after?.status).toBe('failed')
+    expect(after?.errorCode).toBe('INPUT_INSUFFICIENT')
   })
 })
 
@@ -196,8 +222,14 @@ describe('OPS-05 并发重复批准:仅一条业务更新', () => {
 
 describe('OPS-06 目标记录版本变化:409 重新规划', () => {
   it('批准前目标被修改,执行冲突,运行失败', async () => {
-    // 计划在调用时动态读取当前库的真实 ID(避免双库混用)
-    const h = await makeHarness(() => {
+    // OPS-03:修改类 ID 必须来自本运行读取结果——先读取拿到真实 ID(混合计划首轮只执行读取)
+    const h = await makeHarness((callIndex) => {
+      if (callIndex === 0) {
+        return planOf([
+          { tool: 'todo.list', arguments: {} },
+          { tool: 'todo.update', arguments: { id: '占位', title: '改名' } }
+        ])
+      }
       const todoId = h.db.get<{ id: string }>('SELECT id FROM todos LIMIT 1')!.id
       return planOf([{ tool: 'todo.update', arguments: { id: todoId, title: '改名' } }])
     })
@@ -290,6 +322,112 @@ describe('OPS-10 窗口关闭后恢复:事件重放,不再次执行', () => {
     await revived.decide(approvalId, 'approved')
     expect(getRun(h.db, run.runId)?.status).toBe('succeeded')
     expect(h.db.all("SELECT * FROM todos WHERE title = '重启前提案'")).toHaveLength(1)
+  })
+})
+
+describe('OPS-03 读后规划:读取结果参与重规划', () => {
+  it('读后更新:提示词含时区/冻结时钟/读取结果,提案携带真实 ID 并在批准后执行', async () => {
+    const h = await makeHarness((callIndex, request) => {
+      if (callIndex === 0) {
+        return planOf([{ tool: 'todo.list', arguments: { status: 'open' } }], { continue_after_read: true })
+      }
+      expect(request.prompt).toContain('Asia/Shanghai')
+      expect(request.prompt).toContain('2026-09-30T01:00:00.000Z')
+      expect(request.prompt).toContain(todo.id)
+      return planOf([{ tool: 'todo.update', arguments: { id: todo.id, priority: 'high' } }])
+    })
+    const { createTodo } = await import('../../src/main/db/dao')
+    const todo = createTodo(h.db, { title: '整理项目' })
+    const run = createRun(h.db, {
+      mode: 'personal_ops' as RunMode,
+      input: '查到整理项目后改为高优先级',
+      timezone: 'Asia/Shanghai',
+      contextClock: '2026-09-30T01:00:00.000Z'
+    })
+    await h.orchestrator.drivePlanning(run.runId)
+    expect(getRun(h.db, run.runId)?.status).toBe('awaiting_confirmation')
+
+    // 读取观察:真实参数/索引/结果,phase=tool
+    const read = listTraceEvents(h.db, run.runId).find(
+      (e) => e.eventType === 'tool_call' && (e.payload as { phase?: string }).phase === 'tool'
+    )!
+    expect(read.payload.arguments).toEqual({ status: 'open' })
+    expect(read.payload.callIndex).toBe(0)
+    expect(read.payload.result).toMatchObject({ todos: [{ id: todo.id }] })
+
+    // 重规划提案:planVersion 递增到 2;批准后修改指定记录
+    const confirmation = listTraceEvents(h.db, run.runId).find((e) => e.eventType === 'confirmation')!
+    expect((confirmation.payload as { planVersion: number }).planVersion).toBe(2)
+    const approvalId = (confirmation.payload as { approvalId: string }).approvalId
+    await h.orchestrator.decide(approvalId, 'approved')
+    expect(getRun(h.db, run.runId)?.status).toBe('succeeded')
+    expect(
+      h.db.get<{ priority: string }>('SELECT priority FROM todos WHERE id = ?', [todo.id])?.priority
+    ).toBe('high')
+  })
+
+  it('混合计划首轮只执行读取:依赖未执行读取的写参数被丢弃,重规划后重新提案', async () => {
+    const h = await makeHarness((callIndex) => {
+      if (callIndex === 0) {
+        // 混合计划:写步骤的 id 依赖尚未执行的读取
+        return planOf([
+          { tool: 'todo.update', arguments: { id: 'premature-id', priority: 'high' } },
+          { tool: 'todo.list', arguments: { status: 'open' } }
+        ])
+      }
+      const todoId = h.db.get<{ id: string }>("SELECT id FROM todos WHERE title = '整理项目'")!.id
+      return planOf([{ tool: 'todo.update', arguments: { id: todoId, priority: 'high' } }])
+    })
+    const { createTodo } = await import('../../src/main/db/dao')
+    createTodo(h.db, { title: '整理项目' })
+    const run = createRun(h.db, { mode: 'personal_ops' as RunMode, input: '整理项目改高优先级', contextClock: NOW })
+    await h.orchestrator.drivePlanning(run.runId)
+    expect(getRun(h.db, run.runId)?.status).toBe('awaiting_confirmation')
+
+    // 首轮只执行读取,被丢弃的写步骤未形成提案:整个运行只有重规划后的一个审批
+    const readEvents = listTraceEvents(h.db, run.runId).filter(
+      (e) => e.eventType === 'tool_call' && (e.payload as { phase?: string }).phase === 'tool'
+    )
+    expect(readEvents).toHaveLength(1)
+    expect(h.db.all('SELECT * FROM approvals')).toHaveLength(1)
+  })
+
+  it('相同读调用与结果重复无进展:PLAN_NO_PROGRESS 停止,不生成无限循环', async () => {
+    const h = await makeHarness(() =>
+      planOf([{ tool: 'todo.list', arguments: { status: 'open' } }], { continue_after_read: true })
+    )
+    const { createTodo } = await import('../../src/main/db/dao')
+    createTodo(h.db, { title: '整理项目' })
+    const run = createRun(h.db, { mode: 'personal_ops' as RunMode, input: '查完继续', contextClock: NOW })
+    await h.orchestrator.drivePlanning(run.runId)
+    const after = getRun(h.db, run.runId)
+    expect(after?.status).toBe('failed')
+    expect(after?.errorCode).toBe('PLAN_NO_PROGRESS')
+    // 相同读调用未重复执行:读取只发生一次
+    const readEvents = listTraceEvents(h.db, run.runId).filter(
+      (e) => e.eventType === 'tool_call' && (e.payload as { phase?: string }).phase === 'tool'
+    )
+    expect(readEvents).toHaveLength(1)
+  })
+
+  it('修改类 ID 必须来自本运行读取结果:库里存在但未读取的 ID 不能作为证据', async () => {
+    const h = await makeHarness(() => {
+      // ID 在数据库中真实存在,但本运行从未读取:不能作为修改证据
+      const existing = h.db.get<{ id: string }>("SELECT id FROM todos WHERE title = '存在但未读'")!
+      return planOf([{ tool: 'todo.update', arguments: { id: existing.id, priority: 'high' } }])
+    })
+    const { createTodo } = await import('../../src/main/db/dao')
+    createTodo(h.db, { title: '存在但未读' })
+    const run = createRun(h.db, { mode: 'personal_ops' as RunMode, input: '改高优先级', contextClock: NOW })
+    await h.orchestrator.drivePlanning(run.runId)
+    const after = getRun(h.db, run.runId)
+    expect(after?.status).toBe('failed')
+    expect(after?.errorCode).toBe('INPUT_INSUFFICIENT')
+    // 越权写入未发生:无提案、目标未修改
+    expect(h.db.all('SELECT * FROM approvals')).toHaveLength(0)
+    expect(
+      h.db.get<{ priority: string }>("SELECT priority FROM todos WHERE title = '存在但未读'")?.priority
+    ).not.toBe('high')
   })
 })
 

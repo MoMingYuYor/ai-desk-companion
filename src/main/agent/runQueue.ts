@@ -63,6 +63,22 @@ export class RunQueue {
     return true
   }
 
+  /**
+   * OPS-02:审批接力领取——仅可把 awaiting_confirmation 的运行推进到 executing
+   * (已批准且未执行的提案由此领取执行权)。数据库仍无占用者时才转移;
+   * 对已占用执行权的运行重复调用是幂等的;其他状态一律返回 false。
+   */
+  tryResume(runId: string): boolean {
+    const run = getRun(this.db, runId)
+    if (!run) throw new Error(`运行不存在:${runId}`)
+    if ((SLOT_HOLDING_STATUSES as readonly string[]).includes(run.status)) return true
+    if (run.status !== 'awaiting_confirmation') return false
+    const active = this.currentActive()
+    if (active) return false
+    transitionRun(this.db, runId, 'executing')
+    return true
+  }
+
   /** 待执行与占用中的运行数量,用于队列容量与展示 */
   depth(): number {
     return (

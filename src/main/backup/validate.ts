@@ -3,6 +3,7 @@
 // 本模块保持纯函数(不触碰文件系统),文件读写与恢复流程在 services/backup.ts。
 import { appError } from '../../shared/operations'
 import { OperationError } from '../db/operations'
+import { argumentsHash } from '../tools/schema'
 
 /** 备份文件应用标识:导出与校验共用,防止拿错文件 */
 export const BACKUP_APP_ID = 'ai-desk-companion'
@@ -129,6 +130,9 @@ const APPROVALS: BackupColumnSpec[] = [
   t('approval_id'), t('run_id'), t('tool_name'), t('arguments_hash'), i('plan_version'),
   i('target_version', true), t('expires_at'), t('decision'), t('decided_at', true)
 ]
+// v7(A-01/OPS-01):审批参数持久化列(v7 迁移添加;v5/v6 历史备份没有它)。
+// 不向历史备份强加新必需列:缺失/null 的参数在恢复阶段按"参数不可恢复"处理。
+const APPROVALS_V7: BackupColumnSpec[] = [...APPROVALS, t('arguments_json', true)]
 // v6(C-05):检索文档与分块。FTS4 虚表是派生索引,不进备份;恢复后由 rebuild 重建。
 const RETRIEVAL_DOCUMENTS: BackupColumnSpec[] = [
   t('document_id'), t('source_name'), t('source_type'), t('raw_sha256'), t('text_sha256'),
@@ -287,7 +291,7 @@ const V7_TABLES = buildTables([
   ['school_events', SCHOOL_EVENTS], ['profile_facts', PROFILE_FACTS],
   ['mail_analysis_links', MAIL_ANALYSIS_LINKS], ['mail_analysis_versions', MAIL_ANALYSIS_VERSIONS],
   ['mail_confirmations', MAIL_CONFIRMATIONS], ['operation_receipts', OPERATION_RECEIPTS],
-  ['agent_runs', AGENT_RUNS], ['trace_events', TRACE_EVENTS], ['approvals', APPROVALS],
+  ['agent_runs', AGENT_RUNS], ['trace_events', TRACE_EVENTS], ['approvals', APPROVALS_V7],
   ['retrieval_documents', RETRIEVAL_DOCUMENTS], ['retrieval_chunks', RETRIEVAL_CHUNKS],
   ['mail_drafts', MAIL_DRAFTS]
 ])
@@ -299,7 +303,7 @@ const V8_TABLES = buildTables([
   ['school_events', SCHOOL_EVENTS], ['profile_facts', PROFILE_FACTS],
   ['mail_analysis_links', MAIL_ANALYSIS_LINKS], ['mail_analysis_versions', MAIL_ANALYSIS_VERSIONS],
   ['mail_confirmations', MAIL_CONFIRMATIONS], ['operation_receipts', OPERATION_RECEIPTS],
-  ['agent_runs', AGENT_RUNS], ['trace_events', TRACE_EVENTS], ['approvals', APPROVALS],
+  ['agent_runs', AGENT_RUNS], ['trace_events', TRACE_EVENTS], ['approvals', APPROVALS_V7],
   ['retrieval_documents', RETRIEVAL_DOCUMENTS], ['retrieval_chunks', RETRIEVAL_CHUNKS],
   ['mail_drafts', MAIL_DRAFTS],
   ['research_snapshot_manifests', RESEARCH_SNAPSHOT_MANIFESTS], ['research_tasks', RESEARCH_TASKS],
@@ -316,7 +320,7 @@ const V9_TABLES = buildTables([
   ['school_events', SCHOOL_EVENTS], ['profile_facts', PROFILE_FACTS],
   ['mail_analysis_links', MAIL_ANALYSIS_LINKS], ['mail_analysis_versions', MAIL_ANALYSIS_VERSIONS],
   ['mail_confirmations', MAIL_CONFIRMATIONS], ['operation_receipts', OPERATION_RECEIPTS],
-  ['agent_runs', AGENT_RUNS], ['trace_events', TRACE_EVENTS], ['approvals', APPROVALS],
+  ['agent_runs', AGENT_RUNS], ['trace_events', TRACE_EVENTS], ['approvals', APPROVALS_V7],
   ['retrieval_documents', RETRIEVAL_DOCUMENTS_V9], ['retrieval_chunks', RETRIEVAL_CHUNKS],
   ['mail_drafts', MAIL_DRAFTS],
   ['research_snapshot_manifests', RESEARCH_SNAPSHOT_MANIFESTS], ['research_tasks', RESEARCH_TASKS],
@@ -449,7 +453,37 @@ export function validateBackup(raw: unknown, supportedVersions: readonly number[
   }
 
   checkReferences(spec, tables)
+  validateApprovalParams(schemaVersion, tables['approvals'] ?? [])
   return { schemaVersion, tables }
+}
+
+/**
+ * OPS-01:v7 起审批行携带冻结参数(arguments_json)——
+ * 非空参数必须是 JSON 对象,并与行内 tool_name 及 arguments_hash 对应
+ * (hash = sha256(stableStringify({tool, arguments})),与网关 propose 一致)。
+ * 缺失或 null 不算坏文件:恢复阶段把未执行的待批/已批审批置 expired。
+ */
+function validateApprovalParams(schemaVersion: number, rows: ReadonlyArray<Record<string, unknown>>): void {
+  if (schemaVersion < 7) return
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index]!
+    const raw = row['arguments_json']
+    if (raw === undefined || raw === null) continue
+    if (typeof raw !== 'string') throw invalid(`表 approvals 第 ${index} 行 arguments_json 应为文本`)
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      throw invalid(`表 approvals 第 ${index} 行 arguments_json 不是有效 JSON`)
+    }
+    if (!isPlainObject(parsed)) {
+      throw invalid(`表 approvals 第 ${index} 行 arguments_json 必须是 JSON 对象`)
+    }
+    const recomputed = argumentsHash({ tool: row['tool_name'], arguments: parsed })
+    if (recomputed !== row['arguments_hash']) {
+      throw invalid(`表 approvals 第 ${index} 行 arguments_json 与 tool_name/arguments_hash 不对应`)
+    }
+  }
 }
 
 function checkReferences(spec: BackupVersionSpec, tables: ValidatedBackup['tables']): void {

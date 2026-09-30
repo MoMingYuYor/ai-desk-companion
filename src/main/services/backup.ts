@@ -8,6 +8,7 @@ import { SCHEMA_VERSION } from '../db/schema'
 import { nowTimestamp } from '../../shared/dateUtils'
 import { appError } from '../../shared/operations'
 import { bumpWorkspaceEpoch, OperationError } from '../db/operations'
+import { appendTraceEvent, getRun } from '../runs/repository'
 import { rebuildSearchIndex } from '../retrieval/search'
 import {
   BACKUP_APP_ID,
@@ -18,8 +19,11 @@ import {
   type ValidatedBackup
 } from '../backup/validate'
 
-/** 受支持的备份版本:v3 旧备份受控迁移;v4/v5 必须保留(否则旧备份无法恢复);v6 为当前格式 */
-export const SUPPORTED_BACKUP_VERSIONS: readonly number[] = [3, 4, 5, 6, SCHEMA_VERSION]
+/**
+ * 受支持的备份版本(OPS-01):v3 旧备份受控迁移;v4~v8 必须保留(否则对应时期
+ * 的旧备份无法恢复);v7 起审批行可携带冻结参数;当前为 v9。未来版本(v10+)拒绝。
+ */
+export const SUPPORTED_BACKUP_VERSIONS: readonly number[] = [3, 4, 5, 6, 7, 8, SCHEMA_VERSION]
 
 type Row = Record<string, unknown>
 
@@ -85,6 +89,39 @@ function clearBusinessTables(db: SqliteDb): void {
   }
 }
 
+/**
+ * OPS-01:恢复归一化——旧文件缺失/为 null 冻结参数的审批恢复为 null,
+ * 将尚未执行的 pending/approved 审批置 expired,落 error 轨迹记录原因,
+ * 要求重新规划;禁止用 {} 替代缺失冻结参数继续执行。
+ * 参数完整的审批不受影响。必须在替换事务内调用,保证回滚快照与归一化原子一致。
+ */
+function expireApprovalsWithoutParams(db: SqliteDb): void {
+  const rows = db.all<{ approval_id: string; run_id: string; decision: string }>(
+    "SELECT approval_id, run_id, decision FROM approvals WHERE arguments_json IS NULL AND decision IN ('pending', 'approved')"
+  )
+  if (rows.length === 0) return
+  const now = nowTimestamp()
+  for (const row of rows) {
+    db.run("UPDATE approvals SET decision = 'expired', decided_at = ? WHERE approval_id = ?", [
+      now,
+      row.approval_id
+    ])
+    // 原因落运行轨迹(审批引用的运行可能悬空,悬空时只失效不落事件)
+    if (getRun(db, row.run_id)) {
+      appendTraceEvent(db, {
+        runId: row.run_id,
+        eventType: 'error',
+        payload: {
+          code: 'APPROVAL_PARAMS_UNRECOVERABLE',
+          approval_id: row.approval_id,
+          previous_decision: row.decision,
+          reason: '恢复的备份缺少审批冻结参数(arguments_json),审批已失效,需重新规划生成提案'
+        }
+      })
+    }
+  }
+}
+
 function replaceBusinessTables(db: SqliteDb, backup: ValidatedBackup): Record<string, number> {
   const spec = getBackupVersionSpec(backup.schemaVersion)
   const imported: Record<string, number> = {}
@@ -102,6 +139,8 @@ function replaceBusinessTables(db: SqliteDb, backup: ValidatedBackup): Record<st
     db.run(
       'UPDATE mail_analysis_links SET message_id = NULL WHERE message_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM mail_messages WHERE id = mail_analysis_links.message_id)'
     )
+    // OPS-01:参数不可恢复的未执行审批置 expired 并落原因(同一事务内,随替换原子生效)
+    expireApprovalsWithoutParams(db)
     // C-05:chunks 行被整体替换,rowid 可能变化,FTS 索引必须重建对齐。
     // 旧版本备份不含检索表时,恢复即清空检索语料(语料可由原始文件重新导入)。
     rebuildSearchIndex(db)

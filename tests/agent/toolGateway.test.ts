@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { makeTestDb } from '../helpers'
-import { initWorkspaceEpoch } from '../../src/main/db/operations'
-import { getApproval } from '../../src/main/runs/repository'
+import { createPersistenceCoordinator, getOperationReceipt, initWorkspaceEpoch } from '../../src/main/db/operations'
+import { createRun, getApproval } from '../../src/main/runs/repository'
 import { fixedClock, systemClock } from '../../src/shared/clock'
 import { ToolGateway } from '../../src/main/tools/gateway'
 import { ToolRegistry } from '../../src/main/tools/registry'
-import type { ToolDefinition, ToolResult } from '../../src/main/tools/types'
+import type { ToolDefinition, ToolObservationV1, ToolResult } from '../../src/main/tools/types'
 import type { SqliteDb } from '../../src/main/db/connection'
 
 // C-04:ToolGateway。核心安全断言:
@@ -13,6 +13,8 @@ import type { SqliteDb } from '../../src/main/db/connection'
 // 2. 信封出现 approved 键(无论值)一律拒绝;
 // 3. 风险等级由注册表决定,schema 层拒绝任何风险声明字段;
 // 4. 幂等:同 runId:tool:callIndex 重复执行命中回执,副作用只发生一次。
+// OPS-01:单测显式注入持久化协调器,使关键命令覆盖"落盘确认后返回"路径
+// (生产组合的接线回归见 criticalPersistence.test.ts 的 createAgentGateway 工厂)。
 
 const NOW = '2026-09-28T01:00:00.000Z'
 
@@ -59,7 +61,12 @@ async function makeGateway(clock = systemClock): Promise<{
   const db = await makeTestDb()
   initWorkspaceEpoch()
   const tools = makeTools()
-  const gateway = new ToolGateway({ db, registry: tools.registry, clock })
+  const gateway = new ToolGateway({
+    db,
+    registry: tools.registry,
+    clock,
+    persistCoordinator: createPersistenceCoordinator(db)
+  })
   return { db, gateway, tools }
 }
 
@@ -186,7 +193,12 @@ describe('execute 幂等与副作用', () => {
         throw new Error('内部炸了')
       }
     })
-    const gateway = new ToolGateway({ db, registry, clock: systemClock })
+    const gateway = new ToolGateway({
+      db,
+      registry,
+      clock: systemClock,
+      persistCoordinator: createPersistenceCoordinator(db)
+    })
     const input = { runId: 'r', tool: 'fixture.boom', arguments: {}, planVersion: 1, callIndex: 0 }
     // 两次同 callIndex 调用都真正重新执行(无回执挡路)
     await expect(gateway.execute(input)).rejects.toThrow('内部炸了')
@@ -216,7 +228,12 @@ describe('execute 写工具的批准校验', () => {
     const db = await makeTestDb()
     initWorkspaceEpoch()
     const tools = makeTools()
-    const gateway = new ToolGateway({ db, registry: tools.registry, clock: over.clock ?? systemClock })
+    const gateway = new ToolGateway({
+      db,
+      registry: tools.registry,
+      clock: over.clock ?? systemClock,
+      persistCoordinator: createPersistenceCoordinator(db)
+    })
     const run = (await import('../../src/main/runs/repository')).createRun(db, {
       mode: 'personal_ops',
       input: '写任务',
@@ -286,11 +303,11 @@ describe('execute 写工具的批准校验', () => {
   })
 
   it('参数与批准时不一致:CONFLICT', async () => {
-    const { gateway, approvalId, approve } = await setupWithApprovedProposal()
+    const { gateway, runId, approvalId, approve } = await setupWithApprovedProposal()
     approve()
     await expect(
       gateway.execute({
-        runId: 'ghost-r',
+        runId,
         tool: 'fixture.write',
         arguments: { title: '被篡改' },
         planVersion: 1,
@@ -301,11 +318,11 @@ describe('execute 写工具的批准校验', () => {
   })
 
   it('计划版本变化:CONFLICT', async () => {
-    const { gateway, approvalId, approve } = await setupWithApprovedProposal()
+    const { gateway, runId, approvalId, approve } = await setupWithApprovedProposal()
     approve()
     await expect(
       gateway.execute({
-        runId: 'ghost-r',
+        runId,
         tool: 'fixture.write',
         arguments: { title: '项目整理' },
         planVersion: 2,
@@ -321,9 +338,24 @@ describe('execute 写工具的批准校验', () => {
       now: () => new Date(now),
       monotonicMs: systemClock.monotonicMs
     }
-    const { gateway, approvalId, approve } = await setupWithApprovedProposal({ clock: advancingClock })
+    const { gateway, runId, approvalId, approve } = await setupWithApprovedProposal({ clock: advancingClock })
     approve()
     now += 25 * 3600_000
+    await expect(
+      gateway.execute({
+        runId,
+        tool: 'fixture.write',
+        arguments: { title: '项目整理' },
+        planVersion: 1,
+        callIndex: 0,
+        approvalId
+      })
+    ).rejects.toThrow(/已过有效期/)
+  })
+
+  it('审批归属:跨运行携带他运行的有效审批拒绝执行', async () => {
+    const { gateway, approvalId, approve } = await setupWithApprovedProposal()
+    approve()
     await expect(
       gateway.execute({
         runId: 'ghost-r',
@@ -333,7 +365,7 @@ describe('execute 写工具的批准校验', () => {
         callIndex: 0,
         approvalId
       })
-    ).rejects.toThrow(/已过有效期/)
+    ).rejects.toThrow(/审批记录不属于本次运行/)
   })
 
   it('信封带 approved=true 的执行请求同样拒绝', async () => {
@@ -350,5 +382,84 @@ describe('execute 写工具的批准校验', () => {
         approved: true
       })
     ).rejects.toThrow(/不允许调用方声明批准状态/)
+  })
+})
+
+describe('OPS-03 观测出口', () => {
+  it('onObservation 捕获成功两 phase 与回执重放;真实参数/索引/attempt 与库一致', async () => {
+    const db = await makeTestDb()
+    initWorkspaceEpoch()
+    const tools = makeTools()
+    const observations: ToolObservationV1[] = []
+    const gateway = new ToolGateway({
+      db,
+      registry: tools.registry,
+      clock: systemClock,
+      persistCoordinator: createPersistenceCoordinator(db),
+      onObservation: (r) => observations.push(r)
+    })
+    const run = createRun(db, { mode: 'personal_ops', input: '观测', contextClock: NOW })
+    const input = { runId: run.runId, tool: 'fixture.read', arguments: { query: 'x' }, planVersion: 1, callIndex: 0 }
+
+    await gateway.execute(input)
+    await gateway.execute(input) // 回执重放
+
+    expect(observations.map((o) => [o.phase, o.executed, o.replayed])).toEqual([
+      ['tool', true, false],
+      ['persistence', false, false],
+      ['tool', false, true],
+      ['persistence', false, true]
+    ])
+    // 真实参数与索引;重放保持同 operationId。attempt 按"已保存观察最大值+1":
+    // 本用例回调只入内存未落轨迹,已保存最大值仍为 0,故两次调用均为 attempt 1
+    // (落库接线下的 attempt 递增见 toolObservation.test.ts 场景 7)
+    expect(observations[0]!.arguments).toEqual({ query: 'x' })
+    expect(observations[0]!.callIndex).toBe(0)
+    expect(observations[2]!.operationId).toBe(observations[0]!.operationId)
+    expect(observations[2]!.attempt).toBe(1)
+    expect(observations[3]!.attempt).toBe(1)
+    expect(getOperationReceipt(db, `${run.runId}:fixture.read:0`)).toBeDefined()
+    expect(tools.readCalls()).toBe(1)
+  })
+
+  it('审批拒绝的观测携带数据库快照的决定,不采信调用方声明', async () => {
+    const db = await makeTestDb()
+    initWorkspaceEpoch()
+    const tools = makeTools()
+    const observations: ToolObservationV1[] = []
+    const gateway = new ToolGateway({
+      db,
+      registry: tools.registry,
+      clock: systemClock,
+      persistCoordinator: createPersistenceCoordinator(db),
+      onObservation: (r) => observations.push(r)
+    })
+    const run = createRun(db, { mode: 'personal_ops', input: '写任务', contextClock: NOW })
+    const proposal = gateway.propose({
+      runId: run.runId,
+      tool: 'fixture.write',
+      arguments: { title: '未批准' },
+      planVersion: 1
+    })
+
+    await expect(
+      gateway.execute({
+        runId: run.runId,
+        tool: 'fixture.write',
+        arguments: { title: '未批准' },
+        planVersion: 1,
+        callIndex: 0,
+        approvalId: proposal.approvalId
+      })
+    ).rejects.toThrow(/尚未批准/)
+
+    const tool = observations.find((o) => o.phase === 'tool')!
+    expect(tool.outcome).toBe('gateway_error')
+    expect(tool.error?.code).toBe('FORBIDDEN')
+    // 审批字段来自数据库快照:pending 而非调用方声明
+    expect(tool.approvalId).toBe(proposal.approvalId)
+    expect(tool.approvalDecision).toBe('pending')
+    expect(tool.approvalValidated).toBe(false)
+    expect(getOperationReceipt(db, `${run.runId}:fixture.write:0`)).toBeUndefined()
   })
 })

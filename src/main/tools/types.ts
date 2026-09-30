@@ -60,6 +60,15 @@ export interface ToolFailure {
 }
 export type ToolResult = ToolSuccess | ToolFailure
 
+// ---------- 读后规划(OPS-03) ----------
+
+/** 一次已执行的读取调用及其真实结果:重规划提示词"不可信数据"区块的来源 */
+export interface ReadResult {
+  tool: string
+  callIndex: number
+  result: ToolResult
+}
+
 export function toolSuccess(data: unknown): ToolSuccess {
   return { ok: true, data }
 }
@@ -147,4 +156,36 @@ export interface ToolRegistryLike {
   get(name: string): ToolDefinition
   has(name: string): boolean
   list(): string[]
+}
+
+// ---------- 工具观测契约(OPS-03/EVAL-01) ----------
+//
+// 逐字采用完成计划 ops.md 的网关观测接口草案:网关 runOperation 单一出口的
+// 唯一观测形态,经 ToolGatewayDeps.onObservation 回调输出(接线由 OPS 任务落地)。
+// EVAL-01 的 observations.ts 按 (operationId, attempt) 合并 tool/persistence
+// 两阶段生成评分投影,不另建第二套网关字段。
+
+export interface ToolObservationV1 {
+  observationVersion: 1
+  runId: string
+  tool: string
+  callIndex: number
+  operationId: string
+  attempt: number
+  planVersion: number
+  phase: 'tool' | 'persistence'
+  riskLevel: RiskLevel | null
+  attemptedArguments: unknown
+  arguments: Record<string, unknown> | null
+  approvalId: string | null
+  approvalDecision: string | null
+  approvalValidated: boolean
+  targetVersion: number | null
+  executed: boolean
+  replayed: boolean
+  committed: boolean
+  outcome: 'success' | 'business_error' | 'gateway_error' | 'persist_error'
+  result: unknown | null
+  error: AppError | null
+  durationMs: number
 }

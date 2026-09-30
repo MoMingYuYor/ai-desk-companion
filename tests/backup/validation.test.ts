@@ -8,6 +8,8 @@ import { BACKUP_TABLE_ORDER, validateBackup } from '../../src/main/backup/valida
 import { OperationError } from '../../src/main/db/operations'
 import { createTodo, listTodos } from '../../src/main/db/dao'
 import { exportBackup, importBackup } from '../../src/main/services/backup'
+import { createApproval, createRun, decideApproval } from '../../src/main/runs/repository'
+import { argumentsHash } from '../../src/main/tools/schema'
 import { makeTestDb } from '../helpers'
 
 const V4_TABLE_NAMES = [
@@ -236,4 +238,151 @@ it('validateBackup: 表内容不是数组拒绝', () => {
   const tables = v4EmptyTables() as Record<string, unknown>
   tables.conversations = 'not-an-array'
   expect(() => validateBackup(backup(tables as Record<string, unknown[]>), [3, 4])).toThrow(/数组/)
+})
+
+// ---------- OPS-01(2026-09-30 完成计划):备份兼容矩阵 v3~v9 与审批冻结参数 ----------
+
+const OPS_SUPPORTED: readonly number[] = [3, 4, 5, 6, 7, 8, 9]
+
+/** 全量表清单(全空):validateBackup 忽略规格外表键,因此同一清单覆盖 v3~v9 全部必需集合 */
+function allTablesEmpty(): Record<string, unknown[]> {
+  return Object.fromEntries(BACKUP_TABLE_ORDER.map((t) => [t, []]))
+}
+
+function agentRunRow(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    run_id: 'run-1', mode: 'personal_ops', status: 'awaiting_confirmation', input: '整理任务',
+    timezone: 'Asia/Shanghai', context_clock: TS, config_version: '', budget_json: '{}',
+    result_ref: null, error_code: null, started_at: TS, finished_at: null, ...over
+  }
+}
+
+function approvalRow(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    approval_id: 'ap-1', run_id: 'run-1', tool_name: 'todo.create', arguments_hash: 'hash-1',
+    arguments_json: null, plan_version: 1, target_version: null,
+    expires_at: '2026-10-01T00:00:00.000Z', decision: 'pending', decided_at: null, ...over
+  }
+}
+
+it('OPS-01: 受支持版本明确为 v3~v9,未来版本 10 拒绝', () => {
+  for (const version of OPS_SUPPORTED) {
+    expect(() => validateBackup(backup(allTablesEmpty(), version), OPS_SUPPORTED)).not.toThrow()
+  }
+  expect(() => validateBackup(backup(allTablesEmpty(), 10), OPS_SUPPORTED)).toThrow(/10/)
+})
+
+it('OPS-01: v7/v8/v9 备份的审批冻结参数恢复后保持一致', async () => {
+  const args = { title: '冻结参数' }
+  const hash = argumentsHash({ tool: 'todo.create', arguments: args })
+  for (const version of [7, 8, 9] as const) {
+    const db = await makeTestDb()
+    const tables = allTablesEmpty()
+    tables.agent_runs = [agentRunRow()]
+    tables.approvals = [approvalRow({ arguments_hash: hash, arguments_json: JSON.stringify(args) })]
+    const file = writeBackupFile(`v${version}-params.json`, backup(tables, version))
+    const { imported } = importBackup(db, file)
+    expect(imported.approvals).toBe(1)
+    const approval = db.get<{ arguments_json: string | null; decision: string; arguments_hash: string }>(
+      'SELECT arguments_json, decision, arguments_hash FROM approvals WHERE approval_id = ?',
+      ['ap-1']
+    )
+    // 参数按规格列恢复,不因按列 INSERT 被丢弃;决定保持,禁止用 {} 冒充
+    expect(approval?.arguments_json).toBe(JSON.stringify(args))
+    expect(approval?.decision).toBe('pending')
+    expect(approval?.arguments_hash).toBe(hash)
+  }
+})
+
+it('OPS-01: v5/v6 旧备份缺参数的待执行审批恢复后置 expired 并记录原因', async () => {
+  for (const version of [5, 6] as const) {
+    const db = await makeTestDb()
+    const tables = allTablesEmpty()
+    tables.agent_runs = [agentRunRow()]
+    // 历史形态:行内没有 arguments_json 键
+    const legacy = approvalRow()
+    delete legacy.arguments_json
+    tables.approvals = [legacy]
+    const file = writeBackupFile(`v${version}-legacy.json`, backup(tables, version))
+    importBackup(db, file)
+    const approval = db.get<{ arguments_json: string | null; decision: string }>(
+      'SELECT arguments_json, decision FROM approvals WHERE approval_id = ?',
+      ['ap-1']
+    )
+    // 缺失参数恢复为 null(不是 {}),未执行的待批审批失效并要求重新规划
+    expect(approval?.arguments_json).toBeNull()
+    expect(approval?.decision).toBe('expired')
+    const reason = db.get<{ payload: string }>(
+      "SELECT payload FROM trace_events WHERE run_id = 'run-1' AND event_type = 'error'"
+    )
+    expect(reason?.payload).toContain('ap-1')
+  }
+})
+
+it('OPS-01: 参数为 null 的已批准审批恢复后失效,不再继续执行', async () => {
+  const db = await makeTestDb()
+  const tables = allTablesEmpty()
+  tables.agent_runs = [agentRunRow()]
+  tables.approvals = [approvalRow({ decision: 'approved', decided_at: TS, arguments_json: null })]
+  const file = writeBackupFile('v9-null-params.json', backup(tables, 9))
+  importBackup(db, file)
+  const approval = db.get<{ decision: string; arguments_json: string | null }>(
+    'SELECT decision, arguments_json FROM approvals WHERE approval_id = ?',
+    ['ap-1']
+  )
+  expect(approval?.decision).toBe('expired')
+  expect(approval?.arguments_json).toBeNull()
+})
+
+it('OPS-01: 非对象参数、坏 JSON 或与 arguments_hash 不对应的参数拒绝导入', () => {
+  const base = (): Record<string, unknown[]> => {
+    const tables = allTablesEmpty()
+    tables.agent_runs = [agentRunRow()]
+    return tables
+  }
+  const hash = argumentsHash({ tool: 'todo.create', arguments: { title: 'x' } })
+  // 参数必须是 JSON 对象(数组拒绝)
+  expect(() =>
+    validateBackup(backup({ ...base(), approvals: [approvalRow({ arguments_hash: hash, arguments_json: '["x"]' })] }, 9), OPS_SUPPORTED)
+  ).toThrow(/对象/)
+  // 参数必须是有效 JSON
+  expect(() =>
+    validateBackup(backup({ ...base(), approvals: [approvalRow({ arguments_hash: hash, arguments_json: '{bad' })] }, 9), OPS_SUPPORTED)
+  ).toThrow()
+  // 参数必须与工具名及 arguments_hash 对应
+  expect(() =>
+    validateBackup(backup({ ...base(), approvals: [approvalRow({ arguments_hash: hash, arguments_json: '{"title":"y"}' })] }, 9), OPS_SUPPORTED)
+  ).toThrow(/arguments_hash/)
+  // 与 hash 对应的合法参数通过
+  expect(() =>
+    validateBackup(backup({ ...base(), approvals: [approvalRow({ arguments_hash: hash, arguments_json: '{"title":"x"}' })] }, 9), OPS_SUPPORTED)
+  ).not.toThrow()
+})
+
+it('OPS-01: 当前版本导出→恢复往返保留审批冻结参数与决定', async () => {
+  const src = await makeTestDb()
+  const run = createRun(src, { mode: 'personal_ops', input: '建任务', contextClock: TS })
+  const args = { title: '往返参数' }
+  const approval = createApproval(src, {
+    runId: run.runId,
+    toolName: 'todo.create',
+    argumentsHash: argumentsHash({ tool: 'todo.create', arguments: args }),
+    argumentsJson: JSON.stringify(args),
+    planVersion: 1,
+    expiresAt: '2026-10-01T00:00:00.000Z'
+  })
+  decideApproval(src, approval.approvalId, 'approved', TS)
+  const file = join(tempDir(), 'roundtrip-approval.json')
+  exportBackup(src, file)
+
+  const dst = await makeTestDb()
+  createTodo(dst, { title: '将被替换' })
+  importBackup(dst, file)
+  const restored = dst.get<{ arguments_json: string | null; decision: string }>(
+    'SELECT arguments_json, decision FROM approvals'
+  )
+  expect(restored?.arguments_json).toBe(JSON.stringify(args))
+  expect(restored?.decision).toBe('approved')
+  // 替换语义:目标库原有业务行清空
+  expect(listTodos(dst)).toHaveLength(0)
 })

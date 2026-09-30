@@ -8,6 +8,7 @@
 import type { SqliteDb } from '../db/connection'
 import { uid } from '../db/dao'
 import { nowTimestamp } from '../../shared/dateUtils'
+import { getOperationReceipt } from '../db/operations'
 import {
   isRunMode,
   isRunStatus,
@@ -24,6 +25,9 @@ import { assertTransition } from '../agent/stateMachine'
 
 /** 仓库记录形态与 IPC 线缆形态共用 AgentRunView 的字段定义,防止两处漂移 */
 export interface AgentRunRecord extends AgentRunView {}
+
+/** 审批记录类型随仓库一并再导出:编排器与网关经此引用,不绕过仓库层 */
+export type { Approval }
 
 interface RunRow {
   run_id: string
@@ -70,16 +74,35 @@ export interface CreateRunInput {
   budgetJson?: string
 }
 
+/** IANA 时区校验:Intl 不支持的时区在入队前拒绝(OPS-03),不落运行记录 */
+function assertValidTimezone(timezone: string): void {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone })
+  } catch {
+    throw new Error(`运行时区非法,入队前拒绝:${timezone}`)
+  }
+}
+
+/** 冻结上下文时钟必须是可解析的 UTC instant(OPS-03);入队前拒绝,不做猜测性回退 */
+function assertValidContextClock(contextClock: string): void {
+  if (typeof contextClock !== 'string' || Number.isNaN(new Date(contextClock).getTime())) {
+    throw new Error(`运行时间非法,入队前拒绝:${String(contextClock)}`)
+  }
+}
+
 /** 创建运行:初始状态恒为 queued;runId 由本层生成 */
 export function createRun(db: SqliteDb, input: CreateRunInput): AgentRunRecord {
   if (!isRunMode(input.mode)) throw new Error(`mode 非法:${String(input.mode)}`)
   if (input.input.trim() === '') throw new Error('运行输入不能为空')
+  assertValidContextClock(input.contextClock)
+  const timezone = input.timezone ?? 'Asia/Shanghai'
+  assertValidTimezone(timezone)
   const record: AgentRunRecord = {
     runId: uid(),
     mode: input.mode,
     status: 'queued',
     input: input.input,
-    timezone: input.timezone ?? 'Asia/Shanghai',
+    timezone,
     contextClock: input.contextClock,
     configVersion: input.configVersion ?? '',
     budgetJson: input.budgetJson ?? '{}',
@@ -403,4 +426,115 @@ export function expireStaleApprovals(db: SqliteDb, now: string): number {
     ])
   }
   return rows.length
+}
+
+// ---------- 稳定调用索引(OPS-02) ----------
+//
+// 幂等键 = runId:tool:callIndex。索引必须稳定:审批重复或进程重开后,
+// 同一审批仍取同一索引,禁止每次按 tool_call 条数重新分配(回执重放会错位)。
+// 载体:tool_call / confirmation 轨迹事件的 payload.callIndex;
+// 旧轨迹无索引时,首次受理审批的事务内按旧口径分配并写入映射事件,之后从映射读取。
+
+interface CallIndexPayload {
+  callIndex?: unknown
+  approvalId?: unknown
+  planVersion?: unknown
+  operationId?: unknown
+}
+
+/**
+ * 已分配的最大调用索引:扫描 tool_call / confirmation 事件的 payload.callIndex。
+ * 全部缺失(旧轨迹)时回退旧口径"tool_call 条数 - 1",保证首次分配与历史连续。
+ */
+export function maxAssignedCallIndex(db: SqliteDb, runId: string): number {
+  const events = listTraceEvents(db, runId)
+  let max = -1
+  let sawIndex = false
+  let toolCalls = 0
+  for (const event of events) {
+    if (event.eventType === 'tool_call') toolCalls += 1
+    if (event.eventType !== 'tool_call' && event.eventType !== 'confirmation') continue
+    const raw = (event.payload as CallIndexPayload).callIndex
+    if (typeof raw === 'number' && Number.isInteger(raw) && raw >= 0) {
+      sawIndex = true
+      if (raw > max) max = raw
+    }
+  }
+  return sawIndex ? max : toolCalls - 1
+}
+
+/** 写入审批 → 调用索引映射事件(confirmation 类型;旧轨迹补映射用) */
+export function appendCallIndexMapping(
+  db: SqliteDb,
+  input: { runId: string; approvalId: string; toolName: string; callIndex: number; planVersion: number; operationId: string }
+): void {
+  appendTraceEvent(db, {
+    runId: input.runId,
+    eventType: 'confirmation',
+    payload: {
+      event: 'call_index_assigned',
+      approvalId: input.approvalId,
+      tool: input.toolName,
+      callIndex: input.callIndex,
+      planVersion: input.planVersion,
+      operationId: input.operationId
+    }
+  })
+}
+
+/** 从轨迹映射读取审批的稳定调用索引;无映射返回 null */
+export function readApprovalCallIndex(db: SqliteDb, runId: string, approvalId: string): number | null {
+  for (const event of listTraceEvents(db, runId)) {
+    if (event.eventType !== 'tool_call' && event.eventType !== 'confirmation') continue
+    const payload = event.payload as CallIndexPayload
+    if (payload.approvalId === approvalId && typeof payload.callIndex === 'number') {
+      return payload.callIndex
+    }
+  }
+  return null
+}
+
+/**
+ * 本 operationId 已保存观察的最大 attempt(OPS-03):网关按 最大值+1 分配。
+ * 只认 tool_call 观察轨迹;事务回滚的观察未落库,不占用 attempt 编号。
+ */
+export function maxObservationAttempt(db: SqliteDb, runId: string, operationId: string): number {
+  let max = 0
+  for (const event of listTraceEvents(db, runId)) {
+    if (event.eventType !== 'tool_call') continue
+    const payload = event.payload as { operationId?: unknown; attempt?: unknown }
+    if (payload.operationId !== operationId) continue
+    if (typeof payload.attempt === 'number' && Number.isInteger(payload.attempt) && payload.attempt > max) {
+      max = payload.attempt
+    }
+  }
+  return max
+}
+
+/** 审批是否已执行:有稳定索引且对应 operationId 已存在回执 */
+export function isApprovalExecuted(db: SqliteDb, runId: string, approval: Approval): boolean {
+  const callIndex = readApprovalCallIndex(db, runId, approval.approvalId)
+  if (callIndex === null) return false
+  return getOperationReceipt(db, `${runId}:${approval.toolName}:${callIndex}`) !== undefined
+}
+
+/**
+ * 过期一次运行中全部未执行审批:pending 一律过期;已批准但无回执的同样过期
+ * (重启恢复/目标变更失败路径使用),禁止恢复执行。已执行的审批保持原决定。
+ */
+export function expireUnexecutedApprovals(db: SqliteDb, runId: string, now: string = nowTimestamp()): number {
+  const approvals = listApprovals(db, runId)
+  let expired = 0
+  for (const approval of approvals) {
+    const unexecuted =
+      approval.decision === 'pending' ||
+      (approval.decision === 'approved' && !isApprovalExecuted(db, runId, approval))
+    if (!unexecuted) continue
+    db.run("UPDATE approvals SET decision = 'expired', decided_at = ? WHERE approval_id = ?", [
+      now,
+      approval.approvalId
+    ])
+    expired += 1
+  }
+  return expired
 }
