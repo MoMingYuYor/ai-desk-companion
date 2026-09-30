@@ -1,0 +1,10 @@
+# 评测数据与研究语料:行尾统一冻结为 LF。
+# 背景:冻结 hash(快照 manifest 的 raw_sha256、demo 清单的 corpus_sha256)绑定文件
+# 原始字节;若 checkout 配置不同(如 core.autocrlf=true/false)导致工作树行尾漂移,
+# 冻结 hash 校验在干净克隆中必然失败。此处强制 LF 使任何配置下检出字节一致。
+evals/datasets/** text eol=lf
+fixtures/research/** text eol=lf
+
+# 例外:BOM+CRLF 规范化 golden 样例(golden.expected.json 的 raw_sha256 绑定其
+# CRLF 原始字节,该文件就是 CRLF→LF 归一的特性语料)。禁用行尾转换,字节级冻结。
+fixtures/research/normalization/bom_crlf.txt -text -eol

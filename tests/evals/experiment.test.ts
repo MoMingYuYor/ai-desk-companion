@@ -5,11 +5,13 @@
 // - expandExperimentItems 的 case/config/repeat 三元组展开正确性;
 // - 真实数据集(personal_ops_v1 + research_v1)90×2×3=540 全量展开计数与请求上限总量;
 // - smoke 子集(10 Ops + 5 Research)的确定性选择与五类覆盖;
-// - artifacts/experiments/experiment-plan.json 与代码实现的一致性(防计划与代码漂移)。
+// - experiment-plan.json 结构契约:以生成计划的同一代码路径现算断言(核心不变量
+//   不依赖磁盘产物);计划文件存在时才对照磁盘产物防漂移(artifacts/ 不入库,
+//   干净 checkout 无此文件时跳过对照,测试名中注明)。
 //
 // 本测试不调用任何真实模型;fake 通路证据见 tests/evals/ops50.test.ts、
 // tests/evals/researchIntegration.test.ts 与 tests/evals/runner.test.ts。
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { loadDatasetFromDir } from '../../src/main/evals/dataset'
@@ -238,41 +240,66 @@ describe('EXP-01: smoke 子集(10 Ops + 5 Research)确定性选择', () => {
   })
 })
 
-describe('EXP-01: experiment-plan.json 与代码实现一致性', () => {
+describe('EXP-01: experiment-plan.json 结构契约与漂移对照', () => {
   const ops = loadDatasetFromDir(OPS_DIR)
   const research = loadDatasetFromDir(RESEARCH_DIR)
   const allCases = [...ops.cases, ...research.cases]
-  const plan = JSON.parse(readFileSync(PLAN_PATH, 'utf-8')) as {
+
+  // 用生成计划的同一代码路径现算计划内容;核心不变量不依赖 artifacts/ 磁盘产物。
+  const computedItems = expandExperimentItems(allCases, CONFIGS, 3)
+  const computedSmoke = selectSmokeSubset(allCases)
+
+  interface PlanShape {
     expansion: { cases: number; configs: number; repeats: number; expectedItems: number }
     requestBudget: { totalRequestCount: number; items: ExperimentItem[] }
     configs: { baseline: { configId: string }; candidate: { configId: string } }
     smoke: { selections: Array<{ caseId: string; matchedRule: string }> }
   }
+  // artifacts/experiments/experiment-plan.json 不入库(.gitignore):存在时才加载对照,
+  // 缺失时跳过对照(见下方 describe.skipIf 的测试名注明)。
+  const plan: PlanShape | null = existsSync(PLAN_PATH)
+    ? (JSON.parse(readFileSync(PLAN_PATH, 'utf-8')) as PlanShape)
+    : null
 
-  it('计划声明的展开参数与全量展开逐项一致', () => {
-    expect(plan.expansion.cases).toBe(90)
-    expect(plan.expansion.configs).toBe(2)
-    expect(plan.expansion.repeats).toBe(3)
-    expect(plan.expansion.expectedItems).toBe(540)
-    const items = expandExperimentItems(
-      allCases,
-      [
-        { configId: plan.configs.baseline.configId, pipelineVariant: 'baseline' },
-        { configId: plan.configs.candidate.configId, pipelineVariant: 'candidate' }
-      ],
-      plan.expansion.repeats
-    )
-    expect(plan.requestBudget.items).toEqual(items)
+  it('结构契约(现算):90 案例按 2 配置 × 3 重复展开为 540 项,请求上限总量 2640', () => {
+    expect(allCases).toHaveLength(90)
+    expect(computedItems).toHaveLength(540)
+    expect(maximumRequestCount(computedItems)).toBe(2640)
   })
 
-  it('计划声明的请求上限总量等于 maximumRequestCount 重算结果', () => {
-    expect(plan.requestBudget.totalRequestCount).toBe(maximumRequestCount(plan.requestBudget.items))
-    expect(plan.requestBudget.totalRequestCount).toBe(2640)
+  it('结构契约(现算):smoke 子集 15 条,单配置 70、双配置 140 请求上限', () => {
+    expect(computedSmoke.selections).toHaveLength(15)
+    const smokeCases = allCases.filter((c) => computedSmoke.selections.some((s) => s.caseId === c.case_id))
+    expect(maximumRequestCount(expandExperimentItems(smokeCases, [BASELINE], 1))).toBe(70)
+    expect(maximumRequestCount(expandExperimentItems(smokeCases, CONFIGS, 1))).toBe(140)
   })
 
-  it('计划的 smoke 清单与 selectSmokeSubset 输出一致', () => {
-    const expected = selectSmokeSubset(allCases)
-    expect(plan.smoke.selections.map((s) => s.caseId)).toEqual(expected.selections.map((s) => s.caseId))
-    expect(plan.smoke.selections.map((s) => s.matchedRule)).toEqual(expected.selections.map((s) => s.matchedRule))
+  // 磁盘计划文件仅用于"计划与代码漂移"对照;不入库,缺失时跳过并在测试名注明。
+  describe.skipIf(plan === null)('漂移对照(artifacts/experiments/experiment-plan.json 存在时)', () => {
+    it('计划声明的展开参数与全量展开逐项一致', () => {
+      expect(plan!.expansion.cases).toBe(90)
+      expect(plan!.expansion.configs).toBe(2)
+      expect(plan!.expansion.repeats).toBe(3)
+      expect(plan!.expansion.expectedItems).toBe(540)
+      const items = expandExperimentItems(
+        allCases,
+        [
+          { configId: plan!.configs.baseline.configId, pipelineVariant: 'baseline' },
+          { configId: plan!.configs.candidate.configId, pipelineVariant: 'candidate' }
+        ],
+        plan!.expansion.repeats
+      )
+      expect(plan!.requestBudget.items).toEqual(items)
+    })
+
+    it('计划声明的请求上限总量等于 maximumRequestCount 重算结果', () => {
+      expect(plan!.requestBudget.totalRequestCount).toBe(maximumRequestCount(plan!.requestBudget.items))
+      expect(plan!.requestBudget.totalRequestCount).toBe(2640)
+    })
+
+    it('计划的 smoke 清单与 selectSmokeSubset 输出一致', () => {
+      expect(plan!.smoke.selections.map((s) => s.caseId)).toEqual(computedSmoke.selections.map((s) => s.caseId))
+      expect(plan!.smoke.selections.map((s) => s.matchedRule)).toEqual(computedSmoke.selections.map((s) => s.matchedRule))
+    })
   })
 })

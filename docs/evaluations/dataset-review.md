@@ -52,8 +52,17 @@ fixture 为内置虚拟库 `ops-empty`/`ops-seeded`(跨 split 共享属预期设
 | research_v1 cases.jsonl(= manifest 声明) | `b7d3db70a10129cca9bd4db7bf05ebabd6d32931cd85e9b49179d400a41c7165` |
 | research_v1 manifest.json(文件) | `907611ca885906197e3cce95556036c5169bd56e7c6dc1f199aaf7985ad4d6f8` |
 | research_v1 annotations 树(41 文件含 README) | `e79c61ca89a934c4281accf8c9a88d2a192d0c7ef0c6798d3affab693ff01290` |
-| research_v1 snapshots 树 | `3ecfc0d3f0e924ce9fe87b0bf1c4713bddfe423e614fa0a232aae04be44aa99e` |
-| fixtures/research 树(含 demo/ 演示语料) | `9fe412a1d9a4bf0707a71e9425241cc1ba861caa1d683f8b1fe6b75a7c8da72c` |
+| research_v1 snapshots 树 | `0792842d7b4e0b7e5e90e9ded08e95f1419b5bfbfbe2327c03e95cc55e6159c7` |
+| fixtures/research 树(含 demo/ 演示语料) | `07c249817b8d7508bb4b86a5098b5d370bf492de5a53aba48a9bd6ad75524d8e` |
+
+> 2026-10-01 行尾归一后更新:`fixtures/research/locate-006/jd.txt`、`locate-010/jd.txt`
+> 及 `evals/datasets/research_v1/snapshots/` 下两份副本由 CRLF 归一为 LF(git index 一直
+> 存 LF,此前工作磁盘为 CRLF,使绑定磁盘字节的冻结 hash 随 checkout 配置漂移)。受影响
+> 重算:上表 snapshots 树、fixtures 树两行,及两份快照 manifest 的 `raw_sha256`
+> (locate-006 `2478330c…`→`824b3296…`,locate-010 `d56646ec…`→`4e281acb…`);
+> `text_sha256` 与 gold 证据坐标不受影响(规范化 v1 输出不变)。行尾此后由 `.gitattributes`
+> 强制(`evals/datasets/**`、`fixtures/research/**` 为 `text eol=lf`;
+> `normalization/bom_crlf.txt` 为字节冻结例外,保持 CRLF 特性样例)。
 
 **冻结声明**:以上 hash 对应本报告日期的 `feat/agent-portfolio` 工作区数据。自本报告
 起,两数据集视为冻结;任何内容变化(案例、gold、语料、期望坐标)必须创建新数据版本
