@@ -24,6 +24,11 @@
 //   不同逻辑 Source 分别保留"的规格语义。
 //
 // offset 语义:码点索引(零起点、左闭右开),与 Array.from(text) 切片对齐。
+//
+// RES-02:整文件规范全文仍是每条记录行的 normalized_text(gold 全文件坐标不变),
+// 但 FTS 分块只按各记录的范围(projectResearchSourceWithRanges 累计的 RecordScope)
+// 进行——范围内分块、检索与验证,块/邻块/span 不再跨记录端点;record_scope 随
+// source_metadata_json 持久化并冻结进清单(v2)。
 
 import { randomUUID } from 'node:crypto'
 import type { SqliteDb } from '../db/connection'
@@ -38,7 +43,7 @@ import {
   textSha256
 } from '../retrieval/normalize'
 import { SEARCH_VERSION, tokenizeForSearch } from '../retrieval/tokenize'
-import { chunkText } from '../retrieval/chunker'
+import { chunkRecord, validateRecordScope, type RecordScope } from './recordScope'
 import { MAX_DOCUMENT_BYTES } from '../retrieval/importer'
 
 // ---------- 常量与类型 ----------
@@ -119,7 +124,10 @@ export interface ImportedResearchSource {
   codePointLength: number
   collectedAt: string
   collectionTimeBasis: CollectionTimeBasis
+  /** 本记录范围内的块数(RES-02:范围内分块,不再是整文件块数) */
   chunkCount: number
+  /** 本记录在整文件规范全文坐标系内的范围;旧库行(无范围)为 null */
+  recordScope: RecordScope | null
   /** 同一原始字节+定位已导入过,复用既有快照 */
   deduped: boolean
 }
@@ -292,6 +300,142 @@ function coreTextOf(record: ParsedRecord): string {
   return normalizePlainText(projectJsonSource(JSON.stringify(core)))
 }
 
+// ---------- 记录范围投影(RES-02) ----------
+
+/** 多记录文件投影结果:整文件规范全文 + 各记录的码点范围 */
+export interface ProjectedResearchFile {
+  normalizedText: string
+  scopes: RecordScope[]
+}
+
+/**
+ * projectResearchSourceWithRanges(RES-02):复用现有 JSON 键排序/叶值遍历与 CSV
+ * 解析,按产生字段的记录归属累计码点范围,禁止通过 indexOf 文本猜范围。
+ * 输出 normalizedText 必须逐字节等于现存 normalizePlainText(projectJsonSource(...))
+ * 或 CSV 表头加各行字段展平投影(运行时防御断言,不等价即整个文件导入拒绝);
+ * 保留 BOM、CRLF→LF、NFC 的现有顺序。JSON 数组对象的全部投影叶子属于其 /i;
+ * CSV 数据行属于 row:i,表头保留在全文但不进入任何数据记录的支持范围;
+ * 单对象 JSON、md/txt 为全范围。
+ */
+export function projectResearchSourceWithRanges(
+  sourceType: ResearchSourceType,
+  decodedText: string
+): ProjectedResearchFile {
+  if (sourceType === 'markdown' || sourceType === 'txt') {
+    const normalizedText = normalizePlainText(decodedText)
+    return {
+      normalizedText,
+      scopes: [{
+        version: 1,
+        coordinateSystem: 'full-file-codepoint-v1',
+        sourceLocator: null,
+        startOffset: 0,
+        endOffset: Array.from(normalizedText).length
+      }]
+    }
+  }
+
+  const parseInput = normalizePlainText(decodedText)
+  const segments: Array<{ text: string; locator: string | null }> = []
+  if (sourceType === 'json') {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(parseInput)
+    } catch {
+      throw parseError('文件不是合法的 JSON')
+    }
+    // 与 projectJson 的 projectJsonSource 同序遍历(键排序、数组保序、空串跳过)
+    const walk = (value: unknown, locator: string | null): void => {
+      if (value === null || value === undefined) return
+      if (typeof value === 'string') {
+        if (value.trim() !== '') segments.push({ text: value, locator })
+        return
+      }
+      if (typeof value === 'number' || typeof value === 'boolean') {
+        segments.push({ text: String(value), locator })
+        return
+      }
+      if (Array.isArray(value)) {
+        for (const item of value) walk(item, locator)
+        return
+      }
+      for (const key of Object.keys(value).sort()) {
+        walk((value as Record<string, unknown>)[key], locator)
+      }
+    }
+    if (Array.isArray(parsed)) {
+      if (parsed.length === 0) throw parseError('JSON 数组没有记录')
+      parsed.forEach((item, i) => walk(item, `/${i}`))
+    } else if (parsed !== null && typeof parsed === 'object') {
+      walk(parsed, null)
+    } else {
+      throw parseError('JSON 顶层必须是对象或数组')
+    }
+  } else if (sourceType === 'csv') {
+    const rows = parseCsvRows(parseInput)
+    const [head, ...data] = rows
+    if (!head || data.length === 0) throw parseError('CSV 缺少表头或数据行')
+    for (const field of head) segments.push({ text: field, locator: null })
+    data.forEach((row, i) => {
+      for (const field of row) segments.push({ text: field, locator: `row:${i + 1}` })
+    })
+  } else {
+    throw parseError(`不支持的格式:${String(sourceType)}`)
+  }
+
+  // 逐段规范化(与 normalizePlainText 相同的 CRLF→LF 与 NFC;段间 '\n' 分隔符
+  // 阻断 NFC 跨段组合),首段行首 BOM 与全局规范化一致地剥离。
+  const normSegments = segments.map((s) => ({
+    locator: s.locator,
+    text: s.text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').normalize('NFC')
+  }))
+  if (normSegments.length > 0 && normSegments[0]!.text.startsWith('\uFEFF')) {
+    normSegments[0]!.text = normSegments[0]!.text.slice(1)
+  }
+  const normalizedText = normSegments.map((s) => s.text).join('\n')
+
+  // 投影等价防御:必须与现存共享投影器逐字节一致,否则整个文件导入拒绝
+  const legacyProjection =
+    sourceType === 'json'
+      ? normalizePlainText(projectJsonSource(parseInput))
+      : normalizePlainText(projectCsvSource(parseInput))
+  if (normalizedText !== legacyProjection) {
+    throw parseError('记录范围投影与现契约不等价,拒绝导入')
+  }
+
+  // 按记录归属累计码点范围:组内段间 '\n' 计入本记录,记录间分隔符不入任何范围
+  const scopes: RecordScope[] = []
+  let cursor = 0
+  let current: { locator: string | null; start: number; end: number } | null = null
+  const flush = (): void => {
+    if (current !== null && current.end > current.start) {
+      scopes.push({
+        version: 1,
+        coordinateSystem: 'full-file-codepoint-v1',
+        sourceLocator: current.locator,
+        startOffset: current.start,
+        endOffset: current.end
+      })
+    }
+  }
+  for (const seg of normSegments) {
+    const len = Array.from(seg.text).length
+    if (current === null || current.locator !== seg.locator) {
+      flush()
+      current = { locator: seg.locator, start: cursor, end: cursor + len }
+    } else {
+      current.end = cursor + len
+    }
+    cursor += len + 1 // 段间分隔符 '\n'
+  }
+  flush()
+  // CSV:表头不构成记录范围(保留在全文但不进入任何数据记录的支持范围)
+  return {
+    normalizedText,
+    scopes: sourceType === 'csv' ? scopes.filter((s) => s.sourceLocator !== null) : scopes
+  }
+}
+
 // ---------- 主入口 ----------
 
 /**
@@ -374,24 +518,37 @@ function importOneFile(
     records = [{ locator: null, recordIndex: null, fields: {}, fullText: normalizePlainText(decodedText), sourceType }]
   }
 
-  // 规范全文(整文件投影):JSON/CSV 走各自的投影契约,md/txt 即规范正文
-  const normText =
-    records[0]!.fullText !== null
-      ? records[0]!.fullText!
-      : normalizePlainText(
-          sourceType === 'json' ? projectJsonSource(parseInput) : projectCsvSource(parseInput)
-        )
+  // 规范全文与记录范围(RES-02):JSON/CSV 走投影契约并累计记录范围,md/txt 全范围。
+  // 投影不等价或解析失败时整个文件拒绝(不留任何行),其他文件可独立处理。
+  let projected: ProjectedResearchFile
+  try {
+    projected = projectResearchSourceWithRanges(sourceType, decodedText)
+  } catch (err) {
+    return [failed(sourceName, sourceType, null, null, parseError(`${sourceName}:${err instanceof Error ? err.message : String(err)}`))]
+  }
+  const normText = projected.normalizedText
   const textSha = textSha256(normText)
   const codePointLength = Array.from(normText).length
 
-  // 逐记录校验(description 必填、单记录码点上限),先于任何写入。
+  // 逐记录校验(description 必填、单记录码点上限、记录范围存在),先于任何写入。
   // 失败与有效条目都按记录序排队,最终 outcomes 严格按记录序输出。
-  type ValidItem = { record: ParsedRecord; identity: string; contentSha: string; description: string }
+  type ValidItem = { record: ParsedRecord; identity: string; contentSha: string; description: string; scope: RecordScope }
   const queue: Array<{ failure: ResearchSourceOutcome | null; valid: ValidItem | null }> = []
   for (const record of records) {
     const locator = record.locator
     const index = record.recordIndex
     const description = record.fullText !== null ? record.fullText : record.fields.description
+    const scope = projected.scopes.find((s) => s.sourceLocator === locator) ?? null
+    if (scope === null) {
+      // 有效记录必须有范围(退化投影属文件结构异常):逐记录拒绝,不从全文猜边界
+      queue.push({
+        failure: failed(sourceName, sourceType, index, locator, parseError(
+          `${sourceName}${describeLocator(locator)}:记录范围缺失,拒绝从扁平全文猜测边界`
+        )),
+        valid: null
+      })
+      continue
+    }
     if (typeof description !== 'string' || description.trim() === '') {
       queue.push({
         failure: failed(sourceName, sourceType, index, locator, parseError(
@@ -417,7 +574,8 @@ function importOneFile(
         record,
         identity: deriveIdentity(source, record),
         contentSha: sha256Hex(coreText),
-        description
+        description,
+        scope
       }
     })
   }
@@ -439,14 +597,13 @@ function importOneFile(
   const now = clock.now().toISOString()
   const collectedAt = source.collectedAt ?? now
   const timeBasis: CollectionTimeBasis = source.collectedAt ? 'source' : 'imported'
-  const chunks = chunkText(normText)
 
   /** 本文件的逐记录结果,事务成功后合并输出(保持记录序) */
   const outcomes: ResearchSourceOutcome[] = []
   const importedThisFile: ImportedResearchSource[] = []
   db.transaction(() => {
     for (const item of valid) {
-      const { record, identity, contentSha, description } = item
+      const { record, identity, contentSha, description, scope } = item
       const locator = record.locator
 
       // 幂等:同一原始字节 + 同一定位复用既有快照(同文件不同名称不产生新行)
@@ -475,6 +632,7 @@ function importOneFile(
             collectedAt: stored.collectedAt,
             collectionTimeBasis: stored.collectionTimeBasis,
             chunkCount: stored.chunkCount,
+            recordScope: stored.recordScope,
             deduped: true
           })
           continue
@@ -525,7 +683,9 @@ function importOneFile(
         collection_time_basis: timeBasis,
         provenance_relation: relation,
         content_sha256: contentSha,
-        sample: source.sample ?? false
+        sample: source.sample ?? false,
+        // RES-02:记录范围随元数据持久化(整文件规范全文码点坐标系)
+        record_scope: scope
       }
 
       const documentId = randomUUID()
@@ -550,6 +710,9 @@ function importOneFile(
           timeBasis
         ]
       )
+      // RES-02:FTS 只索引本记录范围内的块(局部 offset 加 scope.startOffset),
+      // 块/邻块/span 不跨记录端点;其他记录的内容不再被复制进本记录的索引
+      const chunks = chunkRecord(normText, scope)
       for (const chunk of chunks) {
         const chunkId = randomUUID()
         const searchText = tokenizeForSearch(chunk.content).join(' ')
@@ -582,6 +745,7 @@ function importOneFile(
         collectedAt,
         collectionTimeBasis: timeBasis,
         chunkCount: chunks.length,
+        recordScope: scope,
         deduped: false
       })
     }
@@ -619,6 +783,8 @@ export interface ResearchSourceRecord {
   collectedAt: string
   collectionTimeBasis: CollectionTimeBasis
   chunkCount: number
+  /** RES-02:记录范围(整文件规范全文码点坐标系);旧库行(无范围)为 null */
+  recordScope: RecordScope | null
   metadata: Record<string, unknown>
 }
 
@@ -645,6 +811,9 @@ export function getResearchSourceRecord(db: SqliteDb, documentId: string): Resea
   if (!row) return null
   const metadata = (row.source_metadata_json ? JSON.parse(row.source_metadata_json) : {}) as Record<string, unknown>
   const contentSha256 = typeof metadata.content_sha256 === 'string' ? metadata.content_sha256 : ''
+  const codePointLength = Array.from(row.normalized_text).length
+  const recordScope =
+    metadata.record_scope === undefined ? null : validateRecordScope(metadata.record_scope, codePointLength)
   return {
     documentId: row.document_id,
     sourceName: row.source_name,
@@ -657,11 +826,12 @@ export function getResearchSourceRecord(db: SqliteDb, documentId: string): Resea
     textSha256: row.text_sha256,
     contentSha256,
     normalizedText: row.normalized_text,
-    codePointLength: Array.from(row.normalized_text).length,
+    codePointLength,
     collectedAt: typeof metadata.collected_at === 'string' ? metadata.collected_at : '',
     collectionTimeBasis: (row.collection_time_basis === 'source' ? 'source' : 'imported'),
     chunkCount:
       db.get<{ n: number }>('SELECT COUNT(*) AS n FROM retrieval_chunks WHERE document_id = ?', [row.document_id])?.n ?? 0,
+    recordScope,
     metadata
   }
 }

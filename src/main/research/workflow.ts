@@ -49,8 +49,10 @@ import type { OperationOutcome } from '../db/operations'
 import { systemClock, type Clock } from '../../shared/clock'
 import { transitionRun, getRun, appendTraceEvent, type AgentRunRecord } from '../runs/repository'
 import type { RunQueue } from '../agent/runQueue'
+import type { RunScheduler } from '../agent/runScheduler'
 import type { AgentEventStream } from '../agent/eventStream'
 import type { StructuredCompleter } from '../agent/llm'
+import { ModelRequestError, type ModelAttemptEvent, type ModelAttemptRecord, type ModelRequestControl } from '../services/modelRequest'
 import type { RunStatus, TraceEventType } from '../../shared/agent'
 import {
   BudgetExhaustedError,
@@ -58,7 +60,8 @@ import {
   finalizeOutcome,
   isBudgetExhaustedError,
   restoreLedger,
-  type ResearchBudgetLedger
+  type ResearchBudgetLedger,
+  type SlotKind
 } from './budget'
 import { codePointLength } from './schemas'
 import {
@@ -78,10 +81,11 @@ import {
   updateResearchTaskPhase,
   updateSubQuestionOutcome,
   verifySnapshotManifest,
+  saveAllOfRequirement,
   type ResearchRunHandle
 } from './repository'
 import { retrieveForSubquestion } from './retrieval'
-import { resolveSpanOffsets, validateCitations, type CitationValidationReport, type OffsetResolution } from './citations'
+import { resolveSpanOffsets, validateCitations, type AllOfRequirement, type CitationValidationReport, type OffsetResolution } from './citations'
 import { detectConflicts, persistSubquestionOutcomes, reviewClaims, type ReviewOutcome } from './evidence'
 import { buildReport } from './reports'
 
@@ -287,12 +291,19 @@ export function parseExtractionOutput(raw: unknown): ExtractionModelOutput {
       if (item.claim_type !== 'fact' && item.claim_type !== 'comparison' && item.claim_type !== 'recommendation') {
         throw extractionInvalid('claim_type 非法')
       }
+      const supports = item.supports === undefined ? [] : indexListOf(item.supports)!
+      // RES-03:all_of 预期成员约束——空组、重复、越界属无效抽取输出,进入受控重试
+      if (item.all_of === true) {
+        if (supports.length === 0) throw extractionInvalid('all_of Claim 的 supports 必须至少一个预期成员')
+        if (new Set(supports).size !== supports.length) throw extractionInvalid('all_of Claim 的 supports 不得重复')
+        if (supports.some((idx) => idx >= evidence.length)) throw extractionInvalid('all_of Claim 的 supports 引用越界')
+      }
       claims.push({
         text: item.text,
         claim_type: item.claim_type,
         subject: isPlainObject(item.subject) ? item.subject : undefined,
         qualifier: isPlainObject(item.qualifier) ? item.qualifier : undefined,
-        supports: item.supports === undefined ? [] : indexListOf(item.supports)!,
+        supports,
         contradicts: indexListOf(item.contradicts),
         context: indexListOf(item.context),
         all_of: item.all_of === true ? true : undefined
@@ -320,6 +331,19 @@ class WorkflowFailed extends Error {
   }
 }
 
+/** 模型错误是否可触发抽取的唯一一次受控重试(RES-01 重试分类) */
+function isRetryableModelError(err: unknown): boolean {
+  if (err instanceof ModelRequestError) {
+    // 鉴权/配置、取消、预算不足、总时限到达与观测失败均不重试
+    if (err.code === 'CANCELLED' || err.code === 'OBSERVATION_FAILED' || err.code === 'BUDGET_EXHAUSTED') {
+      return false
+    }
+    return err.retryable
+  }
+  // 既有语义:结构化输出解析失败等可重试
+  return true
+}
+
 // ---------- 驱动状态(每次 driveResearch 一个实例) ----------
 
 interface ClarificationQuestionSet {
@@ -344,6 +368,8 @@ interface DriverState {
    * 「已判定的不足项」,不能伪装成 no_evidence 的诚实产物。
    */
   determinedSubIds: string[]
+  /** RES-01:每次 driveResearch 独立的取消控制器;signal 贯穿到 fetch 与 reader.read */
+  abortController: AbortController
 }
 
 interface WorkflowCheckpoint {
@@ -366,8 +392,13 @@ export interface ResearchWorkflowDeps {
   events?: Pick<AgentEventStream, 'emit'>
   clock?: Clock
   /**
-   * 非研究队列运行的驱动钩子(R-06 接线):研究运行收尾让出执行权后,
-   * 队列里的 personal_ops 运行由组合层转交 RunOrchestrator.drivePlanning。
+   * 共享调度器(OPS-02):接线后接力统一由调度器唤醒——驱动 finally 释放即
+   * request(),本工作流不再自行挑选下一个运行;缺省时保留旧的本地接力行为。
+   */
+  scheduler?: RunScheduler
+  /**
+   * 非研究队列运行的驱动钩子(R-06 旧接线,已由 scheduler 取代):
+   * 仅在未注入 scheduler 时作为回退使用。
    */
   onNonResearchQueued?: (runId: string) => void
 }
@@ -378,6 +409,9 @@ export interface ResearchAnswersInput {
 }
 
 export class ResearchWorkflow {
+  /** RES-01:进行中驱动的取消控制器(runId → controller);requestCancel 先 abort */
+  private readonly activeControllers = new Map<string, AbortController>()
+
   constructor(private readonly deps: ResearchWorkflowDeps) {}
 
   private get db(): SqliteDb {
@@ -394,9 +428,11 @@ export class ResearchWorkflow {
    * 创建研究运行(幂等):直接转交共享 RunService 侧的 createResearchRun
    * (R-01 已做请求校验、清单冻结、mode=research 约束与 MODE_MISMATCH 防护),
    * 只落库排队不驱动(创建不在调用方请求内等待模型)。
+   * RES/OPS 收口接线:workspaceEpoch 显式透传给 createResearchRun;缺省保持
+   * 现状(取当前进程代数),评测环境注入案例局部 epoch 以免触碰生产全局(F-12)。
    */
   createRun(
-    input: { request: unknown; parentRunId?: string | null; timezone?: string; configVersion?: string },
+    input: { request: unknown; parentRunId?: string | null; timezone?: string; configVersion?: string; workspaceEpoch?: string },
     operationId: string
   ): OperationOutcome<ResearchRunHandle> {
     return createResearchRun(
@@ -407,7 +443,8 @@ export class ResearchWorkflow {
         timezone: input.timezone,
         configVersion: input.configVersion,
         parentRunId: input.parentRunId ?? null,
-        clock: this.clock
+        clock: this.clock,
+        workspaceEpoch: input.workspaceEpoch
       },
       operationId
     )
@@ -415,13 +452,18 @@ export class ResearchWorkflow {
 
   /** 创建并异步驱动(生产入口);返回排队中的句柄,不等待模型 */
   startRun(
-    input: { request: unknown; parentRunId?: string | null; timezone?: string; configVersion?: string },
+    input: { request: unknown; parentRunId?: string | null; timezone?: string; configVersion?: string; workspaceEpoch?: string },
     operationId: string
   ): ResearchRunHandle {
     const { value } = this.createRun(input, operationId)
-    void this.driveResearch(value.run.runId).catch((err: unknown) => {
-      console.error('[research-workflow] 驱动异常:', err instanceof Error ? err.message : String(err))
-    })
+    // OPS-02:接线调度器后由 request() 统一挑选就绪项(合并唤醒),不再自行驱动
+    if (this.deps.scheduler) {
+      this.deps.scheduler.request()
+    } else {
+      void this.driveResearch(value.run.runId).catch((err: unknown) => {
+        console.error('[research-workflow] 驱动异常:', err instanceof Error ? err.message : String(err))
+      })
+    }
     return value
   }
 
@@ -477,6 +519,74 @@ export class ResearchWorkflow {
     }
   }
 
+  // ---------- RES-01:阶段控制与发送观测 ----------
+
+  /**
+   * 阶段控制(RES-01):为一次模型调用生成 ModelRequestControl。
+   * beforeSend 同步执行取消检查、预算准入与 checkpoint 保存;失败则不发送。
+   * 审核阶段(consumeReservation)消费抽取前已完成的预留,不得再次 reserve;
+   * 规划、抽取、组织在 beforeSend 扣槽位。抽取重试以子问题 ID 为 retryKey。
+   */
+  private stageControl(
+    driver: DriverState,
+    kind: SlotKind,
+    opts: { consumeReservation?: boolean; isRetry?: boolean; retryKey?: string } = {}
+  ): ModelRequestControl {
+    return {
+      requestId: uid(),
+      signal: driver.abortController.signal,
+      timeoutMs: driver.ledger.modelCallTimeoutMs(MODEL_CALL_LIMIT_MS),
+      policy: { maxAttempts: 1, fallback: 'disabled' },
+      beforeSend: (attempt) => {
+        // 取消检查:已取消/已终结即中止,不占预算
+        this.assertActive(driver.runId)
+        if (opts.consumeReservation !== true) {
+          driver.ledger.reserve(
+            kind,
+            opts.isRetry === true ? { isRetry: true, retryKey: opts.retryKey } : {}
+          )
+        }
+        // 准入即记录发送身份并保存 checkpoint(崩溃后可审计在途发送)
+        driver.ledger.recordSentAttempt(attempt.attemptId)
+        this.saveCheckpoint(driver)
+      },
+      onAttempt: (event) => {
+        // 观测持久化:抛错由 Router 转 OBSERVATION_FAILED 并 abort 在途请求
+        this.traceAttempt(driver.runId, event)
+      }
+    }
+  }
+
+  /** 发送观测落轨迹:sent(派发)与 settled(结算)各一条;载荷只含 ID/计数/枚举 */
+  private traceAttempt(runId: string, event: ModelAttemptEvent): void {
+    if (event.type === 'sent') {
+      this.trace(runId, 'model', {
+        event: 'research.model_sent',
+        request_id: event.attempt.requestId,
+        attempt_id: event.attempt.attemptId,
+        ordinal: event.attempt.ordinal,
+        provider_id: event.attempt.providerId,
+        model: event.attempt.model
+      })
+      return
+    }
+    const attempt: ModelAttemptRecord = event.attempt
+    this.trace(runId, 'model', {
+      event: 'research.model_attempt',
+      request_id: attempt.requestId,
+      attempt_id: attempt.attemptId,
+      ordinal: attempt.ordinal,
+      provider_id: attempt.providerId,
+      provider_name: attempt.providerName,
+      model: attempt.model,
+      response_model: attempt.responseModel,
+      outcome: attempt.outcome,
+      latency_ms: attempt.latencyMs,
+      http_status: attempt.httpStatus,
+      usage: attempt.usage
+    })
+  }
+
   // ---------- 主驱动 ----------
 
   /**
@@ -522,83 +632,97 @@ export class ResearchWorkflow {
       clarifications: ckpt?.clarifications ?? null,
       answers: ckpt?.answers ?? {},
       reviewCompleted: ckpt?.reviewCompleted === true,
-      determinedSubIds: ckpt?.determinedSubIds ?? []
+      determinedSubIds: ckpt?.determinedSubIds ?? [],
+      abortController: new AbortController()
     }
-
-    if (!restored) {
-      driver.ledger.activity.start()
-      // 快照冻结事件:只含清单 hash 与数量,不保存完整私有资料
-      const manifest = getSnapshotManifest(this.db, task.snapshotManifestId)
-      this.trace(runId, 'input', {
-        event: 'research.snapshot_frozen',
-        manifest_id: task.snapshotManifestId,
-        manifest_sha256: manifest?.manifestSha256 ?? '',
-        snapshot_count: manifest?.entries.length ?? 0
-      })
-    } else {
-      // 恢复:重开在途活动段(等待用户的时间已排除在账本之外)
-      try {
-        driver.ledger.activity.resume()
-      } catch {
-        // 时限已到达:直接进入主循环,首个 reserve 按 DEADLINE 拒绝并走收尾
-      }
-    }
-
+    this.activeControllers.set(runId, driver.abortController)
     try {
-      if (driver.phase === 'planning') {
-        const awaiting = await this.planStage(driver, task.budget.max_subqueries)
-        if (awaiting) return // awaiting_input:执行权已释放,等待答案重新入队
+      if (!restored) {
+        driver.ledger.activity.start()
+        // 快照冻结事件:只含清单 hash 与数量,不保存完整私有资料
+        const manifest = getSnapshotManifest(this.db, task.snapshotManifestId)
+        this.trace(runId, 'input', {
+          event: 'research.snapshot_frozen',
+          manifest_id: task.snapshotManifestId,
+          manifest_sha256: manifest?.manifestSha256 ?? '',
+          snapshot_count: manifest?.entries.length ?? 0
+        })
+      } else if (driver.ledger.checkpointVersion === 1) {
+        // RES-01:恢复旧 v1 checkpoint 不重发历史请求,已有运行按 interrupted 收尾;
+        // 重试必须开启新运行,防止遗漏在途发送后超额
+        this.failRun(runId, 'WORKER_INTERRUPTED', '旧版本 v1 检查点不支持续跑真实发送,请开启新运行重试')
+        return
+      } else {
+        // 恢复:重开在途活动段(等待用户的时间已排除在账本之外)
+        try {
+          driver.ledger.activity.resume()
+        } catch {
+          // 时限已到达:直接进入主循环,首个 reserve 按 DEADLINE 拒绝并走收尾
+        }
       }
 
-      // 抽取前置:reserve('review')(审核+收尾窗口,先于抽取);恢复路径按账本阶段幂等
-      const reviewReserved =
-        driver.ledger.currentPhase === 'review_reserved' || driver.ledger.currentPhase === 'synthesis'
-      if (!reviewReserved) {
-        driver.ledger.reserve('review')
-        driver.phase = 'extracting'
-        this.saveCheckpoint(driver)
-      }
-      this.assertActive(runId)
-      this.transition(runId, 'executing')
+      try {
+        if (driver.phase === 'planning') {
+          const awaiting = await this.planStage(driver, task.budget.max_subqueries)
+          if (awaiting) return // awaiting_input:执行权已释放,等待答案重新入队
+        }
 
-      await this.extractionStage(driver)
-      this.assertActive(runId)
+        // 抽取前置:reserve('review')(审核+收尾窗口,先于抽取);恢复路径按账本阶段幂等
+        const reviewReserved =
+          driver.ledger.currentPhase === 'review_reserved' || driver.ledger.currentPhase === 'synthesis'
+        if (!reviewReserved) {
+          driver.ledger.reserve('review')
+          driver.phase = 'extracting'
+          this.saveCheckpoint(driver)
+        }
+        this.assertActive(runId)
+        this.transition(runId, 'executing')
 
-      // 时限在抽取后到达:不再继续审核/组织模型请求,转入收尾(活动时限到达
-      // 终止继续检索与模型请求——规格第 8 节)
-      if (driver.ledger.checkDeadline()) {
-        throw new BudgetExhaustedError('活动时限已到达,终止继续检索与模型请求(DEADLINE_REACHED)', 'DEADLINE')
-      }
+        await this.extractionStage(driver)
+        this.assertActive(runId)
 
-      driver.phase = 'reviewing'
-      await this.reviewStage(driver)
-      this.assertActive(runId)
+        // 时限在抽取后到达:不再继续审核/组织模型请求,转入收尾(活动时限到达
+        // 终止继续检索与模型请求——规格第 8 节)
+        if (driver.ledger.checkDeadline()) {
+          throw new BudgetExhaustedError('活动时限已到达,终止继续检索与模型请求(DEADLINE_REACHED)', 'DEADLINE')
+        }
 
-      driver.phase = 'synthesizing'
-      await this.synthesisStage(driver)
-    } catch (err) {
-      if (err instanceof WorkflowAborted) {
-        // 用户取消:不做任何收尾写入,不伪装 partial;让出执行权并驱动下一个
+        driver.phase = 'reviewing'
+        await this.reviewStage(driver)
+        this.assertActive(runId)
+
+        driver.phase = 'synthesizing'
+        await this.synthesisStage(driver)
+      } catch (err) {
+        if (err instanceof WorkflowAborted) {
+          // 用户取消:不做任何收尾写入,不伪装 partial;让出执行权并驱动下一个
+          this.driveNextQueued()
+          return
+        }
+        if (err instanceof WorkflowFailed) {
+          this.driveNextQueued()
+          return
+        }
+        if (isBudgetExhaustedError(err)) {
+          await this.finalizeRun(driver, err)
+          return
+        }
+        this.failRun(runId, 'MODEL_OUTPUT_INVALID', err instanceof Error ? err.message : String(err))
         this.driveNextQueued()
         return
       }
-      if (err instanceof WorkflowFailed) {
-        this.driveNextQueued()
-        return
-      }
-      if (isBudgetExhaustedError(err)) {
-        await this.finalizeRun(driver, err)
-        return
-      }
-      this.failRun(runId, 'MODEL_OUTPUT_INVALID', err instanceof Error ? err.message : String(err))
       this.driveNextQueued()
-      return
+    } finally {
+      this.activeControllers.delete(runId)
     }
-    this.driveNextQueued()
   }
 
-  /** 队列里的下一个运行:研究运行自行驱动;其他 mode 转交组合层钩子 */
+  /** 队列里的下一个运行:接线调度器后统一由 request() 唤醒;旧路径保留为回退 */
   private driveNextQueued(): void {
+    if (this.deps.scheduler) {
+      this.deps.scheduler.request()
+      return
+    }
     const next = this.deps.queue.nextQueued()
     if (!next) return
     if (next.mode === 'research') {
@@ -628,11 +752,6 @@ export class ResearchWorkflow {
       throw new WorkflowFailed()
     }
 
-    // reserve('planning') 后不落 checkpoint:该中间状态(ledger phase=planning 且已扣
-    // 1)不满足反序列化不变量,且崩溃窗口由 recovery 标 failed 兜底,checkpoint 在
-    // sealPlan 之后才有恢复意义。
-    driver.ledger.reserve('planning')
-
     const task = getResearchTaskByRun(this.db, runId)
     if (!task) throw new WorkflowAborted()
     const manifest = getSnapshotManifest(this.db, task.snapshotManifestId)
@@ -640,6 +759,8 @@ export class ResearchWorkflow {
     let raw: unknown
     let model: string | null = null
     try {
+      // RES-01:规划槽位在 beforeSend 扣减(预算准入+取消检查+checkpoint 保存);
+      // 规划不重试,槽位受账本状态机限制不允许重试
       const result = await this.deps.completer.completeJson({
         system: RESEARCH_PLAN_SYSTEM_PROMPT,
         prompt: buildResearchPlanPrompt({
@@ -647,12 +768,14 @@ export class ResearchWorkflow {
           sources: (manifest?.entries ?? []).map((e) => ({ name: e.source_name, type: e.source_type })),
           maxSubqueries
         }),
-        schemaHint: { subquestions: 'array', clarifications: 'array' }
+        schemaHint: { subquestions: 'array', clarifications: 'array' },
+        control: this.stageControl(driver, 'planning')
       })
       raw = result.data
       model = result.model
     } catch (err) {
       this.assertActive(runId)
+      if (isBudgetExhaustedError(err)) throw err // 预算/时限耗尽 → 收尾路径
       // 规划槽位受账本状态机限制不允许重试:调用失败直接失败落库
       this.failRun(runId, 'MODEL_OUTPUT_INVALID', `规划调用失败:${err instanceof Error ? err.message : String(err)}`)
       throw new WorkflowFailed()
@@ -771,16 +894,14 @@ export class ResearchWorkflow {
           const q = driver.clarifications?.questions.find((item) => item.question_id === id)
           return `- ${q?.question ?? id}:${value}`
         })
-      const callLimitMs = driver.ledger.modelCallTimeoutMs(MODEL_CALL_LIMIT_MS)
-
       let parsed: ExtractionModelOutput
       let retried = false
       try {
         const call = await this.callExtractionWithRetry(driver, {
+          subquestionId: sub.subquestionId,
           subquestion: sub.question,
           constraints: answerLines,
-          chunks,
-          callLimitMs
+          chunks
         })
         parsed = call.parsed
         retried = call.retried
@@ -799,8 +920,7 @@ export class ResearchWorkflow {
       this.trace(runId, 'model', {
         stage: 'extraction',
         subquestion_id: sub.subquestionId,
-        retry: retried,
-        call_timeout_ms: callLimitMs
+        retry: retried
       })
       driver.determinedSubIds.push(sub.subquestionId) // 抽取产物已落库:子问题已被确定性处理
       this.persistExtraction(driver, sub.subquestionId, sub.ordinal, retrieval.hits.map((h) => h.chunkId), parsed, snapshotTexts)
@@ -809,56 +929,52 @@ export class ResearchWorkflow {
   }
 
   /**
-   * 抽取调用 + 受控重试(结构化输出解析在本函数内完成):每次实际发送前原子
-   * reserve;输出无法解析(结构化输出无效)或模型异常(429、超时等)重试占预算
-   * (reserve(kind, { isRetry: true })),最多一次,只有剩余预算允许才执行。
-   * 取消到达在途调用时不重试、不占重试预算。
+   * 抽取调用 + 受控重试(结构化输出解析在本函数内完成):每次实际发送的预算准入
+   * 在 beforeSend 内完成(reserve + recordSentAttempt + checkpoint);结构化输出无效、
+   * 429/5xx、可重试连接错误、未耗尽时限的单次超时与坏 JSON 触发唯一一次受控重试,
+   * 重试以子问题 ID 为 retryKey 占预算;鉴权错误、取消、预算不足、观测失败不重试。
+   * 重试前重新计算 min(30000, 剩余活动毫秒),不沿用首次 timeout。
    */
   private async callExtractionWithRetry(
     driver: DriverState,
     input: {
+      subquestionId: string
       subquestion: string
       constraints: readonly string[]
       chunks: ReadonlyArray<{ snapshot_id: string; chunk_id: string; content: string }>
-      callLimitMs: number
     }
   ): Promise<{ parsed: ExtractionModelOutput; retried: boolean }> {
     if (!this.deps.completer) {
       throw new OperationError(appError('MODEL_OUTPUT_INVALID', '模型服务未配置,无法抽取证据', { retryable: false }))
     }
-    const attempt = async (): Promise<ExtractionModelOutput> => {
+    const attemptOnce = async (isRetry: boolean): Promise<ExtractionModelOutput> => {
       const result = await this.deps.completer!.completeJson({
         system: RESEARCH_EXTRACTION_SYSTEM_PROMPT,
         prompt: buildExtractionPrompt(input.subquestion, input.constraints, input.chunks),
-        schemaHint: { evidence: 'array', claims: 'array' }
+        schemaHint: { evidence: 'array', claims: 'array' },
+        control: this.stageControl(driver, 'extraction', {
+          isRetry,
+          ...(isRetry ? { retryKey: input.subquestionId } : {})
+        })
       })
       // 结构化输出无效(形状/未知字段/类型不符)与传输失败同样触发受控重试
       return parseExtractionOutput(result.data)
     }
 
-    driver.ledger.reserve('extraction')
-    this.saveCheckpoint(driver)
     try {
-      return { parsed: await attempt(), retried: false }
+      return { parsed: await attemptOnce(false), retried: false }
     } catch (err) {
       this.assertActive(driver.runId) // 取消:不占重试预算,直接中断
-      // 重试占预算;受控重试额度/总额不足属预算耗尽(规格第 8 节:六次调用没有
-      // 额外修复额度),映射为 BudgetExhaustedError 走收尾而不是运行错误
-      try {
-        driver.ledger.reserve('extraction', { isRetry: true })
-      } catch (reserveErr) {
-        if (isBudgetExhaustedError(reserveErr)) throw reserveErr
-        if (reserveErr instanceof OperationError) {
-          throw new BudgetExhaustedError(
-            `受控重试额度不可用,预算规则拒绝重试(BUDGET_EXHAUSTED):${reserveErr.message}`,
-            'MODEL_CALLS'
-          )
-        }
-        throw reserveErr
+      if (isBudgetExhaustedError(err)) throw err // 预算/时限耗尽 → 收尾
+      if (!isRetryableModelError(err)) {
+        // 鉴权错误、配置缺失、观测失败等不可重试:直接失败,不继续调用
+        throw new OperationError(
+          appError('MODEL_OUTPUT_INVALID', `抽取调用失败(不可重试):${err instanceof Error ? err.message : String(err)}`, { retryable: false })
+        )
       }
-      this.saveCheckpoint(driver)
-      void err
-      return { parsed: await attempt(), retried: true }
+      // 唯一一次受控重试:reserve 在重试发送的 beforeSend 内执行,额度/总额不足属
+      // 预算耗尽(规格第 8 节:六次调用没有额外修复额度),映射为 BudgetExhaustedError
+      return { parsed: await attemptOnce(true), retried: true }
     }
   }
 
@@ -867,6 +983,8 @@ export class ResearchWorkflow {
    * chunk 不在交付命中内、quote 与切片不符、同 quote 多处命中均拒绝该证据
    * (多处命中必须显式定位或拒绝);模型自报 offset 一律服务端重验,不采信。
    * 引用只指向已落库证据;被拒证据的下标失联,对应 claim 将在结构检查中落 unsupported。
+   * RES-03:all_of 命题先记录全部预期成员下标,再写通过验证的引用;被拒成员保存
+   * null ID 与拒绝原因,Claim、引用与预期清单同事务落库,禁止只留下有效成员。
    */
   private persistExtraction(
     driver: DriverState,
@@ -879,6 +997,7 @@ export class ResearchWorkflow {
     const runId = driver.runId
     const delivered = new Set(deliveredChunkIds)
     const evidenceIds = new Map<number, string>()
+    const rejectionReasons = new Map<number, string>()
 
     for (let i = 0; i < parsed.evidence.length; i += 1) {
       const ev = parsed.evidence[i]!
@@ -888,6 +1007,7 @@ export class ResearchWorkflow {
       )
       // 候选集合守卫:chunk 必须在本次交付命中内且属于所声明的快照
       if (!chunkRow || !delivered.has(ev.chunk_id) || chunkRow.document_id !== ev.snapshot_id) {
+        rejectionReasons.set(i, 'chunk 不在交付候选集合内或快照不匹配')
         this.trace(runId, 'error', {
           code: 'CITATION_INVALID',
           message: `证据 ${i} 被拒绝:chunk 不在交付候选集合内或快照不匹配`,
@@ -922,6 +1042,7 @@ export class ResearchWorkflow {
         })
       }
       if (!offsets.ok) {
+        rejectionReasons.set(i, offsets.reason ?? '证据定位失败')
         this.trace(runId, 'error', {
           code: 'CITATION_INVALID',
           message: `证据 ${i} 被拒绝:${offsets.reason}`,
@@ -943,33 +1064,58 @@ export class ResearchWorkflow {
     const claims = parsed.claims.slice(0, MAX_CANDIDATE_CLAIMS_PER_SUBQUESTION)
     for (let ci = 0; ci < claims.length; ci += 1) {
       const item = claims[ci]!
-      const claim = createClaim(this.db, runId, {
-        subquestionId,
-        claim: {
-          text: item.text,
-          claim_type: item.claim_type,
-          ...(item.subject ? { subject: item.subject } : {}),
-          ...(item.qualifier ? { qualifier: item.qualifier } : {})
+      const groupId = item.all_of === true ? `allg-${ordinal}-${ci}` : undefined
+      // RES-03:Claim、引用与 all_of 预期成员清单同事务;写入失败回滚整条命题
+      this.db.transaction(() => {
+        const claim = createClaim(this.db, runId, {
+          subquestionId,
+          claim: {
+            text: item.text,
+            claim_type: item.claim_type,
+            ...(item.subject ? { subject: item.subject } : {}),
+            ...(item.qualifier ? { qualifier: item.qualifier } : {})
+          }
+        })
+        const citationIdByIndex = new Map<number, string>()
+        const cite = (indices: readonly number[], relation: 'supports' | 'contradicts' | 'context'): void => {
+          for (const idx of indices) {
+            const evidenceId = evidenceIds.get(idx)
+            if (!evidenceId) continue // 被拒证据:引用不成立,结构检查将如实落 unsupported
+            const citation = createCitation(this.db, runId, {
+              claim_id: claim.claimId,
+              evidence_id: evidenceId,
+              relation,
+              ...(relation === 'supports' && groupId
+                ? { evidence_group_id: groupId, group_operator: 'all_of' as const }
+                : {})
+            })
+            if (relation === 'supports') citationIdByIndex.set(idx, citation.citationId)
+          }
+        }
+        cite(item.supports, 'supports')
+        if (item.contradicts) cite(item.contradicts, 'contradicts')
+        if (item.context) cite(item.context, 'context')
+
+        if (groupId !== undefined) {
+          // 先记录原始 supports 全部预期下标,再写通过验证的成员;被拒成员保存 null ID 与原因
+          const requirement: AllOfRequirement = {
+            version: 1,
+            groupId,
+            expectedIndices: [...item.supports].sort((a, b) => a - b),
+            members: item.supports.map((idx) => {
+              const evidenceId = evidenceIds.get(idx) ?? null
+              const citationId = citationIdByIndex.get(idx) ?? null
+              return {
+                index: idx,
+                evidenceId,
+                citationId,
+                rejectionReason: evidenceId === null ? (rejectionReasons.get(idx) ?? '证据被拒绝') : null
+              }
+            })
+          }
+          saveAllOfRequirement(this.db, claim.claimId, requirement)
         }
       })
-      const groupId = item.all_of === true ? `allg-${ordinal}-${ci}` : undefined
-      const cite = (indices: readonly number[], relation: 'supports' | 'contradicts' | 'context'): void => {
-        for (const idx of indices) {
-          const evidenceId = evidenceIds.get(idx)
-          if (!evidenceId) continue // 被拒证据:引用不成立,结构检查将如实落 unsupported
-          createCitation(this.db, runId, {
-            claim_id: claim.claimId,
-            evidence_id: evidenceId,
-            relation,
-            ...(relation === 'supports' && groupId
-              ? { evidence_group_id: groupId, group_operator: 'all_of' as const }
-              : {})
-          })
-        }
-      }
-      cite(item.supports, 'supports')
-      if (item.contradicts) cite(item.contradicts, 'contradicts')
-      if (item.context) cite(item.context, 'context')
     }
   }
 
@@ -996,11 +1142,17 @@ export class ResearchWorkflow {
     let review: ReviewOutcome | null = null
     if (this.deps.completer) {
       try {
+        // RES-01:审核模型调用接入阶段控制;审核不重试,槽位在抽取前已预留,
+        // beforeSend 消费该预留且不得再次 reserve
         review = await reviewClaims(this.db, runId, this.deps.completer, {
-          contextBudget: REVIEW_CONTEXT_BUDGET_CODE_POINTS
+          contextBudget: REVIEW_CONTEXT_BUDGET_CODE_POINTS,
+          control: this.stageControl(driver, 'review', { consumeReservation: true })
         })
       } catch (err) {
-        // 审核异常按候选处理,不升级(reviewClaims 已兜底模型错误;此处防御 DB 级异常)
+        // RES-01:取消与预算/时限耗尽必须穿过异常兜底重新抛出(取消 → 协作中断,
+        // 预算 → 收尾路径);其余异常按候选处理,不升级(防御 DB 级异常)
+        if (err instanceof WorkflowAborted) throw err
+        if (isBudgetExhaustedError(err)) throw err
         this.trace(runId, 'error', {
           code: 'MODEL_OUTPUT_INVALID',
           message: `语义审核未完成:${err instanceof Error ? err.message : String(err)}`
@@ -1044,19 +1196,21 @@ export class ResearchWorkflow {
   // ---------- 组织阶段 ----------
 
   /**
-   * 组织:markSynthesisReady → reserve('synthesis') → buildReport(组织模型可传
-   * completer,白名单外/无效输出由 buildReport 回退确定性模板)→ 引用检查最终
-   * 过一遍(buildReport 内 finalCheck)→ research.report_saved → succeeded 终态。
+   * 组织:markSynthesisReady → buildReport(组织模型可传 completer,白名单外/无效
+   * 输出由 buildReport 回退确定性模板)→ 引用检查最终过一遍(buildReport 内
+   * finalCheck)→ research.report_saved → succeeded 终态。
+   * RES-01:组织槽位在 beforeSend 扣减(预算准入+取消检查+checkpoint 保存);
+   * 无组织模型时不发送也不扣槽位。
    */
   private async synthesisStage(driver: DriverState): Promise<void> {
     const { runId } = driver
     driver.ledger.markSynthesisReady()
-    driver.ledger.reserve('synthesis')
     this.saveCheckpoint(driver)
 
     const { report } = await buildReport(this.db, runId, {
       version: 1,
-      completer: this.deps.completer ?? null
+      completer: this.deps.completer ?? null,
+      ...(this.deps.completer ? { control: this.stageControl(driver, 'synthesis') } : {})
     })
 
     this.transition(runId, 'succeeded', {
@@ -1256,7 +1410,10 @@ export class ResearchWorkflow {
       question_set_id: questionSet.questionSetId,
       answers: input.answers
     })
-    return transitionRun(this.db, runId, 'queued')
+    const queued = transitionRun(this.db, runId, 'queued')
+    // OPS-02:澄清受理后由调度器重新挑选(执行权在等待答案期间已让出)
+    this.deps.scheduler?.request()
+    return queued
   }
 
   /** 提交澄清回答并等待驱动完成(测试与 CLI 用;IPC 层用 acceptResearchAnswers + driveResearch) */
@@ -1276,6 +1433,11 @@ export class ResearchWorkflow {
   requestCancel(runId: string): AgentRunRecord {
     const run = assertResearchRun(this.db, runId)
     if (run.status === 'cancelled' || run.finishedAt != null) return run
+    // RES-01:先 abort 在途模型请求(signal 经 AbortSignal 贯穿到 fetch 与
+    // reader.read),再执行原有终态更新;取消后的晚响应不落证据、不改变终态
+    this.activeControllers.get(runId)?.abort(new Error('用户请求取消'))
+    // OPS-02:调度器登记在途驱动,abort 使旧 Promise settle 前仍占用执行权
+    this.deps.scheduler?.abort(runId)
     const updated = transitionRun(this.db, runId, 'cancelled', { errorCode: 'CANCELLED' })
     const task = getResearchTaskByRun(this.db, runId)
     if (task) updateResearchTaskPhase(this.db, task.researchTaskId, 'cancelled')

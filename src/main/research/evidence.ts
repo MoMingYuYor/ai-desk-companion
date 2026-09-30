@@ -13,7 +13,9 @@
 
 import type { SqliteDb } from '../db/connection'
 import type { StructuredCompleter } from '../agent/llm'
-import { packageReviewClaims, type ReviewClaimCandidate, type ReviewSpanInput } from './budget'
+import { ModelRequestError, type ModelRequestControl } from '../services/modelRequest'
+import { allOfIncompleteClaimIds } from './citations'
+import { isBudgetExhaustedError, packageReviewClaims, type ReviewClaimCandidate, type ReviewSpanInput } from './budget'
 import {
   getClaim,
   getResearchTaskByRun,
@@ -184,6 +186,8 @@ export interface ReviewOptions {
   contextBudget: number
   /** 是否执行语义审核;false 或 completer 缺省时跳过(只留结构检查结果) */
   enabled?: boolean
+  /** RES-01:审核模型调用的传输控制;审核不重试,槽位预留由调用方维持 */
+  control?: ModelRequestControl
 }
 
 export interface ReviewOutcome {
@@ -238,9 +242,35 @@ export async function reviewClaims(db: SqliteDb, runId: string, completer: Struc
     skipped: true
   }
   const enabled = options.enabled !== false
+
+  // RES-03:即使被直接调用(未先跑 validateCitations)也先检查 all_of 完整性——
+  // 缺员或缺预期清单的命题确定性拒绝,不送模型;模型返回 supported 也不能覆盖。
+  // 结构结果未知(候选态 span)按缺失处理;已冻结命题不回写,保持原状态。
+  const blockedByAllOf = allOfIncompleteClaimIds(db, claims)
+  for (const claim of claims) {
+    if (!blockedByAllOf.has(claim.claimId) || frozen.has(claim.claimId)) continue
+    if (claim.supportStatus === 'candidate') {
+      updateClaimReview(db, claim.claimId, 'unsupported', {
+        ...(claim.review ?? {}),
+        review: {
+          stage: 'all_of_completeness',
+          status: 'unsupported',
+          reason: 'all_of 证据组缺员或缺预期清单 [ALL_OF_EXPECTATION_MISSING],整组不成立(送审入口确定性拒绝)'
+        }
+      })
+    }
+  }
+
   // 送审范围:未冻结、候选态的 fact/comparison claim(recommendation 属建议区,单独审核;
-  // 已有结构结论(unsupported)的不重审——确定性规则优先于模型判断)
-  const reviewable = claims.filter((c) => !frozen.has(c.claimId) && c.supportStatus === 'candidate' && c.claimType !== 'recommendation')
+  // 已有结构结论(unsupported)的不重审——确定性规则优先于模型判断;
+  // all_of 缺员命题已被确定性拒绝,不进入打包范围)
+  const reviewable = claims.filter(
+    (c) =>
+      !frozen.has(c.claimId) &&
+      c.supportStatus === 'candidate' &&
+      c.claimType !== 'recommendation' &&
+      !blockedByAllOf.has(c.claimId)
+  )
   if (!enabled || completer === null || reviewable.length === 0) {
     // 跳过语义审核:只留结构检查结果,candidate 不升级(规格第 8 节)
     return outcome
@@ -302,11 +332,16 @@ export async function reviewClaims(db: SqliteDb, runId: string, completer: Struc
         '把"加分项"改成"必须"、"可选其一"改成"全部要求"、某岗位结论推广到所有岗位,都判 unsupported。' +
         '只输出 JSON:{"verdicts":[{"claim_id":"...","status":"supported|unsupported|uncertain","reason":"..."}]}。' +
         '不确定时用 uncertain,不得编造。不审核范围之外的 claim_id。',
-      prompt: `逐条审核以下 Claim 是否被其片段直接支持:\n${promptLines.join('\n\n')}`
+      prompt: `逐条审核以下 Claim 是否被其片段直接支持:\n${promptLines.join('\n\n')}`,
+      ...(options.control !== undefined ? { control: options.control } : {})
     })
     data = result.data
-  } catch {
-    // 模型调用失败(异常):本次候选全部按候选处理,不升级
+  } catch (err) {
+    // RES-01:取消与预算/时限耗尽必须穿过异常兜底重新抛出,不得按候选处理吞掉;
+    // 其余模型调用失败(异常):本次候选全部按候选处理,不升级
+    if (isBudgetExhaustedError(err)) throw err
+    if (err instanceof ModelRequestError && err.code === 'CANCELLED') throw err
+    if (options.control?.signal.aborted) throw err
     outcome.invalidOutputClaimIds = [...allowed]
     return outcome
   }

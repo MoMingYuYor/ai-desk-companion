@@ -398,7 +398,7 @@ describe('provenance 去重与来源组统计', () => {
         bytes: bytesOf(
           JSON.stringify([
             { title: '算法工程师', company: '甲公司', location: '上海', description: '负责推荐算法与 Python 服务开发。' },
-            { title: '前端工程师', company: '甲公司', location: '上海', description: '负责 Web 界面与交互实现。' }
+            { title: '前端工程师', company: '甲公司', location: '上海', description: '负责 Web 开发与交互实现。' }
           ])
         )
       }
@@ -533,5 +533,84 @@ describe('检索 trace 与确定性可复现', () => {
     expect(() =>
       retrieveForSubquestion(db, { query: 'Python', frozenSnapshotIds: [''], chunkLimit: 8 })
     ).toThrow()
+  })
+})
+
+// ---------- RES-02:冻结集合检索严格限定在记录范围内 ----------
+
+describe('RES-02 记录范围与冻结集合检索', () => {
+  it('RES-02 冻结首条记录不能检索第二条记录', async () => {
+    const db = await makeTestDb()
+    const rows = importOk(db, [{ sourceName: 'roles.json', sourceType: 'json',
+      bytes: Buffer.from(JSON.stringify([
+        { title: 'A', description: 'Python 工作' },
+        { title: 'B', description: 'OnlyBetaSecret Rust 工作' }
+      ])) }])
+    const a = rows.find(row => row.sourceLocator === '/0')!
+    const result = retrieveFrozen(db, [a.documentId], { query: 'OnlyBetaSecret' })
+    expect(result.hits).toEqual([])
+    const chunks = db.all<{ content: string }>(
+      'SELECT content FROM retrieval_chunks WHERE document_id = ?', [a.documentId])
+    expect(chunks.some(chunk => chunk.content.includes('OnlyBetaSecret'))).toBe(false)
+  })
+
+  it('JSON/CSV 两记录可各自命中;同描述不同岗位按 locator 区分', async () => {
+    const db = await makeTestDb()
+    const rows = importOk(db, [{ sourceName: 'two.json', sourceType: 'json',
+      bytes: Buffer.from(JSON.stringify([
+        { title: 'A', description: 'Python 工作' },
+        { title: 'B', description: 'Rust 工作' }
+      ])) }])
+    const a = rows.find(row => row.sourceLocator === '/0')!
+    const b = rows.find(row => row.sourceLocator === '/1')!
+    const hitA = retrieveFrozen(db, [a.documentId], { query: 'Python' })
+    expect(hitA.hits.length).toBeGreaterThan(0)
+    expect(hitA.hits.every(h => h.documentId === a.documentId)).toBe(true)
+    const hitB = retrieveFrozen(db, [b.documentId], { query: 'Rust' })
+    expect(hitB.hits.length).toBeGreaterThan(0)
+    expect(hitB.hits.every(h => h.documentId === b.documentId)).toBe(true)
+
+    const csvRows = importOk(db, [{ sourceName: 'same.csv', sourceType: 'csv',
+      bytes: Buffer.from('title,company,description\n甲,公司一,相同的描述内容 Alpha\n甲,公司二,相同的描述内容 Beta') }])
+    const row1 = csvRows.find(row => row.sourceLocator === 'row:1')!
+    const row2 = csvRows.find(row => row.sourceLocator === 'row:2')!
+    expect(row1.documentId).not.toBe(row2.documentId)
+    const hitRow2 = retrieveFrozen(db, [row2.documentId], { query: 'Beta' })
+    expect(hitRow2.hits.length).toBeGreaterThan(0)
+    expect(hitRow2.hits.every(h => h.documentId === row2.documentId)).toBe(true)
+  })
+
+  it('邻块不进入另一记录:expandAdjacent 只在记录自身范围内取块', async () => {
+    const db = await makeTestDb()
+    const rows = importOk(db, [{ sourceName: 'adj.json', sourceType: 'json',
+      bytes: Buffer.from(JSON.stringify([
+        { title: 'A', description: '首段要求 Python。' + '补'.repeat(900) },
+        { title: 'B', description: '第二条要求 OnlyBetaSecret Rust。' }
+      ])) }])
+    const a = rows.find(row => row.sourceLocator === '/0')!
+    const result = retrieveFrozen(db, [a.documentId], { query: 'Python' })
+    expect(result.hits.length).toBeGreaterThan(0)
+    const lastChunk = result.hits[result.hits.length - 1]!
+    const neighbor = expandAdjacent(db, result, lastChunk)
+    if (neighbor) {
+      expect(neighbor.documentId).toBe(a.documentId)
+      expect(neighbor.content).not.toContain('OnlyBetaSecret')
+    }
+  })
+
+  it('超过 500 个清单外匹配仍召回唯一冻结记录(冻结过滤先于截断)', async () => {
+    const db = await makeTestDb()
+    // 清单外 501 条记录(每条 1 块)都命中查询词;冻结记录得分更高,排序后居首
+    const filler = Array.from({ length: 501 }, (_, i) =>
+      JSON.stringify({ title: `填充${i}`, description: 'OnlyBetaSecret 填充块。' })
+    ).join(',')
+    importOk(db, [{ sourceName: 'big.json', sourceType: 'json', bytes: Buffer.from('[' + filler + ']') }])
+    const frozen = importOne(db, {
+      sourceName: 'frozen.md',
+      bytes: bytesOf('岗位要求 OnlyBetaSecret OnlyBetaSecret OnlyBetaSecret 与 Rust。')
+    })
+    const result = retrieveFrozen(db, [frozen.documentId], { query: 'OnlyBetaSecret' })
+    expect(result.hits.length).toBeGreaterThan(0)
+    expect(result.hits[0]!.documentId).toBe(frozen.documentId)
   })
 })

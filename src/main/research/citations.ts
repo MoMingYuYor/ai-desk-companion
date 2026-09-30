@@ -24,6 +24,7 @@ import {
   listRunCitationsForClaim,
   listFrozenClaimIds,
   listFrozenEvidenceIds,
+  loadAllOfRequirements,
   updateEvidenceSpanStatus,
   updateClaimReview,
   getResearchTaskByRun,
@@ -105,6 +106,17 @@ export function checkCitationStructure(input: {
   const entry = manifest.entries.find((e) => e.snapshot_id === span.snapshotId)
   if (!entry) {
     return fail(`快照 ${span.snapshotId} 不在本运行的冻结清单内,拒绝清单外来源`)
+  }
+
+  // 1.5) RES-02:span 必须落在冻结记录范围内——清单外伪造 span(同一文件其他
+  // 记录的内容、或范围被改写后的位置)一律拒绝
+  if (entry.record_scope !== undefined) {
+    const scope = entry.record_scope
+    if (span.startOffset < scope.startOffset || span.endOffset > scope.endOffset) {
+      return fail(
+        `span [${span.startOffset},${span.endOffset}) 超出冻结记录范围 [${scope.startOffset},${scope.endOffset}),拒绝清单外伪造证据`
+      )
+    }
   }
 
   // 2) 快照存在且 hash 一致(当前行 text_sha256 == span 落库时清单冻结的 hash)
@@ -265,6 +277,94 @@ export function validContradictsEvidenceIds(rows: readonly RunCitationRow[], str
     .map((row) => row.citation.evidenceId)
 }
 
+// ---------- all_of 联合证据完整性(RES-03) ----------
+
+/**
+ * all_of 预期成员清单:抽取期与 Claim、引用同事务持久化于 Claim.review
+ * 的 evidence_requirements 段;被拒成员保存 null ID 与拒绝原因,
+ * 禁止只留下有效成员。
+ */
+export interface AllOfRequirement {
+  version: 1
+  groupId: string
+  expectedIndices: number[]
+  members: Array<{
+    index: number
+    evidenceId: string | null
+    citationId: string | null
+    rejectionReason: string | null
+  }>
+}
+
+/** 完整性判定结果:missingIndices 是缺失的预期成员下标 */
+export interface AllOfCompleteness {
+  satisfied: boolean
+  missingIndices: number[]
+}
+
+/**
+ * all_of 完整性判定:expectedIndices 非空、无重复,members 与之精确一一对应,
+ * 所有成员 evidenceId/citationId 非 null、无 rejectionReason 且 citation 在
+ * 结构通过集合内;未知结果(结构结果缺失)按缺失处理。
+ */
+export function checkAllOfCompleteness(
+  requirement: AllOfRequirement,
+  validCitationIds: ReadonlySet<string>
+): AllOfCompleteness {
+  const expected = Array.isArray(requirement.expectedIndices) ? requirement.expectedIndices : []
+  const members = Array.isArray(requirement.members) ? requirement.members : []
+  if (expected.length === 0 || new Set(expected).size !== expected.length) {
+    // 预期清单非法(空组/重复成员):整组不成立,不能用剩余引用数推测原始成员数
+    return { satisfied: false, missingIndices: [...expected].sort((a, b) => a - b) }
+  }
+  const missing: number[] = []
+  for (const index of expected) {
+    const member = members.find((m) => m.index === index)
+    if (
+      member === undefined ||
+      member.rejectionReason !== null ||
+      member.evidenceId === null ||
+      member.citationId === null ||
+      !validCitationIds.has(member.citationId)
+    ) {
+      missing.push(index)
+    }
+  }
+  return { satisfied: missing.length === 0, missingIndices: missing.sort((a, b) => a - b) }
+}
+
+/**
+ * 汇总缺员(或缺预期清单)的 all_of 命题 ID:供 reviewClaims 送审入口与
+ * buildReport 事实区过滤使用。判定口径:citation 的 span 结构结果为 valid
+ * (validateCitations 之后)才计入通过集合;未经结构检查的按缺失处理。
+ */
+export function allOfIncompleteClaimIds(db: SqliteDb, claims: readonly Claim[]): Set<string> {
+  const blocked = new Set<string>()
+  for (const claim of claims) {
+    const requirements = loadAllOfRequirements(db, claim.claimId)
+    if (requirements.length === 0) continue
+    const rows = listRunCitationsForClaim(db, claim)
+    const validIds = new Set(
+      rows
+        .filter((row) => row.citation.relation === 'supports' && row.span.validationStatus === 'valid')
+        .map((row) => row.citation.citationId)
+    )
+    const groupIds = new Set(
+      rows
+        .filter((row) => row.citation.evidenceGroupId !== null && row.citation.groupOperator === 'all_of')
+        .map((row) => row.citation.evidenceGroupId as string)
+    )
+    for (const groupId of groupIds) {
+      const requirement = requirements.find((r) => r.groupId === groupId)
+      if (!requirement || !checkAllOfCompleteness(requirement, validIds).satisfied) {
+        blocked.add(claim.claimId)
+        break
+      }
+    }
+  }
+  return blocked
+}
+
 // ---------- 主入口 ----------
 
 /**
@@ -347,8 +447,24 @@ export function validateCitations(db: SqliteDb, runId: string): CitationValidati
       const result = claimStructure.get(row.citation.citationId)
       return result !== undefined && !result.ok
     })
+    // RES-03:all_of 组先按结构结果,再按持久化预期清单判定完整性——
+    // 缺任一预期成员、缺清单([ALL_OF_EXPECTATION_MISSING])整组不成立
+    const requirements = loadAllOfRequirements(db, claim.claimId)
+    const groupComplete = (group: EvidenceGroupCheck): boolean => {
+      if (!group.satisfied) return false
+      const requirement = requirements.find((r) => r.groupId === group.groupId)
+      if (!requirement) return false // [ALL_OF_EXPECTATION_MISSING]
+      const validIds = new Set(
+        claimRows
+          .filter((row) => row.citation.relation === 'supports' && row.citation.evidenceGroupId === group.groupId)
+          .filter((row) => claimStructure.get(row.citation.citationId)?.ok === true)
+          .map((row) => row.citation.citationId)
+      )
+      return checkAllOfCompleteness(requirement, validIds).satisfied
+    }
     const allOfGroups = evaluateAllOfGroups(claimRows, claimStructure)
-    const groupMissing = allOfGroups.some((g) => !g.satisfied)
+    const missingGroup = allOfGroups.find((g) => !groupComplete(g))
+    const groupMissing = missingGroup !== undefined
     const hasSupport = hasUngroupedSupport(claimRows, claimStructure)
     const contradicted = validContradictsEvidenceIds(claimRows, claimStructure).length > 0
 
@@ -359,14 +475,19 @@ export function validateCitations(db: SqliteDb, runId: string): CitationValidati
     if (groupMissing || anyFailed || (!hasSupport && !hasAnySupportCitation)) {
       report.unsupportedClaimIds.push(claim.claimId)
       if (!frozenClaims.has(claim.claimId)) {
-        // 原因判定:all_of 缺员优先于单项失败(整组不成立是更准确的语义结论;
+        // 原因判定:all_of 缺员/缺清单优先于单项失败(整组不成立是更准确的语义结论;
         // 无组且无支持引用次之;单项引用失败兜底)
-        const missingGroup = allOfGroups.find((g) => !g.satisfied)
-        const reason = missingGroup
-          ? `all_of 证据组 ${missingGroup.groupId} 缺少有效成员(${missingGroup.failedCitationIds.join(', ')}),整组不成立`
-          : anyFailed
-            ? (failed.find((f) => f.claimId === claim.claimId)?.reason ?? '引用结构检查失败')
-            : 'claim 没有任何 supports 引用,不构成支持'
+        let reason: string
+        if (missingGroup !== undefined) {
+          const requirement = requirements.find((r) => r.groupId === missingGroup.groupId)
+          reason = requirement
+            ? `all_of 证据组 ${missingGroup.groupId} 缺少有效成员(缺员下标 ${checkAllOfCompleteness(requirement, validIdsOfGroup(claimRows, claimStructure, missingGroup.groupId)).missingIndices.join(', ')}),整组不成立`
+            : `all_of 证据组 ${missingGroup.groupId} 缺少预期成员清单 [ALL_OF_EXPECTATION_MISSING],整组不成立`
+        } else if (anyFailed) {
+          reason = failed.find((f) => f.claimId === claim.claimId)?.reason ?? '引用结构检查失败'
+        } else {
+          reason = 'claim 没有任何 supports 引用,不构成支持'
+        }
         updateClaimReview(db, claim.claimId, 'unsupported', {
           stage: 'structure_check',
           reason
@@ -379,4 +500,18 @@ export function validateCitations(db: SqliteDb, runId: string): CitationValidati
   }
 
   return report
+}
+
+/** 组内结构通过的引用 ID 集合(缺员原因展示用) */
+function validIdsOfGroup(
+  rows: readonly RunCitationRow[],
+  structure: ReadonlyMap<string, CitationCheckResult>,
+  groupId: string
+): Set<string> {
+  return new Set(
+    rows
+      .filter((row) => row.citation.relation === 'supports' && row.citation.evidenceGroupId === groupId)
+      .filter((row) => structure.get(row.citation.citationId)?.ok === true)
+      .map((row) => row.citation.citationId)
+  )
 }

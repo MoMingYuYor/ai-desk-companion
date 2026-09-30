@@ -214,7 +214,8 @@ export interface SerializedActivity {
 
 /** 账本持久化形态:全量状态;反序列化后预算不复活 */
 export interface SerializedLedger {
-  version: 1
+  /** RES-01:v2 增加 sentAttemptIds 与 extractionRetryKeys;v1 为旧版恢复入口 */
+  version: 1 | 2
   budget: ResearchBudget
   phase: LedgerPhase
   slots: Record<SlotKind, SlotState>
@@ -222,6 +223,10 @@ export interface SerializedLedger {
   deadlineReached: boolean
   /** 规划定稿时锁定的子问题数(= 抽取槽位容量) */
   sealedSubquestions: number
+  /** RES-01:已准入派发的发送尝试 ID(唯一;与 actualAttempts 分开的槽位预留计数) */
+  sentAttemptIds: string[]
+  /** RES-01:已执行受控重试的抽取子问题 ID(每子问题单独一次重试身份) */
+  extractionRetryKeys: string[]
 }
 
 /** 本地持久化收尾段上限(规格:最多 2 秒;目标值,超限由 finalizeSegmentExceeded 上报) */
@@ -257,6 +262,12 @@ export class ResearchBudgetLedger {
   private finalizeSegmentStartedMs: number | null
   private deadlineReachedFlag: boolean
   private sealedSubquestions: number
+  /** RES-01:已准入派发的发送尝试 ID(sent/settled 用 attemptId 去重) */
+  private readonly sentAttemptIds: string[]
+  /** RES-01:已执行受控重试的抽取子问题 ID(每子问题一次) */
+  private readonly extractionRetryKeys: Set<string>
+  /** RES-01:恢复来源版本;新建为 2,从 v1 checkpoint 恢复为 1(不重发历史请求) */
+  private readonly restoredVersion: 1 | 2
   private readonly clock: Clock
 
   /** 活动时间窗控制:pause/resume 排除排队与等待用户的时间 */
@@ -304,6 +315,9 @@ export class ResearchBudgetLedger {
       this.time.finalizeMs = restored.activity.finalizeMs
       this.deadlineReachedFlag = restored.deadlineReached
       this.sealedSubquestions = restored.sealedSubquestions
+      this.sentAttemptIds = [...restored.sentAttemptIds]
+      this.extractionRetryKeys = new Set(restored.extractionRetryKeys)
+      this.restoredVersion = restored.version
       return
     }
 
@@ -316,6 +330,9 @@ export class ResearchBudgetLedger {
       review: { used: 0, retries: 0 },
       synthesis: { used: 0, retries: 0 }
     }
+    this.sentAttemptIds = []
+    this.extractionRetryKeys = new Set()
+    this.restoredVersion = 2
   }
 
   // ---------- 只读视图 ----------
@@ -368,6 +385,28 @@ export class ResearchBudgetLedger {
     }
     if (this.deadlineReachedFlag) return 0
     return Math.min(requestLimitMs, this.remainingActiveMs)
+  }
+
+  /** RES-01:恢复来源版本;从 v1 checkpoint 恢复时上层不得续跑真实发送 */
+  get checkpointVersion(): 1 | 2 {
+    return this.restoredVersion
+  }
+
+  /** RES-01:已准入派发的发送尝试 ID 只读视图 */
+  get sentAttemptIdList(): readonly string[] {
+    return this.sentAttemptIds
+  }
+
+  /**
+   * RES-01:记录一次已准入派发的发送尝试 ID。
+   * sent/settled 用 attemptId 去重:重复 ID 幂等忽略,不重复累加。
+   */
+  recordSentAttempt(attemptId: string): void {
+    if (typeof attemptId !== 'string' || attemptId === '') {
+      throw budgetError('VALIDATION', 'attemptId 必须是非空字符串')
+    }
+    if (this.sentAttemptIds.includes(attemptId)) return
+    this.sentAttemptIds.push(attemptId)
   }
 
   // ---------- 私有工具 ----------
@@ -424,10 +463,11 @@ export class ResearchBudgetLedger {
 
   /**
    * 每次实际发送模型请求前原子预扣一个槽位调用。
-   * 重试 = 对同槽位再次 reserve 且 isRetry: true:计入总调用额、不占槽位容量,
-   * 每槽位最多一次受控重试,且只有剩余预算允许才执行——重试不能逃过预算。
+   * 重试 = 对同槽位再次 reserve 且 isRetry: true:计入总调用额、不占槽位容量。
+   * RES-01:抽取重试以 retryKey(子问题 ID)为身份,每个抽取子问题单独一次受控
+   * 重试,不能按整个 extraction 槽位共用一次标记;其他槽位重试仍最多一次。
    */
-  reserve(kind: SlotKind, opts: { isRetry?: boolean } = {}): void {
+  reserve(kind: SlotKind, opts: { isRetry?: boolean; retryKey?: string } = {}): void {
     if (this.deadlineReachedFlag) {
       throw new BudgetExhaustedError(`活动时限已到达,拒绝 ${kind} 模型调用(BUDGET_EXHAUSTED)`, 'DEADLINE')
     }
@@ -438,8 +478,18 @@ export class ResearchBudgetLedger {
       if (slot.used < 1) {
         throw budgetError('CONFLICT', `${kind} 槽位尚无基础调用,重试无从谈起`)
       }
-      if (slot.retries >= 1) {
-        throw budgetError('CONFLICT', `${kind} 槽位已执行过一次受控重试,不允许再次重试`)
+      if (kind === 'extraction') {
+        const key = opts.retryKey
+        if (typeof key !== 'string' || key === '') {
+          throw budgetError('CONFLICT', '抽取受控重试必须携带 retryKey(子问题身份),不能按整个抽取槽位共用一次标记')
+        }
+        if (this.extractionRetryKeys.has(key)) {
+          throw budgetError('CONFLICT', `该抽取子问题已执行过一次受控重试,不允许再次重试:${key}`)
+        }
+      } else {
+        if (slot.retries >= 1) {
+          throw budgetError('CONFLICT', `${kind} 槽位已执行过一次受控重试,不允许再次重试`)
+        }
       }
     }
 
@@ -465,6 +515,7 @@ export class ResearchBudgetLedger {
 
     // 校验全部通过后才落账——原子预扣:不通过则状态零变更
     if (retrying) {
+      if (kind === 'extraction') this.extractionRetryKeys.add(opts.retryKey!)
       slot.retries += 1
     } else {
       slot.used += 1
@@ -594,7 +645,7 @@ export class ResearchBudgetLedger {
     this.foldActiveSegment()
     this.maybeDeadline()
     return {
-      version: 1,
+      version: 2,
       budget: { ...this.budget },
       phase: this.phase,
       slots: {
@@ -610,7 +661,9 @@ export class ResearchBudgetLedger {
         finalizeMs: this.time.finalizeMs
       },
       deadlineReached: this.deadlineReachedFlag,
-      sealedSubquestions: this.sealedSubquestions
+      sealedSubquestions: this.sealedSubquestions,
+      sentAttemptIds: [...this.sentAttemptIds],
+      extractionRetryKeys: [...this.extractionRetryKeys]
     }
   }
 }
@@ -626,13 +679,19 @@ export function deserializeLedger(raw: unknown): SerializedLedger {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
     throw budgetError('VALIDATION', '账本必须是对象')
   }
-  const allowed = new Set(['version', 'budget', 'phase', 'slots', 'activity', 'deadlineReached', 'sealedSubquestions'])
-  for (const key of Object.keys(raw as Record<string, unknown>)) {
-    if (!allowed.has(key)) throw budgetError('VALIDATION', `账本含未知字段:${key}`)
-  }
   const obj = raw as Record<string, unknown>
 
-  if (obj.version !== 1) throw budgetError('VALIDATION', `账本版本不支持:${String(obj.version)}`)
+  // RES-01:接受 v1(旧 checkpoint 恢复入口,不重发历史请求)与 v2(含发送观测)
+  const version = obj.version
+  if (version !== 1 && version !== 2) throw budgetError('VALIDATION', `账本版本不支持:${String(obj.version)}`)
+
+  const allowed = new Set<string>([
+    'version', 'budget', 'phase', 'slots', 'activity', 'deadlineReached', 'sealedSubquestions',
+    'sentAttemptIds', 'extractionRetryKeys'
+  ])
+  for (const key of Object.keys(obj)) {
+    if (!allowed.has(key)) throw budgetError('VALIDATION', `账本含未知字段:${key}`)
+  }
 
   // 预算重走 resolveResearchBudget 校验(未知字段/上调/低于下限),不重写规则
   const budget = resolveResearchBudget(obj.budget)
@@ -677,7 +736,14 @@ export function deserializeLedger(raw: unknown): SerializedLedger {
     if (typeof retries !== 'number' || !Number.isInteger(retries) || retries < 0) {
       throw budgetError('VALIDATION', `槽位 ${kind}.retries 必须是非负整数,收到 ${String(retries)}`)
     }
-    if (retries > 1) throw budgetError('VALIDATION', `槽位 ${kind}.retries 最多为 1,收到 ${retries}`)
+    // RES-01:抽取的受控重试按子问题身份记账(v2 允许多次,上限 = 容量,由
+    // extractionRetryKeys 一致性约束);其他槽位仍最多一次
+    if (kind !== 'extraction' && retries > 1) {
+      throw budgetError('VALIDATION', `槽位 ${kind}.retries 最多为 1,收到 ${retries}`)
+    }
+    if (version === 1 && kind === 'extraction' && retries > 1) {
+      throw budgetError('VALIDATION', `槽位 ${kind}.retries 最多为 1,收到 ${retries}`)
+    }
     if (retries === 1 && used < 1) {
       throw budgetError('VALIDATION', `槽位 ${kind} 状态机不合法:重试必须建立在基础调用之上`)
     }
@@ -700,7 +766,15 @@ export function deserializeLedger(raw: unknown): SerializedLedger {
 
   // 阶段与槽位状态机一致性
   if (phase === 'planning') {
-    if (total > 0) throw budgetError('VALIDATION', '阶段 planning 不允许存在任何已消耗调用')
+    // RES-01:允许「规划请求已准入派发但未定稿」的在途形态(仅规划槽位扣 1,
+    // 无重试、无其他槽位);其余 planning 状态仍不允许任何已消耗调用
+    const inFlightPlanning =
+      slots.planning.used === 1 &&
+      slots.planning.retries === 0 &&
+      slots.extraction.used + slots.extraction.retries === 0 &&
+      slots.review.used + slots.review.retries === 0 &&
+      slots.synthesis.used + slots.synthesis.retries === 0
+    if (!inFlightPlanning && total > 0) throw budgetError('VALIDATION', '阶段 planning 不允许存在任何已消耗调用')
     if (obj.sealedSubquestions !== 0) throw budgetError('VALIDATION', '阶段 planning 不允许已定稿子问题')
   } else {
     if (slots.planning.used < 1) throw budgetError('VALIDATION', `阶段 ${phase} 要求规划槽位已消耗`)
@@ -746,8 +820,34 @@ export function deserializeLedger(raw: unknown): SerializedLedger {
     throw budgetError('VALIDATION', 'deadlineReached 必须是布尔值')
   }
 
+  // RES-01:v2 发送观测与抽取重试身份
+  const stringArrayOf = (value: unknown, field: string): string[] => {
+    if (value === undefined) return []
+    if (!Array.isArray(value)) throw budgetError('VALIDATION', `${field} 必须是字符串数组`)
+    const out: string[] = []
+    for (const item of value) {
+      if (typeof item !== 'string' || item === '') {
+        throw budgetError('VALIDATION', `${field} 的每一项都必须是非空字符串`)
+      }
+      if (out.includes(item)) throw budgetError('VALIDATION', `${field} 含重复项:${item}`)
+      out.push(item)
+    }
+    return out
+  }
+  const sentAttemptIds = stringArrayOf(obj.sentAttemptIds, 'sentAttemptIds')
+  const extractionRetryKeys = stringArrayOf(obj.extractionRetryKeys, 'extractionRetryKeys')
+  if (version === 2 && extractionRetryKeys.length !== slots.extraction.retries) {
+    throw budgetError(
+      'VALIDATION',
+      `extractionRetryKeys(${extractionRetryKeys.length}) 与 extraction.retries(${slots.extraction.retries}) 不一致`
+    )
+  }
+  if (version === 2 && slots.extraction.retries > obj.sealedSubquestions) {
+    throw budgetError('VALIDATION', 'extraction.retries 超过抽取槽位容量')
+  }
+
   return {
-    version: 1,
+    version,
     budget,
     phase,
     slots,
@@ -758,7 +858,9 @@ export function deserializeLedger(raw: unknown): SerializedLedger {
       finalizeMs: a.finalizeMs
     },
     deadlineReached: obj.deadlineReached === true,
-    sealedSubquestions: obj.sealedSubquestions
+    sealedSubquestions: obj.sealedSubquestions,
+    sentAttemptIds,
+    extractionRetryKeys
   }
 }
 

@@ -24,6 +24,7 @@ import {
   textSha256
 } from '../../src/main/retrieval/normalize'
 import { loadDatasetFromDir } from '../../src/main/evals/dataset'
+import type { ScopedSnapshot } from '../../src/main/research/recordScope'
 
 const ROOT = process.cwd()
 const DATA_DIR = join(ROOT, 'evals', 'datasets', 'research_v1')
@@ -453,5 +454,49 @@ describe('research_v1 数据集与 gold 完整性(R-07 静态部分)', () => {
         expect(raw.toLowerCase()).not.toMatch(/zhipin|lagou|51job|boss直聘|linkedin|indeed/)
       }
     }
+  })
+
+  it('RES-02 cross-003 两处 gold 映射到不同记录且 text_sha256 不变(只读校验标注文件)', async () => {
+    const gold = golds.get('research-cross-003')!
+    const allSpans = gold.gold_claims.flatMap((cl) =>
+      cl.acceptable_evidence_sets.flat().map((e) => ({ startOffset: e.start_offset, endOffset: e.end_offset, sha: e.text_sha256 }))
+    )
+    expect(allSpans.length).toBe(2)
+
+    // 将该 fixture 按导入器全链路播种(与 EVAL-03 的 recordsByLogical 同构)
+    const { mkdtempSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const dir = mkdtempSync(join(tmpdir(), 'gold-cross003-'))
+    const { openDatabase } = await import('../../src/main/db/connection')
+    const { initSchema } = await import('../../src/main/db/dao')
+    const { db } = await openDatabase(join(dir, 'test.sqlite'), join(process.cwd(), 'node_modules', 'sql.js', 'dist'))
+    initSchema(db)
+      const { importResearchSources } = await import('../../src/main/research/snapshots')
+      const { resolveLogicalGoldSpan } = await import('../../src/main/research/recordScope')
+      const outcomes = importResearchSources(db, {
+        sources: [{ sourceName: 'jd_list.json', bytes: readFileSync(join(FIX_DIR, 'cross-003', 'jd_list.json')) }]
+      })
+      const records: ScopedSnapshot[] = outcomes
+        .filter((o): o is Extract<typeof o, { ok: true }> => o.ok && o.recordScope !== null)
+        .map((o) => ({
+          documentId: o.documentId,
+          scope: o.recordScope!,
+          textSha256: o.textSha256
+        }))
+      expect(records.length).toBe(2)
+
+    // gold 先核 text_sha256(与标注一致,未被改写),再按完整 [start,end) 选唯一记录
+    const resolved = allSpans.map((span) => {
+      expect(records[0]!.textSha256).toBe(span.sha)
+      return resolveLogicalGoldSpan(records, span)
+    })
+    expect(resolved[0]!.scope.sourceLocator).toBe('/0')
+    expect(resolved[1]!.scope.sourceLocator).toBe('/1')
+    expect(resolved[0]!.documentId).not.toBe(resolved[1]!.documentId)
+    // 跨边界 gold 明确失败:以记录 0 的真实端点构造横跨两记录的 span
+    const boundary = records[0]!.scope.endOffset
+    expect(() =>
+      resolveLogicalGoldSpan(records, { startOffset: boundary - 2, endOffset: boundary + 2 })
+    ).toThrow(/GOLD_SPAN_UNRESOLVABLE/)
   })
 })

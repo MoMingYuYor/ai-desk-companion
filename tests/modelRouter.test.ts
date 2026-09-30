@@ -8,6 +8,7 @@ import {
   ModelRouter,
   type LlmMessage
 } from '../src/main/services/modelRouter'
+import type { ModelAttemptEvent, ModelRequestControl } from '../src/main/services/modelRequest'
 
 function provider(partial: Partial<ProviderInfo>): ProviderInfo {
   return {
@@ -165,5 +166,145 @@ describe('JSON 结构化输出能力', () => {
     await router.call([provider({ id: 'off', supportsJsonMode: false })], { messages })
     expect(bodies[0].response_format).toEqual({ type: 'json_object' })
     expect(bodies[1].response_format).toBeUndefined()
+  })
+})
+
+// ---------- RES-01 单发送契约(带 control 的调用;fetchImpl 只返回本地响应) ----------
+
+describe('RES-01 单发送契约', () => {
+  const messages: LlmMessage[] = [{ role: 'user', content: 'x' }]
+
+  function controlOf(over: Partial<ModelRequestControl> = {}): ModelRequestControl {
+    return {
+      requestId: 'res-01',
+      signal: new AbortController().signal,
+      timeoutMs: 20,
+      policy: { maxAttempts: 1, fallback: 'disabled' },
+      beforeSend: () => {},
+      onAttempt: () => {},
+      ...over
+    }
+  }
+
+  it('RES-01 单发送策略不隐藏重试或备用切换', async () => {
+    const events: ModelAttemptEvent[] = []
+    const fetchImpl = vi.fn(async () => new Response('限流', { status: 429 }))
+    const router = new ModelRouter({ apiKeyOf: () => 'test-key', fetchImpl: fetchImpl as unknown as typeof fetch })
+    const control = controlOf({ onAttempt: (event) => events.push(event) })
+    await expect(
+      router.call([provider({ id: 'a', isDefault: true }), provider({ id: 'b' })], { messages, control })
+    ).rejects.toThrow()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(events.filter((e) => e.type === 'sent')).toHaveLength(1)
+    expect(events.filter((e) => e.type === 'settled')).toHaveLength(1)
+  })
+
+  it('RES-01 准入拒绝或预取消发送 0 次、不发 sent、错误原样传播', async () => {
+    const fetchImpl = vi.fn(async (): Promise<Response> => new Response('ok', { status: 200 }))
+    const router = new ModelRouter({ apiKeyOf: () => 'k', fetchImpl: fetchImpl as unknown as typeof fetch })
+    // beforeSend 抛错(预算准入失败):不 fetch、不发 sent
+    await expect(
+      router.call([provider({ id: 'a', isDefault: true })], {
+        messages,
+        control: controlOf({ beforeSend: () => { throw new Error('预算准入失败') } })
+      })
+    ).rejects.toThrow('预算准入失败')
+    // 预取消:signal 在派发前已 aborted,不发送
+    const aborted = new AbortController()
+    aborted.abort()
+    await expect(
+      router.call([provider({ id: 'a', isDefault: true })], {
+        messages,
+        control: controlOf({ signal: aborted.signal })
+      })
+    ).rejects.toThrow()
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
+  it('RES-01 指定 policy.providerId 不存在时发送 0 次并拒绝', async () => {
+    const fetchImpl = vi.fn(async (): Promise<Response> => new Response('ok', { status: 200 }))
+    const router = new ModelRouter({ apiKeyOf: () => 'k', fetchImpl: fetchImpl as unknown as typeof fetch })
+    await expect(
+      router.call([provider({ id: 'a', isDefault: true })], {
+        messages,
+        control: controlOf({ policy: { maxAttempts: 1, fallback: 'disabled', providerId: 'missing' } })
+      })
+    ).rejects.toThrow()
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
+  it('RES-01 chat 协议请求 include_usage 并把 usage 流事件映射为 TokenUsage', async () => {
+    const bodies: Array<Record<string, unknown>> = []
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      bodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      const body =
+        `data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' } }] })}\n\n` +
+        `data: ${JSON.stringify({ choices: [], model: 'm1-real', usage: { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 } })}\n\n` +
+        'data: [DONE]\n\n'
+      return new Response(body, { status: 200 })
+    })
+    const router = new ModelRouter({ apiKeyOf: () => 'k', fetchImpl: fetchImpl as unknown as typeof fetch })
+    const events: ModelAttemptEvent[] = []
+    const result = await router.call([provider({ id: 'a', isDefault: true })], {
+      messages,
+      control: controlOf({ timeoutMs: 2000, onAttempt: (event) => events.push(event) })
+    })
+    expect(bodies[0]!.stream_options).toEqual({ include_usage: true })
+    expect(result.usage).toEqual({ inputTokens: 11, outputTokens: 7, totalTokens: 18, source: 'provider-reported' })
+    expect(result.actualProvider).toEqual({ providerId: 'a', providerName: 'P', model: 'm1' })
+    expect(result.actualAttempts).toBe(1)
+    expect(result.attempts).toHaveLength(1)
+    const settled = events.find((e) => e.type === 'settled') as Extract<ModelAttemptEvent, { type: 'settled' }>
+    expect(settled.attempt.outcome).toBe('succeeded')
+    expect(settled.attempt.usage.totalTokens).toBe(18)
+    expect(settled.attempt.responseModel).toBe('m1-real')
+  })
+
+  it('RES-01 缺 usage 的成功保留全 null;responses 协议 response.completed.usage 亦映射', async () => {
+    // chat 协议:无 usage 块
+    const fetchNoUsage = vi.fn(async (): Promise<Response> => {
+      const body = `data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' } }] })}\n\ndata: [DONE]\n\n`
+      return new Response(body, { status: 200 })
+    })
+    const routerA = new ModelRouter({ apiKeyOf: () => 'k', fetchImpl: fetchNoUsage as unknown as typeof fetch })
+    const resultA = await routerA.call([provider({ id: 'a', isDefault: true })], { messages, control: controlOf({ timeoutMs: 2000 }) })
+    expect(resultA.usage).toEqual({ inputTokens: null, outputTokens: null, totalTokens: null, source: null })
+
+    // responses 协议:response.completed.response.usage
+    const fetchResponses = vi.fn(async (): Promise<Response> => {
+      const body =
+        `data: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'ok' })}\n\n` +
+        `data: ${JSON.stringify({ type: 'response.completed', response: { model: 'm1-resp', usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 } } })}\n\n`
+      return new Response(body, { status: 200 })
+    })
+    const routerB = new ModelRouter({ apiKeyOf: () => 'k', fetchImpl: fetchResponses as unknown as typeof fetch })
+    const resultB = await routerB.call(
+      [provider({ id: 'r', isDefault: true, protocol: 'responses' })],
+      { messages, control: controlOf({ timeoutMs: 2000 }) }
+    )
+    expect(resultB.usage).toEqual({ inputTokens: 5, outputTokens: 3, totalTokens: 8, source: 'provider-reported' })
+    expect(resultB.actualProvider!.model).toBe('m1')
+    expect(resultB.text).toBe('ok')
+  })
+
+  it('RES-01 fetch 同步抛错也记录一次 sent 与一次 settled', async () => {
+    const events: ModelAttemptEvent[] = []
+    const fetchImpl = vi.fn((): Response => {
+      throw new Error('boom')
+    })
+    const router = new ModelRouter({ apiKeyOf: () => 'k', fetchImpl: fetchImpl as unknown as typeof fetch })
+    await expect(
+      router.call([provider({ id: 'a', isDefault: true })], {
+        messages,
+        control: controlOf({ onAttempt: (event) => events.push(event) })
+      })
+    ).rejects.toThrow('boom')
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(events.filter((e) => e.type === 'sent')).toHaveLength(1)
+    const settled = events.filter((e) => e.type === 'settled') as Array<Extract<ModelAttemptEvent, { type: 'settled' }>>
+    expect(settled).toHaveLength(1)
+    expect(settled[0]!.attempt.outcome).toBe('failed')
+    expect(settled[0]!.attempt.httpStatus).toBeNull()
+    expect(settled[0]!.attempt.usage.totalTokens).toBeNull()
   })
 })

@@ -13,6 +13,7 @@
 import { appError } from '../../shared/operations'
 import { OperationError } from '../db/operations'
 import type { RunStatus } from '../../shared/agent'
+import type { RecordScope } from './recordScope'
 
 function invalid(message: string): OperationError {
   return new OperationError(appError('VALIDATION', message, { retryable: false }))
@@ -167,7 +168,8 @@ export function isReportState(value: unknown): value is ReportState {
 // ---------- 领域实体类型(持久化形态;规格第 5 节字段清单) ----------
 
 /**
- * 冻结清单条目:有序快照 ID/hash 与来源元数据(R-02 扩展)。
+ * 冻结清单条目:有序快照 ID/hash 与来源元数据(R-02 扩展;RES-02 起清单为 v2,
+ * 条目含 record_scope 并纳入 manifest hash)。
  * 扩展字段是清单复核的一部分:任何一项与当前库不一致都判 SNAPSHOT_HASH_MISMATCH。
  * 旧清单(无扩展字段)兼容:复核时把旧条目视为"导入路径未知",仅核对双 hash。
  */
@@ -182,6 +184,8 @@ export interface SnapshotManifestEntry {
   provenance_group_id?: string
   /** 采集时间依据:imported=未知用导入时间;source=调用方提供 */
   collection_time_basis?: 'imported' | 'source'
+  /** 记录范围(RES-02):整文件规范全文码点坐标系内的范围;旧单源条目可缺省 */
+  record_scope?: RecordScope
 }
 
 export interface SnapshotManifest {

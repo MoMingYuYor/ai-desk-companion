@@ -25,7 +25,8 @@ import {
   getClaim,
   getEvidenceSpan,
   getSubQuestion,
-  listClaims
+  listClaims,
+  saveAllOfRequirement
 } from '../../src/main/research/repository'
 import {
   importResearchSources,
@@ -357,7 +358,8 @@ describe('all_of 证据组与 context 关系', () => {
     const { runId, subquestionId } = seedRun(db, [snap.documentId])
     const groupId = 'grp-1'
     const pyStart = codePointOffsetOf(db, snap.documentId, QUOTE_PYTHON)
-    chainOf(db, runId, subquestionId, snap.documentId, {
+    // RES-03:抽取管线对每个 all_of 组同事务持久化预期成员清单;直接播种同样补清单
+    const memberA = chainOf(db, runId, subquestionId, snap.documentId, {
       quote: QUOTE_PYTHON,
       start: pyStart,
       end: pyStart + Array.from(QUOTE_PYTHON).length,
@@ -365,15 +367,27 @@ describe('all_of 证据组与 context 关系', () => {
       evidenceGroupId: groupId,
       groupOperator: 'all_of'
     })
+    saveAllOfRequirement(db, memberA.claimId, {
+      version: 1,
+      groupId,
+      expectedIndices: [0],
+      members: [{ index: 0, evidenceId: memberA.evidenceId, citationId: memberA.citationId, rejectionReason: null }]
+    })
     // 第二个成员:正确 quote 配错误 offset(结构失败)
     const wrongStart = codePointOffsetOf(db, snap.documentId, '地点:上海。')
-    chainOf(db, runId, subquestionId, snap.documentId, {
+    const memberB = chainOf(db, runId, subquestionId, snap.documentId, {
       quote: '地点:上海。',
       start: wrongStart + 1,
       end: wrongStart + 1 + Array.from('地点:上海。').length,
       claimText: '岗位A 要求 Python 熟练且在上海',
       evidenceGroupId: groupId,
       groupOperator: 'all_of'
+    })
+    saveAllOfRequirement(db, memberB.claimId, {
+      version: 1,
+      groupId,
+      expectedIndices: [0],
+      members: [{ index: 0, evidenceId: memberB.evidenceId, citationId: memberB.citationId, rejectionReason: null }]
     })
     const report = validateCitations(db, runId)
     expect(report.unsupportedClaimIds).toHaveLength(1)
@@ -920,6 +934,32 @@ describe('checkCitationStructure 单项边界', () => {
     expect(checkCitationStructure({ citation, span: mkSpan(2, 2), snapshot, manifest, chunk }).ok).toBe(false)
     const ok = checkCitationStructure({ citation, span: mkSpan(0, 3), snapshot, manifest, chunk })
     expect(ok.ok).toBe(true)
+  })
+
+  it('RES-02 清单外伪造 span 被拒:span 超出冻结记录范围即结构失败', () => {
+    // 记录 0 的冻结范围 [0,13);同文件另一记录的内容在 [13,∞)
+    const snapshot = { snapshotId: 's1', textSha256: 'h', normalizedText: 'abc' + 'd'.repeat(30) }
+    const manifest = {
+      manifestId: 'm', schemaVersion: 2, manifestSha256: 'mh', createdAt: 't',
+      entries: [{
+        snapshot_id: 's1', text_sha256: 'h', raw_sha256: 'r', source_type: 'json', source_name: 'a.json',
+        record_scope: { version: 1 as const, coordinateSystem: 'full-file-codepoint-v1' as const, sourceLocator: '/0', startOffset: 0, endOffset: 13 }
+      }]
+    }
+    const mkSpan = (start: number, end: number, quote: string) => ({
+      evidenceId: 'e1', subquestionId: 'sub', snapshotId: 's1', chunkId: 'k1',
+      startOffset: start, endOffset: end, quote,
+      spanSha256: 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+      validationStatus: 'candidate' as const
+    })
+    const citation = { citationId: 'c1', claimId: 'cl', evidenceId: 'e1', relation: 'supports' as const, evidenceGroupId: null, groupOperator: null }
+    const chunk = { chunkId: 'k1', snapshotId: 's1', startOffset: 0, endOffset: 3, content: 'abc' }
+    // 范围内的合法 span 通过
+    expect(checkCitationStructure({ citation, span: mkSpan(0, 3, 'abc'), snapshot, manifest, chunk }).ok).toBe(true)
+    // 越过范围端点的 span(指向同文件另一记录)被拒
+    const forged = checkCitationStructure({ citation, span: mkSpan(10, 16, 'dddddd'), snapshot, manifest, chunk })
+    expect(forged.ok).toBe(false)
+    expect(forged.reason).toContain('冻结记录范围')
   })
 })
 

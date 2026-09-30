@@ -105,12 +105,12 @@ describe('受控重试', () => {
     const { ledger } = freshLedger()
     planAndReserveReview(ledger)
     ledger.reserve('extraction')
-    // 模型返回无效结构化输出 → 重试一次:成功
-    ledger.reserve('extraction', { isRetry: true })
+    // 模型返回无效结构化输出 → 重试一次(以子问题为身份):成功
+    ledger.reserve('extraction', { isRetry: true, retryKey: 'sub-1' })
     // 已用:规划1 + 审核1 + 抽取1 + 抽取重试1 = 4
     expect(ledger.remainingModelCalls).toBe(2)
-    // 第二次重试拒绝
-    expect(() => ledger.reserve('extraction', { isRetry: true })).toThrow(/受控重试/)
+    // 同一子问题第二次重试拒绝
+    expect(() => ledger.reserve('extraction', { isRetry: true, retryKey: 'sub-1' })).toThrow(/受控重试/)
   })
 
   it('重试不占槽位容量但占总额;每槽位最多一次受控重试', () => {
@@ -118,20 +118,20 @@ describe('受控重试', () => {
     planAndReserveReview(ledger)
     // 总额 6:规划1+审核1 已用 2。抽取 2 次基础 + 1 次重试 = 5,剩 1
     ledger.reserve('extraction')
-    ledger.reserve('extraction', { isRetry: true })
+    ledger.reserve('extraction', { isRetry: true, retryKey: 'sub-1' })
     ledger.reserve('extraction')
     expect(ledger.remainingModelCalls).toBe(1)
     // 第 3 次基础抽取用满总额,但抽取槽位基础用量 3/3 恰好也用满
     ledger.reserve('extraction')
     expect(ledger.remainingModelCalls).toBe(0)
-    // 该槽位已重试过一次:被「每槽位最多一次受控重试」守卫拒绝(先于总额判定)
-    expect(() => ledger.reserve('extraction', { isRetry: true })).toThrow(/受控重试/)
+    // 同一子问题已重试过一次:被「每子问题最多一次受控重试」守卫拒绝(先于总额判定)
+    expect(() => ledger.reserve('extraction', { isRetry: true, retryKey: 'sub-1' })).toThrow(/受控重试/)
     // 另一账本:抽取容量 3 用尽后,基础预留抛槽位容量;重试不占容量,总额允许时放行
     const second = freshLedger()
     planAndReserveReview(second.ledger)
     for (let i = 0; i < 3; i += 1) second.ledger.reserve('extraction')
     expect(second.ledger.remainingModelCalls).toBe(1)
-    second.ledger.reserve('extraction', { isRetry: true })
+    second.ledger.reserve('extraction', { isRetry: true, retryKey: 'sub-3' })
     expect(second.ledger.remainingModelCalls).toBe(0)
   })
 
@@ -140,7 +140,7 @@ describe('受控重试', () => {
     planAndReserveReview(ledger, 3)
     ledger.reserve('extraction')
     // 总额 4:规划1+审核1+抽取1 = 3,剩 1 → 抽取重试用掉最后额度
-    ledger.reserve('extraction', { isRetry: true })
+    ledger.reserve('extraction', { isRetry: true, retryKey: 'sub-1' })
     expect(ledger.remainingModelCalls).toBe(0)
     // 审核槽位的基础调用已消耗、尚未重试,但剩余不足 → 受控重试被拒绝
     expect(() => ledger.reserve('review', { isRetry: true })).toThrow(BudgetExhaustedError)
@@ -424,12 +424,16 @@ describe('账本序列化与重启恢复', () => {
     const { ledger } = freshLedger({ max_model_calls: 6, max_active_seconds: 60 })
     planAndReserveReview(ledger)
     ledger.reserve('extraction')
-    ledger.reserve('extraction', { isRetry: true })
+    ledger.recordSentAttempt('attempt-1')
+    // RES-01:抽取受控重试以子问题 ID 为 retryKey(每子问题单独一次)
+    ledger.reserve('extraction', { isRetry: true, retryKey: 'sub-1' })
     const serialized = ledger.serializeLedger()
     const parsed = JSON.parse(JSON.stringify(serialized))
     const restored = deserializeLedger(parsed)
     expect(restored).toEqual(serialized)
     expect(restored.slots.extraction).toEqual({ used: 1, retries: 1 })
+    expect(restored.sentAttemptIds).toEqual(['attempt-1'])
+    expect(restored.extractionRetryKeys).toEqual(['sub-1'])
     expect(restored.phase).toBe('review_reserved')
   })
 
@@ -457,8 +461,54 @@ describe('账本序列化与重启恢复', () => {
     first.ledger.reserve('extraction')
     const serialized = JSON.parse(JSON.stringify(first.ledger.serializeLedger()))
     const restored = restoreLedger({ serialized, clock: systemClock })
-    restored.reserve('extraction', { isRetry: true })
-    expect(() => restored.reserve('extraction', { isRetry: true })).toThrow(/受控重试/)
+    // RES-01:抽取重试携带子问题身份;同一子问题最多一次
+    restored.reserve('extraction', { isRetry: true, retryKey: 'sub-1' })
+    expect(() => restored.reserve('extraction', { isRetry: true, retryKey: 'sub-1' })).toThrow(/受控重试/)
+  })
+
+  it('RES-01 每个抽取子问题单独一次重试身份;不能共用标记', () => {
+    const { ledger } = freshLedger({ max_model_calls: 6, max_active_seconds: 60 })
+    planAndReserveReview(ledger)
+    ledger.reserve('extraction')
+    ledger.reserve('extraction')
+    ledger.reserve('extraction', { isRetry: true, retryKey: 'sub-a' })
+    // 不同子问题各自一次重试身份
+    ledger.reserve('extraction', { isRetry: true, retryKey: 'sub-b' })
+    // 同一子问题第二次重试拒绝;缺 retryKey 的抽取重试拒绝
+    expect(() => ledger.reserve('extraction', { isRetry: true, retryKey: 'sub-a' })).toThrow(/受控重试/)
+    expect(() => ledger.reserve('extraction', { isRetry: true })).toThrow(/retryKey/)
+    // 重试计数与身份一致地进入 checkpoint v2
+    const serialized = ledger.serializeLedger()
+    expect(serialized.version).toBe(2)
+    expect(serialized.extractionRetryKeys.sort()).toEqual(['sub-a', 'sub-b'])
+    expect(serialized.slots.extraction).toEqual({ used: 2, retries: 2 })
+  })
+
+  it('RES-01 v1 checkpoint 恢复入口保留:恢复后按旧版本续跑由上层拒绝', () => {
+    const { ledger } = freshLedger()
+    ledger.reserve('planning')
+    ledger.sealPlan(1)
+    const serialized = ledger.serializeLedger()
+    // 模拟历史 v1 checkpoint:剥离 v2 字段并降版本
+    const v1 = { ...serialized, version: 1 }
+    delete (v1 as Record<string, unknown>).sentAttemptIds
+    delete (v1 as Record<string, unknown>).extractionRetryKeys
+    const restored = deserializeLedger(v1)
+    expect(restored.version).toBe(1)
+    expect(restored.sentAttemptIds).toEqual([])
+    expect(restored.extractionRetryKeys).toEqual([])
+  })
+
+  it('RES-01 规划在途形态(已准入未定稿)可序列化恢复', () => {
+    const { ledger } = freshLedger()
+    ledger.reserve('planning')
+    ledger.recordSentAttempt('attempt-plan-1')
+    const restored = restoreLedger({ serialized: JSON.parse(JSON.stringify(ledger.serializeLedger())), clock: systemClock })
+    expect(restored.currentPhase).toBe('planning')
+    expect(restored.checkpointVersion).toBe(2)
+    expect(restored.sentAttemptIdList).toEqual(['attempt-plan-1'])
+    // 恢复后规划槽位不可再次预扣(不重发历史请求)
+    expect(() => restored.reserve('planning')).toThrow(/规划槽位已用尽/)
   })
 
   it('活动时间恢复:累计值保留,恢复后按剩余预算计算', () => {

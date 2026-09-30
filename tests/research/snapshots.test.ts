@@ -26,6 +26,7 @@ import {
 import {
   IMPORT_BATCH_LIMIT,
   importResearchSources,
+  projectResearchSourceWithRanges,
   type ImportedResearchSource,
   type ResearchSourceInput
 } from '../../src/main/research/snapshots'
@@ -683,5 +684,127 @@ describe('规范化 golden fixture(fixtures/research/normalization)', () => {
         expect(slice, `${entry.file} [${anchor.start_offset},${anchor.end_offset})`).toBe(anchor.quote)
       }
     }
+  })
+})
+
+// ---------- RES-02:记录范围导入、清单 v2 与旧来源阻塞 ----------
+
+describe('RES-02 记录范围(record_scope)导入与冻结', () => {
+  it('导入结果暴露 recordScope:JSON /i、CSV row:N、md/txt null;FTS 只索引范围内块', async () => {
+    const db = await makeTestDb()
+    const outcomes = importResearchSources(db, {
+      sources: [
+        { sourceName: 'two.json', sourceType: 'json', bytes: Buffer.from(JSON.stringify([
+          { title: 'A', description: '第一记录要求 Python。' },
+          { title: 'B', description: '第二记录要求 OnlyBetaSecret Rust。' }
+        ])) },
+        { sourceName: 'rows.csv', sourceType: 'csv', bytes: Buffer.from('title,description\n甲,行一要求 SQL。\n乙,行二要求 Go。') },
+        { sourceName: 'note.md', sourceType: 'markdown', bytes: Buffer.from('全文即单一记录。') }
+      ],
+      clock: FIXED_CLOCK
+    })
+    const ok = outcomes.filter((o): o is ImportedResearchSource => o.ok)
+    const json0 = ok.find((o) => o.sourceLocator === '/0')!
+    const json1 = ok.find((o) => o.sourceLocator === '/1')!
+    const csv1 = ok.find((o) => o.sourceLocator === 'row:1')!
+    const md = ok.find((o) => o.sourceName === 'note.md')!
+    expect(json0.recordScope).not.toBeNull()
+    expect(json0.recordScope!.sourceLocator).toBe('/0')
+    expect(json1.recordScope!.sourceLocator).toBe('/1')
+    expect(json0.recordScope!.endOffset).toBeLessThanOrEqual(json1.recordScope!.startOffset)
+    expect(csv1.recordScope!.sourceLocator).toBe('row:1')
+    expect(md.recordScope!.sourceLocator).toBeNull()
+    expect(md.recordScope!.startOffset).toBe(0)
+    // FTS 只索引范围内块:记录 1 的块含其专有词,记录 0 的块不含
+    const chunksJson1 = db.all<{ content: string }>(
+      'SELECT content FROM retrieval_chunks WHERE document_id = ? ORDER BY chunk_index', [json1.documentId])
+    expect(chunksJson1.length).toBeGreaterThan(0)
+    expect(chunksJson1.some((c) => c.content.includes('OnlyBetaSecret'))).toBe(true)
+    const chunksJson0 = db.all<{ content: string }>(
+      'SELECT content FROM retrieval_chunks WHERE document_id = ? ORDER BY chunk_index', [json0.documentId])
+    expect(chunksJson0.some((c) => c.content.includes('OnlyBetaSecret'))).toBe(false)
+  })
+
+  it('首条记录无效时不挪动后续全文件坐标:/1 的范围与完整投影一致', async () => {
+    const db = await makeTestDb()
+    const raw = JSON.stringify([
+      { title: '坏记录', company: 'X' }, // 缺 description:该记录失败
+      { title: '好记录', description: '第二条要求 Python。' }
+    ])
+    const outcomes = importResearchSources(db, {
+      sources: [{ sourceName: 'partial.json', sourceType: 'json', bytes: Buffer.from(raw) }],
+      clock: FIXED_CLOCK
+    })
+    const failed = outcomes.find((o) => !o.ok && o.sourceLocator === '/0')
+    const ok1 = outcomes.find((o): o is ImportedResearchSource => o.ok && o.sourceLocator === '/1')
+    expect(failed).toBeTruthy()
+    expect(ok1).toBeTruthy()
+    // /1 的范围仍按完整投影的码点累计(不从扁平全文猜、不因首条失败而挪动)
+    const full = projectResearchSourceWithRanges('json', new TextDecoder().decode(Buffer.from(raw)))
+    const expected = full.scopes.find((s) => s.sourceLocator === '/1')!
+    expect(ok1!.recordScope!.startOffset).toBe(expected.startOffset)
+    expect(ok1!.recordScope!.endOffset).toBe(expected.endOffset)
+  })
+
+  it('清单为 v2:条目含 record_scope;库内范围被改在复核时暴露', async () => {
+    const db = await makeTestDb()
+    const doc = okOf(importResearchSources(db, { sources: [{ sourceName: 'two2.json', sourceType: 'json', bytes: Buffer.from(JSON.stringify([
+      { title: 'A', description: '第一记录要求 Python。' },
+      { title: 'B', description: '第二记录要求 Rust。' }
+    ])) }], clock: FIXED_CLOCK })).find((o) => o.sourceLocator === '/0')!
+    const { value } = createResearchRun(db, {
+      request: { question: '要求什么?', snapshot_ids: [doc.documentId], snapshot_policy: 'fixed', budget: {} },
+      contextClock: '2026-09-27T12:00:00.000Z',
+      clock: FIXED_CLOCK
+    }, 'op-scope-v2')
+    expect(value.manifest.schemaVersion).toBe(2)
+    expect(value.manifest.entries[0]!.record_scope).toEqual(doc.recordScope)
+    // 篡改库内范围 → verifySnapshotManifest 抛 SNAPSHOT_HASH_MISMATCH(记录范围与冻结清单不一致)
+    db.run(
+      `UPDATE retrieval_documents
+         SET source_metadata_json = json_set(source_metadata_json, '$.record_scope.end_offset',
+           json_extract(source_metadata_json, '$.record_scope.end_offset') + 1)
+       WHERE document_id = ?`,
+      [doc.documentId]
+    )
+    expect(() => verifySnapshotManifest(db, value.manifest.manifestId)).toThrow(/记录范围|SNAPSHOT_HASH_MISMATCH/)
+  })
+
+  it('旧多记录来源无范围时拒绝执行:[RECORD_SCOPE_REQUIRED];旧单源只读放行', async () => {
+    const db = await makeTestDb()
+    const doc = okOf(importResearchSources(db, { sources: [{ sourceName: 'old.json', sourceType: 'json', bytes: Buffer.from(JSON.stringify([
+      { title: 'A', description: '第一记录要求 Python。' },
+      { title: 'B', description: '第二记录要求 Rust。' }
+    ])) }], clock: FIXED_CLOCK })).find((o) => o.sourceLocator === '/0')!
+    // 模拟旧库行:剥离 record_scope
+    db.run(
+      `UPDATE retrieval_documents
+         SET source_metadata_json = json_remove(source_metadata_json, '$.record_scope')
+       WHERE document_id = ?`,
+      [doc.documentId]
+    )
+    let message = ''
+    try {
+      createResearchRun(db, {
+        request: { question: '要求什么?', snapshot_ids: [doc.documentId], snapshot_policy: 'fixed', budget: {} },
+        contextClock: '2026-09-27T12:00:00.000Z',
+        clock: FIXED_CLOCK
+      }, 'op-scope-required')
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err)
+    }
+    expect(message).toContain('[RECORD_SCOPE_REQUIRED]')
+    // 旧单源(md/txt,locator null)无范围仍可建运行:保持"范围未验证"只读语义
+    const md = okOf(importResearchSources(db, { sources: [{ sourceName: 'legacy-md.md', sourceType: 'markdown', bytes: Buffer.from('旧的单源记录。') }], clock: FIXED_CLOCK }))[0]!
+    db.run(
+      `UPDATE retrieval_documents SET source_metadata_json = json_remove(source_metadata_json, '$.record_scope') WHERE document_id = ?`,
+      [md.documentId]
+    )
+    const { value } = createResearchRun(db, {
+      request: { question: '要求什么?', snapshot_ids: [md.documentId], snapshot_policy: 'fixed', budget: {} },
+      contextClock: '2026-09-27T12:00:00.000Z',
+      clock: FIXED_CLOCK
+    }, 'op-legacy-md')
+    expect(value.manifest.entries[0]!.record_scope).toBeUndefined()
   })
 })

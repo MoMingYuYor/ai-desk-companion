@@ -17,6 +17,8 @@ import { createRun, type AgentRunRecord } from '../runs/repository'
 import { appError } from '../../shared/operations'
 import { systemClock, type Clock } from '../../shared/clock'
 import { isRunStatus, type RunStatus } from '../../shared/agent'
+import { validateRecordScope } from './recordScope'
+import type { AllOfRequirement } from './citations'
 import {
   isEvidenceValidationStatus,
   isReportState,
@@ -354,7 +356,8 @@ export function createResearchRun(db: SqliteDb, input: CreateResearchRunInput, o
       const request = parseResearchRequest(input.request)
 
       // 冻结清单:快照必须已导入(SourceSnapshot 即 retrieval_documents,m3 共享表;
-      // v9 起补研究侧来源列——source_identity/provenance_group_id/collection_time_basis)
+      // v9 起补研究侧来源列——source_identity/provenance_group_id/collection_time_basis;
+      // RES-02 起清单为 schemaVersion=2,条目含 record_scope 并纳入 manifest hash)
       const entries: SnapshotManifestEntry[] = []
       for (const snapshotId of request.snapshot_ids) {
         const doc = db.get<{
@@ -366,14 +369,32 @@ export function createResearchRun(db: SqliteDb, input: CreateResearchRunInput, o
           source_identity: string | null
           provenance_group_id: string | null
           collection_time_basis: string | null
+          source_locator: string | null
+          source_metadata_json: string | null
+          normalized_text: string
         }>(
           `SELECT document_id, source_name, source_type, raw_sha256, text_sha256,
-                  source_identity, provenance_group_id, collection_time_basis
+                  source_identity, provenance_group_id, collection_time_basis,
+                  source_locator, source_metadata_json, normalized_text
            FROM retrieval_documents WHERE document_id = ?`,
           [snapshotId]
         )
         if (!doc) {
           throw researchFailure('TARGET_UNAVAILABLE', 'SNAPSHOT_NOT_FOUND', `快照不存在或未导入:${snapshotId}`)
+        }
+        // RES-02:旧多记录来源无范围时必须拒绝执行,提示从原始文件重导入;
+        // 不能从扁平全文猜边界(旧单源条目保持"范围未验证"只读语义)
+        const metadata = (doc.source_metadata_json ? (JSON.parse(doc.source_metadata_json) as Record<string, unknown>) : {})
+        const recordScope =
+          metadata.record_scope === undefined
+            ? null
+            : validateRecordScope(metadata.record_scope, Array.from(doc.normalized_text).length)
+        if (doc.source_locator !== null && recordScope === null) {
+          throw researchFailure(
+            'CONFLICT',
+            'RECORD_SCOPE_REQUIRED',
+            `快照 ${snapshotId} 是多记录来源但缺少记录范围(record_scope),请从原始文件重新导入后再运行`
+          )
         }
         entries.push({
           snapshot_id: doc.document_id,
@@ -386,14 +407,15 @@ export function createResearchRun(db: SqliteDb, input: CreateResearchRunInput, o
           collection_time_basis:
             doc.collection_time_basis === 'imported' || doc.collection_time_basis === 'source'
               ? doc.collection_time_basis
-              : undefined
+              : undefined,
+          record_scope: recordScope ?? undefined
         })
       }
       const manifest: SnapshotManifest = {
         manifestId: randomUUID(),
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries,
-        manifestSha256: sha256Hex(stableStringify({ schema_version: 1, entries })),
+        manifestSha256: sha256Hex(stableStringify({ schema_version: 2, entries })),
         createdAt: clock.now().toISOString()
       }
       db.run(
@@ -475,10 +497,12 @@ export function getSnapshotManifest(db: SqliteDb, manifestId: string): SnapshotM
 }
 
 /**
- * 清单复核:逐个快照核对存在性、双 hash(text/raw)及 R-02 来源元数据
- * (source_identity/provenance_group_id/collection_time_basis)是否与冻结时一致。
- * 任一项不一致说明快照在运行创建后被改动(损坏或被替换),抛 CONFLICT(SNAPSHOT_HASH_MISMATCH)。
- * 旧清单(无扩展字段)只核对双 hash,视为导入路径未知。
+ * 清单复核:逐个快照核对存在性、双 hash(text/raw)、R-02 来源元数据
+ * (source_identity/provenance_group_id/collection_time_basis)以及 RES-02 记录范围
+ * (record_scope)是否与冻结时一致。任一项不一致说明快照在运行创建后被改动
+ * (损坏或被替换),抛 CONFLICT(SNAPSHOT_HASH_MISMATCH)。
+ * 旧清单(v1,无扩展字段)只核对双 hash;其中多记录来源缺范围时拒绝执行
+ * ([RECORD_SCOPE_REQUIRED])——不能从扁平全文猜边界。
  */
 export function verifySnapshotManifest(db: SqliteDb, manifestId: string): SnapshotManifest {
   const manifest = getSnapshotManifest(db, manifestId)
@@ -492,8 +516,12 @@ export function verifySnapshotManifest(db: SqliteDb, manifestId: string): Snapsh
       source_identity: string | null
       provenance_group_id: string | null
       collection_time_basis: string | null
+      source_locator: string | null
+      source_metadata_json: string | null
+      normalized_text: string
     }>(
-      `SELECT raw_sha256, text_sha256, source_identity, provenance_group_id, collection_time_basis
+      `SELECT raw_sha256, text_sha256, source_identity, provenance_group_id, collection_time_basis,
+              source_locator, source_metadata_json, normalized_text
        FROM retrieval_documents WHERE document_id = ?`,
       [entry.snapshot_id]
     )
@@ -515,6 +543,33 @@ export function verifySnapshotManifest(db: SqliteDb, manifestId: string): Snapsh
       doc.collection_time_basis !== entry.collection_time_basis
     ) {
       throw researchFailure('CONFLICT', 'SNAPSHOT_HASH_MISMATCH', `快照采集时间依据与冻结清单不一致:${entry.snapshot_id}`)
+    }
+    // RES-02:记录范围一致性。v2 清单条目冻结过范围时必须与当前范围逐字一致;
+    // v1 旧清单中多记录来源无范围 → 拒绝执行(旧运行不重索引,提示从原始文件重导入)
+    const metadata = (doc.source_metadata_json ? (JSON.parse(doc.source_metadata_json) as Record<string, unknown>) : {})
+    const currentScope =
+      metadata.record_scope === undefined
+        ? null
+        : validateRecordScope(metadata.record_scope, Array.from(doc.normalized_text).length)
+    if (entry.record_scope !== undefined) {
+      if (
+        currentScope === null ||
+        currentScope.sourceLocator !== entry.record_scope.sourceLocator ||
+        currentScope.startOffset !== entry.record_scope.startOffset ||
+        currentScope.endOffset !== entry.record_scope.endOffset
+      ) {
+        throw researchFailure(
+          'CONFLICT',
+          'SNAPSHOT_HASH_MISMATCH',
+          `快照记录范围与冻结清单不一致:${entry.snapshot_id}`
+        )
+      }
+    } else if (doc.source_locator !== null && currentScope === null) {
+      throw researchFailure(
+        'CONFLICT',
+        'RECORD_SCOPE_REQUIRED',
+        `旧清单中快照 ${entry.snapshot_id} 是多记录来源但缺少记录范围,请从原始文件重新导入后开启新运行`
+      )
     }
   }
   return manifest
@@ -574,8 +629,8 @@ export function createEvidenceSpan(db: SqliteDb, runId: string, subquestionId: s
   assertSubQuestionInRun(db, runId, subquestionId)
   const input = parseEvidenceSpanInput(raw)
 
-  const doc = db.get<{ normalized_text: string }>(
-    'SELECT normalized_text FROM retrieval_documents WHERE document_id = ?',
+  const doc = db.get<{ normalized_text: string; source_metadata_json: string | null }>(
+    'SELECT normalized_text, source_metadata_json FROM retrieval_documents WHERE document_id = ?',
     [input.snapshot_id]
   )
   if (!doc) {
@@ -591,6 +646,20 @@ export function createEvidenceSpan(db: SqliteDb, runId: string, subquestionId: s
     throw new OperationError(
       appError('VALIDATION', `offset 超出快照范围:end_offset=${input.end_offset} > 快照码点长度 ${snapshotLength}`, { retryable: false })
     )
+  }
+  // RES-02:抽取落库同样验证冻结记录范围——span 不得超出本快照的 record_scope
+  const metadata = (doc.source_metadata_json ? (JSON.parse(doc.source_metadata_json) as Record<string, unknown>) : {})
+  if (metadata.record_scope !== undefined) {
+    const scope = validateRecordScope(metadata.record_scope, snapshotLength)
+    if (input.start_offset < scope.startOffset || input.end_offset > scope.endOffset) {
+      throw new OperationError(
+        appError(
+          'VALIDATION',
+          `offset 超出记录范围:[${input.start_offset},${input.end_offset}) 不在冻结范围 [${scope.startOffset},${scope.endOffset}) 内`,
+          { retryable: false }
+        )
+      )
+    }
   }
 
   const span: EvidenceSpan = {
@@ -888,7 +957,7 @@ export function updateClaimReview(
   assertClaimNotFrozen(db, claimId)
   db.run(
     'UPDATE research_claims SET support_status = ?, review_json = ? WHERE claim_id = ?',
-    [status, review === null ? null : JSON.stringify(review), claimId]
+    [status, mergeAllOfRequirements(db, claimId, review), claimId]
   )
 }
 
@@ -897,7 +966,84 @@ export function updateClaimConflictGroup(db: SqliteDb, claimId: string, conflict
   assertClaimNotFrozen(db, claimId)
   db.run(
     'UPDATE research_claims SET conflict_group = ?, review_json = ? WHERE claim_id = ?',
-    [conflictGroup, review === null ? null : JSON.stringify(review), claimId]
+    [conflictGroup, mergeAllOfRequirements(db, claimId, review), claimId]
+  )
+}
+
+/**
+ * RES-03:更新 review_json 时保留既有 evidence_requirements(all_of 预期成员清单
+ * 与结构/语义 review 字段并存,更新审核状态不得覆盖它)。
+ */
+function mergeAllOfRequirements(db: SqliteDb, claimId: string, review: Record<string, unknown> | null): string | null {
+  const claim = getClaim(db, claimId)
+  const preserved = (claim?.review as { evidence_requirements?: unknown } | null)?.evidence_requirements
+  if (preserved === undefined || review === null || review.evidence_requirements !== undefined) {
+    return review === null ? null : JSON.stringify(review)
+  }
+  return JSON.stringify({ ...review, evidence_requirements: preserved })
+}
+
+// ---------- RES-03:all_of 预期成员清单存取 ----------
+
+/**
+ * 校验清单形状(写入侧防线):版本/groupId/预期下标与成员键形逐项拒绝;
+ * 成员与预期下标的对应完整性**不在写入侧强制**——缺员属确定性缺员结果,
+ * 由 checkAllOfCompleteness 在读取侧按缺失判定(失败方向安全)。
+ */
+function assertAllOfRequirementShape(value: AllOfRequirement): void {
+  const invalid = (message: string): OperationError =>
+    new OperationError(appError('VALIDATION', `all_of 预期成员清单非法:${message}`, { retryable: false }))
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw invalid('必须是对象')
+  if (value.version !== 1) throw invalid('version 仅接受 1')
+  if (typeof value.groupId !== 'string' || value.groupId === '') throw invalid('groupId 必须是非空字符串')
+  if (!Array.isArray(value.expectedIndices) || value.expectedIndices.length === 0) {
+    throw invalid('expectedIndices 必须至少一项(空组属无效抽取输出)')
+  }
+  if (new Set(value.expectedIndices).size !== value.expectedIndices.length) {
+    throw invalid('expectedIndices 不得重复')
+  }
+  if (!Array.isArray(value.members)) throw invalid('members 必须是数组')
+  for (const index of value.expectedIndices) {
+    if (typeof index !== 'number' || !Number.isInteger(index) || index < 0) {
+      throw invalid(`expectedIndices 必须是非负整数,收到 ${String(index)}`)
+    }
+  }
+  for (const member of value.members) {
+    if (typeof member !== 'object' || member === null || Array.isArray(member)) {
+      throw invalid('成员必须是对象')
+    }
+    const keys = Object.keys(member).sort()
+    if (JSON.stringify(keys) !== JSON.stringify(['citationId', 'evidenceId', 'index', 'rejectionReason'])) {
+      throw invalid(`成员 ${String(member.index)} 含未知字段或缺字段`)
+    }
+    if (member.rejectionReason !== null && typeof member.rejectionReason !== 'string') {
+      throw invalid(`成员 ${String(member.index)} 的 rejectionReason 必须是字符串或 null`)
+    }
+  }
+}
+
+/** 保存(同组整体替换)all_of 预期成员清单;与结构/语义 review 字段并存,同事务由调用方拥有 */
+export function saveAllOfRequirement(db: SqliteDb, claimId: string, value: AllOfRequirement): void {
+  assertAllOfRequirementShape(value)
+  assertClaimNotFrozen(db, claimId)
+  const claim = getClaim(db, claimId)
+  if (!claim) {
+    throw new OperationError(appError('TARGET_UNAVAILABLE', `Claim 不存在:${claimId}`, { retryable: false }))
+  }
+  const existing = (claim.review as { evidence_requirements?: AllOfRequirement[] } | null)?.evidence_requirements ?? []
+  const merged = [...existing.filter((r) => r.groupId !== value.groupId), value]
+  const review = { ...(claim.review ?? {}), evidence_requirements: merged }
+  db.run('UPDATE research_claims SET review_json = ? WHERE claim_id = ?', [JSON.stringify(review), claimId])
+}
+
+/** 读取 claim 的全部 all_of 预期成员清单;无清单返回 [](缺清单的组由调用方按 ALL_OF_EXPECTATION_MISSING 处理) */
+export function loadAllOfRequirements(db: SqliteDb, claimId: string): AllOfRequirement[] {
+  const claim = getClaim(db, claimId)
+  if (!claim || claim.review === null) return []
+  const raw = (claim.review as { evidence_requirements?: unknown }).evidence_requirements
+  if (!Array.isArray(raw)) return []
+  return raw.filter((r): r is AllOfRequirement =>
+    typeof r === 'object' && r !== null && !Array.isArray(r) && (r as AllOfRequirement).version === 1
   )
 }
 

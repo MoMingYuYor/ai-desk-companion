@@ -317,10 +317,11 @@ export function retrieveForSubquestion(db: SqliteDb, input: RetrieveForSubquesti
   // 分词为空(纯标点/空白查询):无法构造安全 MATCH,直接记检索不足
   if (queryTokens.length === 0) return emptyResult()
 
-  // 每题仅此一次检索;窗口取共享候选上限等宽,过滤后再截断(见文件头说明)
-  const filtered = searchDocuments(db, queryUsed, RETRIEVAL_FETCH_LIMIT).filter((hit) =>
-    frozenSet.has(hit.documentId)
-  )
+  // 每题仅此一次检索;RES-02:冻结集合过滤移入 MATCH 候选阶段(参数绑定),
+  // 候选窗口只被冻结清单内内容占据,清单外高分资料不再挤占名额
+  const filtered = searchDocuments(db, queryUsed, RETRIEVAL_FETCH_LIMIT, {
+    frozenSnapshotIds: frozenSnapshotIds
+  })
   const candidateCount = filtered.length
   filtered.sort(compareHits)
   const hits: RetrievalHit[] = filtered.slice(0, input.chunkLimit).map((hit) => ({

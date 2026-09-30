@@ -16,8 +16,11 @@
 
 import type { SqliteDb } from '../db/connection'
 import type { StructuredCompleter } from '../agent/llm'
+import { ModelRequestError, type ModelRequestControl } from '../services/modelRequest'
+import { isBudgetExhaustedError } from './budget'
 import { appError } from '../../shared/operations'
 import { OperationError } from '../db/operations'
+import { allOfIncompleteClaimIds } from './citations'
 import {
   createReport,
   getResearchTaskByRun,
@@ -313,6 +316,8 @@ export interface BuildReportOptions {
   /** 显式提供组织计划(测试与模板路径);缺省调用 completer */
   plan?: SynthesisPlan | null
   reportState?: Report['reportState']
+  /** RES-01:组织模型调用的传输控制;组织槽位在其 beforeSend 内扣减 */
+  control?: ModelRequestControl
 }
 
 export interface BuildReportResult {
@@ -326,7 +331,8 @@ export interface BuildReportResult {
  *    candidate 不进事实区;
  * 2) 组织模型返回白名单外的 claim 即拒绝并回退模板;
  * 3) 引用闭包最终再校验一次(逐引用重放 checkCitationStructure),任一失败不进入版本;
- * 4) createReport 唯一约束兜底版本不可变;structured.frozen 记录冻结集合。
+ * 4) RES-03:all_of 缺员命题在冻结前再次检查,不进入事实区(缺员只能进不足/候选说明);
+ * 5) createReport 唯一约束兜底版本不可变;structured.frozen 记录冻结集合。
  */
 export async function buildReport(db: SqliteDb, runId: string, options: BuildReportOptions): Promise<BuildReportResult> {
   const task = getResearchTaskByRun(db, runId)
@@ -337,7 +343,13 @@ export async function buildReport(db: SqliteDb, runId: string, options: BuildRep
   const subquestions = listSubQuestions(db, task.researchTaskId)
   const frozenAlready = listFrozenClaimIds(db, task.researchTaskId)
 
-  const eligible = reportEligibleClaims(claims).filter((c) => !frozenAlready.has(c.claimId))
+  // RES-03 完整性终检:all_of 缺员或缺预期清单的命题在冻结前再次检查,
+  // 即使被绕过升级为 supported 也不进入事实区,只能进入不足/候选说明
+  const blockedByAllOf = allOfIncompleteClaimIds(db, claims)
+
+  const eligible = reportEligibleClaims(claims).filter(
+    (c) => !frozenAlready.has(c.claimId) && !blockedByAllOf.has(c.claimId)
+  )
   const allowed = new Set(eligible.map((c) => c.claimId))
 
   // 组织:优先显式 plan;否则调 completer;白名单外/无效一律回退模板。
@@ -353,10 +365,16 @@ export async function buildReport(db: SqliteDb, runId: string, options: BuildRep
           '不生成新的事实句。可选输出 recommendation_claim_ids(建议类 Claim 顺序)。',
         prompt:
           `可用 Claim ID(白名单):\n${[...allowed].map((id) => `- ${id}`).join('\n') || '(空)'}\n` +
-          `章节枚举:${REPORT_SECTIONS.join(', ')}`
+          `章节枚举:${REPORT_SECTIONS.join(', ')}`,
+        ...(options.control !== undefined ? { control: options.control } : {})
       })
       plan = parseSynthesisPlan(result.data, allowed)
-    } catch {
+    } catch (err) {
+      // RES-01:取消与预算/时限耗尽必须穿过组织兜底重新抛出;
+      // 其余输出/网络错误回退确定性模板
+      if (isBudgetExhaustedError(err)) throw err
+      if (err instanceof ModelRequestError && err.code === 'CANCELLED') throw err
+      if (options.control?.signal.aborted) throw err // beforeSend 内的协作取消
       plan = null
     }
     planUsedModel = plan !== null
@@ -439,7 +457,7 @@ export async function buildReport(db: SqliteDb, runId: string, options: BuildRep
   }
 }
 
-/** 终检:任一引用结构失败即拒绝进入版本(CITATION_INVALID) */
+/** 终检:任一引用结构失败即拒绝进入版本(CITATION_INVALID);RES-02 同时校验冻结记录范围与全文 hash */
 function finalCheck(db: SqliteDb, rows: readonly RunCitationRow[], manifest: ReturnType<typeof verifySnapshotManifest>): void {
   void db
   for (const row of rows) {
@@ -447,8 +465,22 @@ function finalCheck(db: SqliteDb, rows: readonly RunCitationRow[], manifest: Ret
       'SELECT text_sha256 FROM retrieval_documents WHERE document_id = ?',
       [row.span.snapshotId]
     )
-    if (!snapshotRow || snapshotRow.text_sha256 !== manifest.entries.find((e) => e.snapshot_id === row.span.snapshotId)?.text_sha256) {
+    const entry = manifest.entries.find((e) => e.snapshot_id === row.span.snapshotId)
+    if (!snapshotRow || snapshotRow.text_sha256 !== entry?.text_sha256) {
       throw new OperationError(appError('CONFLICT', '[CITATION_INVALID] 快照 hash 与冻结清单不一致,拒绝生成报告版本', { retryable: false }))
+    }
+    // RES-02:span 必须落在冻结记录范围内,范围外的引用不进入报告版本
+    if (entry.record_scope !== undefined) {
+      const scope = entry.record_scope
+      if (row.span.startOffset < scope.startOffset || row.span.endOffset > scope.endOffset) {
+        throw new OperationError(
+          appError(
+            'CONFLICT',
+            `[CITATION_INVALID] span [${row.span.startOffset},${row.span.endOffset}) 超出冻结记录范围 [${scope.startOffset},${scope.endOffset}),拒绝生成报告版本`,
+            { retryable: false }
+          )
+        )
+      }
     }
     const resliced = Array.from(
       db.get<{ normalized_text: string }>('SELECT normalized_text FROM retrieval_documents WHERE document_id = ?', [row.span.snapshotId])!

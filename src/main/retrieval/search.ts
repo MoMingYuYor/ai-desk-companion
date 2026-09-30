@@ -5,6 +5,10 @@
 // 排序:bm25() 是 FTS5 特性本构建不可用;采用应用层计分——
 // score = Σ(去重后查询 token 在 chunk 中出现次数),同分按
 // document_id、chunk_index 字典序稳定排序,可复现、可手算核对。
+//
+// RES-02:提供 options.frozenSnapshotIds 时,冻结集合过滤移入 MATCH 候选阶段
+// (JOIN retrieval_chunks,参数绑定),再应用 candidateLimit——清单外资料不再
+// 挤占候选窗口;分批取候选(超过 SQL 参数上限),合并后稳定排序并统一截断。
 
 import type { SqliteDb } from '../db/connection'
 import { tokenizeForSearch, buildMatchQuery } from './tokenize'
@@ -25,6 +29,13 @@ export interface SearchHit {
   matchedTerms: string[]
 }
 
+export interface SearchDocumentsOptions {
+  /** 冻结集合:候选阶段即按 document_id 过滤(参数绑定);空集合直接返回 [] */
+  frozenSnapshotIds: readonly string[]
+  /** 候选上限(过滤后统一截断);缺省 500 */
+  candidateLimit?: number
+}
+
 interface ChunkRow {
   chunk_id: string
   document_id: string
@@ -43,30 +54,76 @@ interface DocumentRow {
 /** 单次查询进入评分的候选上限(候选集截断,防止超大语料全量评分) */
 const MATCH_CANDIDATE_LIMIT = 500
 
+/** SQL 参数分批上限:每批 MATCH 表达式占 1 个参数,其余留给 document_id 绑定 */
+const SQL_PARAM_BATCH = 400
+
+/** 按 (documentId, chunkIndex, chunkId) 的稳定全序(跨批合并后统一截断用) */
+function compareCandidateRows(a: ChunkRow, b: ChunkRow): number {
+  return (
+    (a.document_id < b.document_id ? -1 : a.document_id > b.document_id ? 1 : 0) ||
+    a.chunk_index - b.chunk_index ||
+    (a.chunk_id < b.chunk_id ? -1 : a.chunk_id > b.chunk_id ? 1 : 0)
+  )
+}
+
 /**
  * 关键词检索。查询为空或分词后为空(纯标点等)返回空数组而非报错;
  * 恶意 MATCH 语法经分词归一后不可能进入表达式。
+ * options.frozenSnapshotIds 提供时(RES-02),冻结过滤发生在 MATCH 候选阶段。
  */
-export function searchDocuments(db: SqliteDb, query: string, limit = 8): SearchHit[] {
+export function searchDocuments(db: SqliteDb, query: string, limit = 8, options?: SearchDocumentsOptions): SearchHit[] {
   const tokens = tokenizeForSearch(query)
   if (tokens.length === 0) return []
   const match = buildMatchQuery(tokens)
 
-  const candidates = db.all<{ docid: number }>(
-    `SELECT docid FROM retrieval_fts WHERE retrieval_fts MATCH ? LIMIT ${MATCH_CANDIDATE_LIMIT}`,
-    [match]
-  )
-  if (candidates.length === 0) return []
-
-  const placeholders = candidates.map(() => '?').join(', ')
-  const rows = db.all<ChunkRow & DocumentRow>(
-    `SELECT c.chunk_id, c.document_id, c.chunk_index, c.start_offset, c.end_offset,
-            c.content, c.search_text, d.source_name, d.source_type
-       FROM retrieval_chunks c
-       JOIN retrieval_documents d ON d.document_id = c.document_id
-      WHERE c.rowid IN (${placeholders})`,
-    candidates.map((c) => c.docid)
-  )
+  let rows: Array<ChunkRow & DocumentRow>
+  if (options !== undefined) {
+    // RES-02 路径:候选阶段 JOIN retrieval_chunks 按冻结 document_id 过滤;
+    // 冻结集合为空直接返回 [];超过 SQL 参数上限分批取候选
+    const frozen = [...options.frozenSnapshotIds]
+    if (frozen.length === 0) return []
+    const candidateLimit = options.candidateLimit ?? MATCH_CANDIDATE_LIMIT
+    const candidateRows: Array<ChunkRow & DocumentRow> = []
+    for (let i = 0; i < frozen.length; i += SQL_PARAM_BATCH) {
+      const batch = frozen.slice(i, i + SQL_PARAM_BATCH)
+      const placeholders = batch.map(() => '?').join(', ')
+      candidateRows.push(
+        ...db.all<ChunkRow & DocumentRow>(
+          `SELECT c.chunk_id, c.document_id, c.chunk_index, c.start_offset, c.end_offset,
+                  c.content, c.search_text, d.source_name, d.source_type
+             FROM retrieval_fts f
+             JOIN retrieval_chunks c ON c.rowid = f.docid
+             JOIN retrieval_documents d ON d.document_id = c.document_id
+            WHERE retrieval_fts MATCH ? AND c.document_id IN (${placeholders})`,
+          [match, ...batch]
+        )
+      )
+    }
+    // 合并去重后按稳定全序排序,再做统一候选截断(不能每批各截断后不做全局上限)
+    const seen = new Set<string>()
+    const deduped = candidateRows.filter((row) => {
+      if (seen.has(row.chunk_id)) return false
+      seen.add(row.chunk_id)
+      return true
+    })
+    rows = deduped.sort(compareCandidateRows).slice(0, candidateLimit)
+  } else {
+    const candidates = db.all<{ docid: number }>(
+      `SELECT docid FROM retrieval_fts WHERE retrieval_fts MATCH ? LIMIT ${MATCH_CANDIDATE_LIMIT}`,
+      [match]
+    )
+    if (candidates.length === 0) return []
+    const placeholders = candidates.map(() => '?').join(', ')
+    rows = db.all<ChunkRow & DocumentRow>(
+      `SELECT c.chunk_id, c.document_id, c.chunk_index, c.start_offset, c.end_offset,
+              c.content, c.search_text, d.source_name, d.source_type
+         FROM retrieval_chunks c
+         JOIN retrieval_documents d ON d.document_id = c.document_id
+        WHERE c.rowid IN (${placeholders})`,
+      candidates.map((c) => c.docid)
+    )
+  }
+  if (rows.length === 0) return []
 
   const distinct = [...new Set(tokens)]
   const hits: SearchHit[] = rows.map((row) => {

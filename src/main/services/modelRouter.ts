@@ -1,5 +1,18 @@
-// 模型服务:多服务商配置、流式调用、多模态、有限重试与自动故障切换
+// 模型服务:多服务商配置、流式调用、多模态、有限重试与自动故障切换。
+// RES-01:带 control 的 call 走单发送分支——一次 call 最多一次 fetchImpl,
+// 强制忽略旧 maxRetriesPerProvider,禁止内部备用切换;重试只由上层工作流发起。
+import { randomUUID } from 'node:crypto'
 import type { ProviderInfo } from '../../shared/types'
+import type { TokenUsage } from '../../shared/agent'
+import {
+  ModelRequestError,
+  nullTokenUsage,
+  type ActualProvider,
+  type ModelAttemptEvent,
+  type ModelAttemptInfo,
+  type ModelAttemptRecord,
+  type ModelRequestControl
+} from './modelRequest'
 
 export type LlmPart =
   | { type: 'text'; text: string }
@@ -30,11 +43,21 @@ export interface CallOptions {
   onNotice?: (n: RouterNotice) => void
   maxRetriesPerProvider?: number
   timeoutMs?: number
+  /** RES-01 单发送控制;携带时忽略 maxRetriesPerProvider 并禁用备用切换 */
+  control?: ModelRequestControl
 }
 
 export interface CallResult {
   text: string
   used: { providerId: string; providerName: string; model: string }
+  /** 实际派发路由(仅 control 分支返回;旧流式调用方按原职责使用 text/used) */
+  actualProvider?: ActualProvider | null
+  /** 实际网络发送次数 */
+  actualAttempts?: number
+  /** 逐尝试结算记录 */
+  attempts?: readonly ModelAttemptRecord[]
+  /** 供应商上报的 token 用量;未返回字段记 null */
+  usage?: TokenUsage
 }
 
 export class ModelCallError extends Error {
@@ -102,6 +125,8 @@ export class ModelRouter {
   }
 
   async call(providers: ProviderInfo[], options: CallOptions): Promise<CallResult> {
+    // RES-01 单发送分支:带 control 的调用不重试、不切换,由上层工作流控制重试
+    if (options.control) return this.callControlled(providers, options)
     const needVision = options.needVision ?? false
     const chain = buildChain(providers, this.opts.apiKeyOf, { needVision })
     if (chain.length === 0) {
@@ -157,6 +182,256 @@ export class ModelRouter {
       '所有模型服务均不可用:' + failures.map((f) => `${f.attempt}(${f.reason})`).join(';'),
       failures
     )
+  }
+
+  /**
+   * RES-01 单发送分支:一次 call 最多调用 fetchImpl 一次,忽略旧 maxRetriesPerProvider,
+   * 禁止内部备用切换。请求 policy.providerId 缺省时选候选链第一项;指定 ID 不存在则
+   * 发送数为 0 并拒绝。beforeSend 同步执行预算准入/取消检查/checkpoint 保存,失败则
+   * 不调用 fetch、不发 sent;实际调用 fetchImpl 后在同一同步段立即发 sent(fetch 同步
+   * 抛错也记录一次 sent)。onAttempt 回调持久化失败必须 abort 已派发请求,以
+   * OBSERVATION_FAILED 失败并保留已派发记录。超时与取消经真实 abort 终止网络,
+   * 不用单独 Promise.race 留下后台请求。
+   */
+  private async callControlled(providers: ProviderInfo[], options: CallOptions): Promise<CallResult> {
+    const control = options.control!
+    const needVision = options.needVision ?? false
+    const chain = buildChain(providers, this.opts.apiKeyOf, { needVision })
+    let attempt: Attempt | undefined
+    const wanted = control.policy.providerId
+    if (wanted !== undefined) {
+      attempt = chain.find((a) => a.provider.id === wanted)
+      if (!attempt) {
+        // 指定 ID 不存在:发送数为 0 并拒绝
+        throw new ModelCallError(`指定的模型服务不存在:${wanted}`, [])
+      }
+    } else {
+      attempt = chain[0]
+    }
+    if (!attempt) {
+      throw new ModelCallError(
+        needVision
+          ? '没有可用的模型服务:请先在"设置 → 模型服务"中配置默认模型(需支持图片)。'
+          : '没有可用的模型服务:请先在"设置 → 模型服务"中配置默认模型。',
+        []
+      )
+    }
+
+    const info: ModelAttemptInfo = {
+      providerId: attempt.provider.id,
+      providerName: attempt.provider.name,
+      model: attempt.model,
+      requestId: control.requestId,
+      attemptId: randomUUID(),
+      ordinal: 1
+    }
+
+    // 准入:beforeSend 失败则不调用 fetch、不发 sent,错误原样传播(预算语义由上层解释)
+    control.beforeSend(info)
+    // beforeSend 后再检查 signal:避免准入期间取消仍发送
+    if (control.signal.aborted) {
+      throw new ModelRequestError('CANCELLED', '发送前已取消,未派发任何请求', [], false)
+    }
+
+    // 合并"用户取消"与"单次超时"两个信号;超时经真实 abort 终止网络
+    const controller = new AbortController()
+    let timedOut = false
+    const timer = AbortSignal.timeout(control.timeoutMs)
+    const onTimeout = (): void => {
+      timedOut = true
+      controller.abort(timer.reason)
+    }
+    timer.addEventListener('abort', onTimeout, { once: true })
+    const onExternalAbort = (): void => controller.abort(control.signal.reason)
+    if (control.signal.aborted) controller.abort(control.signal.reason)
+    else control.signal.addEventListener('abort', onExternalAbort, { once: true })
+
+    const records: ModelAttemptRecord[] = []
+    let callbackFailed: unknown = null
+    // 观测派发;回调持久化失败:abort 已派发请求、停止后续发送与观测
+    const emit = (event: ModelAttemptEvent): void => {
+      if (callbackFailed !== null) return
+      try {
+        control.onAttempt(event)
+      } catch (err) {
+        callbackFailed = err
+        controller.abort(new ModelRequestError('OBSERVATION_FAILED', '观测回调失败,已中止在途请求', records, false))
+      }
+    }
+    const startedAt = Date.now()
+    const latency = (): number => Math.max(0, Date.now() - startedAt)
+    const recordOf = (base: Omit<ModelAttemptRecord, keyof ModelAttemptInfo>): ModelAttemptRecord => ({ ...info, ...base })
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
+    const cleanup = (): void => {
+      // finally 清理定时器和监听器、取消中断中的 reader 并释放锁
+      timer.removeEventListener('abort', onTimeout)
+      control.signal.removeEventListener('abort', onExternalAbort)
+      if (reader !== null) void reader.cancel().catch(() => {})
+    }
+    const observationFailure = (): ModelRequestError => {
+      // 保留已经派发的记录;没有 settled 记录时补一条 cancelled 结算
+      if (records.length === 0) {
+        records.push(recordOf({ outcome: 'cancelled', latencyMs: latency(), httpStatus: null, responseModel: null, usage: nullTokenUsage() }))
+      }
+      const reason = callbackFailed instanceof Error ? callbackFailed.message : String(callbackFailed)
+      return new ModelRequestError('OBSERVATION_FAILED', `观测回调持久化失败,已停止后续发送:${reason}`, records, false)
+    }
+
+    const { provider } = attempt
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (attempt.apiKey) headers.Authorization = `Bearer ${attempt.apiKey}`
+    let body: unknown
+    let path: string
+    if (provider.protocol === 'responses') {
+      path = '/responses'
+      body = {
+        model: attempt.model,
+        stream: true,
+        input: options.messages.map((m) => ({ role: m.role, content: m.content }))
+      }
+    } else {
+      path = '/chat/completions'
+      body = {
+        model: attempt.model,
+        stream: true,
+        messages: options.messages,
+        // 声明支持 JSON 结构化输出的服务商启用 response_format;其余靠提示词约束
+        ...(provider.supportsJsonMode ? { response_format: { type: 'json_object' } } : {}),
+        // RES-01:按协议请求其支持的 usage 流选项
+        stream_options: { include_usage: true }
+      }
+    }
+
+    let fetchPromise: Promise<Response>
+    try {
+      fetchPromise = this.fetchImpl(joinUrl(provider.baseUrl, path), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal
+      })
+    } catch (err) {
+      // fetch 同步抛错也记录一次 sent,再结算 failed
+      emit({ type: 'sent', attempt: info })
+      const record = recordOf({ outcome: 'failed', latencyMs: latency(), httpStatus: null, responseModel: null, usage: nullTokenUsage() })
+      records.push(record)
+      emit({ type: 'settled', attempt: record })
+      if (callbackFailed !== null) {
+        cleanup()
+        throw observationFailure()
+      }
+      cleanup()
+      throw new ModelRequestError('TRANSPORT', err instanceof Error ? err.message : String(err), records, true)
+    }
+    // 实际调用 fetchImpl 后,在同一同步段立即发 sent
+    emit({ type: 'sent', attempt: info })
+
+    try {
+      const res = await fetchPromise
+      if (callbackFailed !== null) throw observationFailure()
+      if (!res.ok) {
+        const text = await res.text().catch(() => '')
+        const record = recordOf({ outcome: 'failed', latencyMs: latency(), httpStatus: res.status, responseModel: null, usage: nullTokenUsage() })
+        records.push(record)
+        emit({ type: 'settled', attempt: record })
+        if (callbackFailed !== null) throw observationFailure()
+        throw new ModelRequestError('TRANSPORT', describeHttpError(res.status, text), records, isRetryableStatus(res.status))
+      }
+      if (!res.body) {
+        const record = recordOf({ outcome: 'failed', latencyMs: latency(), httpStatus: res.status, responseModel: null, usage: nullTokenUsage() })
+        records.push(record)
+        emit({ type: 'settled', attempt: record })
+        if (callbackFailed !== null) throw observationFailure()
+        throw new ModelRequestError('TRANSPORT', '服务未返回流式响应体', records, true)
+      }
+
+      reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let full = ''
+      let sawDone = false
+      let responseModel: string | null = null
+      let usage: TokenUsage | null = null
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split(/\r?\n/)
+        buffer = lines.pop() ?? ''
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed.startsWith('data:')) continue
+          const data = trimmed.slice(5).trim()
+          if (data === '[DONE]') {
+            sawDone = true
+            continue
+          }
+          if (!data) continue
+          let json: Record<string, unknown>
+          try {
+            json = JSON.parse(data) as Record<string, unknown>
+          } catch {
+            continue
+          }
+          const delta = extractDelta(json, provider.protocol)
+          if (delta) {
+            full += delta
+            options.onDelta?.(delta)
+          }
+          // usage 与响应模型标识:流事件内逐块捕获,以最后出现的为准
+          const parsedUsage = extractUsage(json, provider.protocol)
+          if (parsedUsage) usage = parsedUsage
+          const parsedModel = extractResponseModel(json)
+          if (parsedModel) responseModel = parsedModel
+        }
+      }
+      if (!sawDone && full.length === 0) {
+        throw new Error('模型没有返回任何内容(连接提前中断)')
+      }
+
+      const settledUsage = usage ?? nullTokenUsage()
+      const record = recordOf({ outcome: 'succeeded', latencyMs: latency(), httpStatus: res.status, responseModel, usage: settledUsage })
+      records.push(record)
+      emit({ type: 'settled', attempt: record })
+      if (callbackFailed !== null) throw observationFailure()
+      const actualProvider: ActualProvider = { providerId: attempt.provider.id, providerName: attempt.provider.name, model: attempt.model }
+      return {
+        text: full,
+        used: actualProvider,
+        actualProvider,
+        actualAttempts: 1,
+        attempts: records,
+        usage: settledUsage
+      }
+    } catch (err) {
+      if (err instanceof ModelRequestError) {
+        cleanup()
+        throw err
+      }
+      if (callbackFailed !== null) {
+        cleanup()
+        throw observationFailure()
+      }
+      if (timedOut) {
+        const record = recordOf({ outcome: 'timeout', latencyMs: latency(), httpStatus: null, responseModel: null, usage: nullTokenUsage() })
+        records.push(record)
+        emit({ type: 'settled', attempt: record })
+        cleanup()
+        throw new ModelRequestError('TIMEOUT', `单次请求超时(${control.timeoutMs}ms)`, records, true)
+      }
+      if (control.signal.aborted) {
+        const record = recordOf({ outcome: 'cancelled', latencyMs: latency(), httpStatus: null, responseModel: null, usage: nullTokenUsage() })
+        records.push(record)
+        emit({ type: 'settled', attempt: record })
+        cleanup()
+        throw new ModelRequestError('CANCELLED', '请求已取消', records, false)
+      }
+      const record = recordOf({ outcome: 'failed', latencyMs: latency(), httpStatus: null, responseModel: null, usage: nullTokenUsage() })
+      records.push(record)
+      emit({ type: 'settled', attempt: record })
+      cleanup()
+      throw new ModelRequestError('TRANSPORT', err instanceof Error ? err.message : String(err), records, true)
+    }
   }
 
   private async callAttempt(attempt: Attempt, options: CallOptions, timeoutMs: number): Promise<string> {
@@ -310,4 +585,41 @@ function extractDelta(json: Record<string, unknown>, protocol: string): string {
       .join('')
   }
   return ''
+}
+
+/**
+ * RES-01:从流事件提取供应商上报的 usage。
+ * Responses 协议取 response.completed.response.usage(input_tokens 等);
+ * Chat Completions 协议取 usage 流事件(prompt_tokens 等)。
+ * 未返回的字段记 null,不估算、不填零。
+ */
+function extractUsage(json: Record<string, unknown>, protocol: string): TokenUsage | null {
+  const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+  if (protocol === 'responses') {
+    if (json.type !== 'response.completed') return null
+    const response = json.response as Record<string, unknown> | undefined
+    const u = response?.usage
+    if (typeof u !== 'object' || u === null) return null
+    const usage = u as Record<string, unknown>
+    const input = num(usage.input_tokens)
+    const output = num(usage.output_tokens)
+    const total = num(usage.total_tokens) ?? (input !== null && output !== null ? input + output : null)
+    return { inputTokens: input, outputTokens: output, totalTokens: total, source: 'provider-reported' }
+  }
+  const u = json.usage
+  if (typeof u !== 'object' || u === null) return null
+  const usage = u as Record<string, unknown>
+  const input = num(usage.prompt_tokens)
+  const output = num(usage.completion_tokens)
+  const total = num(usage.total_tokens) ?? (input !== null && output !== null ? input + output : null)
+  return { inputTokens: input, outputTokens: output, totalTokens: total, source: 'provider-reported' }
+}
+
+/** RES-01:响应中可取得的模型标识(responseModel);取不到为 null,不冒充冻结配置 */
+function extractResponseModel(json: Record<string, unknown>): string | null {
+  if (json.type === 'response.completed') {
+    const response = json.response as Record<string, unknown> | undefined
+    return typeof response?.model === 'string' ? response.model : null
+  }
+  return typeof json.model === 'string' ? json.model : null
 }

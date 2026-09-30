@@ -11,12 +11,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { openDatabase, type SqliteDb } from '../../src/main/db/connection'
-import { initSchema } from '../../src/main/db/dao'
+import { initSchema, saveProvider } from '../../src/main/db/dao'
 import { initWorkspaceEpoch, OperationError } from '../../src/main/db/operations'
 import { fixedClock, systemClock, type Clock } from '../../src/shared/clock'
 import { RunQueue } from '../../src/main/agent/runQueue'
 import type { AgentRunView, TraceEvent } from '../../src/shared/agent'
 import { FakeProvider } from '../../src/main/providers/fake'
+import { ModelCompleter } from '../../src/main/agent/completer'
+import { ModelRouter } from '../../src/main/services/modelRouter'
 import type { StructuredCompleteRequest } from '../../src/main/agent/llm'
 import { recoverInterruptedRuns } from '../../src/main/agent/recovery'
 import {
@@ -25,7 +27,7 @@ import {
   parseResearchPlanOutput
 } from '../../src/main/research/workflow'
 import { createLedger, deserializeLedger, restoreLedger } from '../../src/main/research/budget'
-import { getResearchTaskByRun, listSubQuestions, loadResearchCheckpoint } from '../../src/main/research/repository'
+import { getResearchTaskByRun, listSubQuestions, loadResearchCheckpoint, loadAllOfRequirements, listClaims } from '../../src/main/research/repository'
 import { importResearchSources, type ImportedResearchSource } from '../../src/main/research/snapshots'
 import { getRun, listTraceEvents, transitionRun } from '../../src/main/runs/repository'
 import { saveResearchCheckpoint } from '../../src/main/research/repository'
@@ -184,7 +186,7 @@ function clarifySetIdOf(h: Harness, runId: string): string {
   return (researchEvents(h, runId, 'research.clarification_required')[0] as { question_set_id: string }).question_set_id
 }
 
-function checkpointLedger(h: Harness, runId: string): ReturnType<typeof deserializeLedger> {
+function checkpointLedger(h: { db: SqliteDb }, runId: string): ReturnType<typeof deserializeLedger> {
   const task = getResearchTaskByRun(h.db, runId)!
   const ckpt = loadResearchCheckpoint(h.db, task.researchTaskId) as { ledger?: unknown } | null
   expect(ckpt?.ledger).toBeDefined()
@@ -882,5 +884,306 @@ describe('边界', () => {
     const workflow = new ResearchWorkflow({ db, queue: new RunQueue(db), clock: systemClock })
     // requestCancel 走 assertResearchRun 守卫(MODE_MISMATCH / 运行不存在均拒绝)
     expect(() => workflow.requestCancel(run.runId)).toThrow(OperationError)
+  })
+})
+
+// ---------- RES-01:真实发送链(注入 fetchImpl 的 ModelCompleter + ModelRouter) ----------
+
+describe('RES-01 真实发送链:预算、单发送观测、动态时限与取消贯穿', () => {
+  interface RealHarness {
+    db: SqliteDb
+    clock: ReturnType<typeof makeManualClock>
+    workflow: ResearchWorkflow
+    fetchMock: ReturnType<typeof vi.fn>
+    snapshots: ImportedResearchSource[]
+    signals: Array<AbortSignal | null | undefined>
+  }
+
+  /** 单块 SSE:content 为 JSON 文本,附 usage 流事件与 [DONE] */
+  function sseOf(jsonText: string): Response {
+    const usageChunk = JSON.stringify({ choices: [], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } })
+    const contentChunk = JSON.stringify({ choices: [{ delta: { content: jsonText } }] })
+    return new Response('data: ' + contentChunk + '\n\ndata: ' + usageChunk + '\n\ndata: [DONE]\n\n', { status: 200 })
+  }
+
+  async function makeRealHarness(
+    respond: (system: string, userPrompt: string, init: RequestInit) => Response | Promise<Response>
+  ): Promise<RealHarness> {
+    const dir = mkdtempSync(join(tmpdir(), 'research-workflow-real-'))
+    const { db } = await openDatabase(join(dir, 'test.sqlite'), SQL_JS_DIST)
+    initSchema(db)
+    initWorkspaceEpoch()
+    const outcomes = importResearchSources(db, {
+      sources: [{ sourceName: 'jd-a.md', sourceType: 'markdown', bytes: Buffer.from(SAMPLE_JD, 'utf-8'), sample: true }],
+      clock: FIXED_CLOCK
+    })
+    const first = outcomes[0]!
+    expect(first.ok, JSON.stringify(first.ok ? '' : first.error)).toBe(true)
+    const snapshots = [first as ImportedResearchSource]
+    saveProvider(db, {
+      id: 'p1',
+      name: '主供应商',
+      baseUrl: 'https://research.example.invalid/v1',
+      protocol: 'chat-completions',
+      models: ['m1'],
+      defaultModel: 'm1',
+      supportsVision: false,
+      isDefault: true,
+      apiKeyEnc: 'plain:sk-test'
+    })
+    const signals: Array<AbortSignal | null | undefined> = []
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      signals.push(init?.signal)
+      const parsed = JSON.parse(String(init?.body ?? '{}')) as { messages: Array<{ role: string; content: string }> }
+      return respond(parsed.messages[0]!.content, parsed.messages[1]!.content, init ?? {})
+    })
+    const router = new ModelRouter({ apiKeyOf: () => 'sk-test', fetchImpl: fetchMock as unknown as typeof fetch })
+    const completer = new ModelCompleter({ db, router })
+    const clock = makeManualClock()
+    const workflow = new ResearchWorkflow({ db, queue: new RunQueue(db), completer, clock, events: { emit: () => {} } })
+    return { db, clock, workflow, fetchMock, snapshots, signals }
+  }
+
+  async function createAndDriveReal(h: RealHarness, requestOverrides: Record<string, unknown> = {}): Promise<string> {
+    const budget = (requestOverrides.budget as Record<string, unknown> | undefined) ?? {}
+    const rest = { ...requestOverrides }
+    delete rest.budget
+    const { value } = h.workflow.createRun(
+      {
+        request: {
+          question: '该岗位要求什么编程语言?',
+          snapshot_ids: h.snapshots.map((s) => s.documentId),
+          snapshot_policy: 'fixed',
+          budget,
+          ...rest
+        }
+      },
+      'op-real-' + Math.random().toString(36).slice(2)
+    )
+    await h.workflow.driveResearch(value.run.runId)
+    return value.run.runId
+  }
+
+  /** 标准四阶段成功响应(规划/抽取/审核/组织) */
+  function standardResponder(): (system: string, userPrompt: string) => Response {
+    return (system, userPrompt) => {
+      if (system.includes('研究规划器')) return sseOf(JSON.stringify(planOf([{ question: '该岗位要求什么编程语言?' }])))
+      if (system.includes('证据抽取器')) {
+        const m = /snapshot_id=([0-9a-f-]+) chunk_id=([0-9a-f-]+)/.exec(userPrompt)!
+        return sseOf(JSON.stringify(extractionWithIds(m[1]!, m[2]!)))
+      }
+      if (system.includes('证据审核员')) return sseOf(JSON.stringify(supportedVerdictsFrom(userPrompt)))
+      return sseOf(JSON.stringify({ sections: ['core_findings'], claim_order: [] }))
+    }
+  }
+
+  function payloadEvents(h: RealHarness, runId: string, name: string): Array<Record<string, unknown>> {
+    return listTraceEvents(h.db, runId)
+      .map((e) => e.payload)
+      .filter((p) => p.event === name)
+  }
+
+  async function waitFor(cond: () => boolean): Promise<void> {
+    for (let i = 0; i < 300; i += 1) {
+      if (cond()) return
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    throw new Error('waitFor 超时')
+  }
+
+  it('预算 6 时规划/抽取/审核/组织实际发送总数 ≤6,fetch 次数等于 sent 唯一 ID 数', async () => {
+    const h = await makeRealHarness((system, userPrompt) => standardResponder()(system, userPrompt))
+    const runId = await createAndDriveReal(h, { budget: { max_model_calls: 6 } })
+    expect(getRun(h.db, runId)?.status).toBe('succeeded')
+    expect(h.fetchMock).toHaveBeenCalledTimes(4)
+    const sent = payloadEvents(h, runId, 'research.model_sent')
+    expect(sent).toHaveLength(4)
+    const sentIds = sent.map((p) => p.attempt_id as string)
+    expect(new Set(sentIds).size).toBe(4)
+    // 账本 checkpoint v2:发送身份与槽位预留分开记录,且与实际发送一致
+    const ledger = checkpointLedger(h, runId)
+    expect([...ledger.sentAttemptIds].sort()).toEqual([...sentIds].sort())
+    const totalConsumed =
+      ledger.slots.planning.used + ledger.slots.planning.retries +
+      ledger.slots.extraction.used + ledger.slots.extraction.retries +
+      ledger.slots.review.used + ledger.slots.review.retries +
+      ledger.slots.synthesis.used + ledger.slots.synthesis.retries
+    expect(totalConsumed).toBe(4) // 预算 6:实际发送 4,剩余 2
+    // 逐尝试结算:usage 已知值(供应商上报),responseModel 为 null(响应未带模型标识)
+    const settled = payloadEvents(h, runId, 'research.model_attempt')
+    expect(settled).toHaveLength(4)
+    for (const p of settled) {
+      expect(p.outcome).toBe('succeeded')
+      expect((p.usage as { totalTokens: number | null }).totalTokens).toBe(15)
+      expect(p.response_model).toBeNull()
+    }
+  })
+
+  it('429 后唯一上层重试使发送恰为 2 次(抽取),重试身份落在子问题', async () => {
+    let extractionAttempts = 0
+    const h = await makeRealHarness((system, userPrompt) => {
+      if (system.includes('证据抽取器')) {
+        extractionAttempts += 1
+        if (extractionAttempts === 1) return new Response('限流', { status: 429 })
+        const m = /snapshot_id=([0-9a-f-]+) chunk_id=([0-9a-f-]+)/.exec(userPrompt)!
+        return sseOf(JSON.stringify(extractionWithIds(m[1]!, m[2]!)))
+      }
+      return standardResponder()(system, userPrompt)
+    })
+    const runId = await createAndDriveReal(h)
+    expect(getRun(h.db, runId)?.status).toBe('succeeded')
+    expect(h.fetchMock).toHaveBeenCalledTimes(5) // 规划1 + 抽取2(含重试) + 审核1 + 组织1
+    const ledger = checkpointLedger(h, runId)
+    expect(ledger.slots.extraction).toEqual({ used: 1, retries: 1 })
+    expect(ledger.extractionRetryKeys).toHaveLength(1)
+    expect(payloadEvents(h, runId, 'research.model_sent')).toHaveLength(5)
+  })
+
+  it('剩余时间 10ms 时 fetch.signal 真正 abort(不用 Promise.race 留后台请求)', async () => {
+    let h!: RealHarness
+    h = await makeRealHarness((system, _user, init) => {
+      if (system.includes('研究规划器')) {
+        // 规划完成时把活动时间推进到只剩 10ms:抽取阶段的动态时限 = min(30000, 剩余)
+        h.clock.advance(9990)
+        return sseOf(JSON.stringify(planOf([{ question: '该岗位要求什么编程语言?' }])))
+      }
+      // 永不主动完成:只在真实 abort 到达时拒绝,验证超时经 AbortSignal 贯穿
+      return new Promise<Response>((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+      })
+    })
+    const runId = await createAndDriveReal(h, { budget: { max_model_calls: 6, max_active_seconds: 10 } })
+    const run = getRun(h.db, runId)
+    expect(run?.status).toBe('failed')
+    expect(run?.errorCode).toBe('MODEL_OUTPUT_INVALID') // 受控重试后仍超时:运行失败
+    // 发送 3 次:规划 1 + 抽取首试 1 + 抽取重试 1(冻结单调钟不把真实等待计入
+    // 活动时间,重试按账本口径仍在时限内,各获 10ms 动态时限)
+    expect(h.fetchMock).toHaveBeenCalledTimes(3)
+    // 抽取两次派发的真实 signal 都被 10ms 定时器真正 abort(非 Promise.race)
+    expect(h.signals[1]?.aborted).toBe(true)
+    expect(h.signals[2]?.aborted).toBe(true)
+    // 超时以 timeout 结算落观测
+    const settled = payloadEvents(h, runId, 'research.model_attempt')
+    expect(settled.map((p) => p.outcome)).toEqual(['succeeded', 'timeout', 'timeout'])
+  })
+
+  it('SSE 读流中取消:无第三次请求,终态 cancelled,晚响应不落证据', async () => {
+    const h = await makeRealHarness((system, userPrompt, init) => {
+      if (system.includes('证据抽取器')) {
+        // 挂起的流:取消(signal abort)后报错,模拟真实读流中断
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            const partial = JSON.stringify({ choices: [{ delta: { content: '{"evidence' } }] })
+            controller.enqueue(new TextEncoder().encode('data: ' + partial + '\n\n'))
+            init.signal?.addEventListener('abort', () => controller.error(new Error('aborted')), { once: true })
+          }
+        })
+        return new Response(stream, { status: 200 })
+      }
+      return standardResponder()(system, userPrompt)
+    })
+    const { value } = h.workflow.createRun(
+      {
+        request: {
+          question: '该岗位要求什么编程语言?',
+          snapshot_ids: h.snapshots.map((s) => s.documentId),
+          snapshot_policy: 'fixed',
+          budget: {}
+        }
+      },
+      'op-real-cancel'
+    )
+    const driven = h.workflow.driveResearch(value.run.runId)
+    await waitFor(() => h.fetchMock.mock.calls.length >= 2)
+    h.workflow.requestCancel(value.run.runId)
+    await driven
+    const run = getRun(h.db, value.run.runId)
+    expect(run?.status).toBe('cancelled')
+    expect(h.fetchMock).toHaveBeenCalledTimes(2) // 规划1 + 抽取1(取消后无第三次请求)
+    expect(h.signals[1]?.aborted).toBe(true)
+  })
+})
+
+// ---------- RES-03:all_of 联合证据完整性(真实抽取落库回归) ----------
+
+describe('RES-03 all_of 缺员回归', () => {
+  it('一有效一拒绝:预期两成员全部落库(含拒绝原因),缺员整组不成立且审核不升级', async () => {
+    const h = await makeHarness((ids) => (_callIndex, request) => {
+      if (request.system.includes('研究规划器')) return planOf([{ question: '该岗位要求什么编程语言?' }])
+      if (request.system.includes('证据抽取器')) {
+        return {
+          evidence: [
+            { snapshot_id: ids.snapshotId, chunk_id: ids.chunkId, quote: QUOTE_PYTHON },
+            { snapshot_id: ids.snapshotId, chunk_id: ids.chunkId, quote: '不存在的引用内容。' }
+          ],
+          claims: [
+            {
+              text: '该岗位同时要求 Python 与不存在的 X。',
+              claim_type: 'fact',
+              subject: { entity: '数据工程师', attribute: '要求' },
+              supports: [0, 1],
+              all_of: true
+            }
+          ]
+        }
+      }
+      if (request.system.includes('证据审核员')) return supportedVerdictsFrom(request.prompt)
+      return { sections: ['core_findings'], claim_order: [] }
+    })
+    const runId = await createAndDrive(h)
+    // 报告仍生成(缺员命题不进入事实区),运行成功
+    expect(getRun(h.db, runId)?.status).toBe('succeeded')
+
+    const task = getResearchTaskByRun(h.db, runId)!
+    const claim = listClaims(h.db, task.researchTaskId)[0]!
+    // 预期两成员全部持久化:一员有效、一员带拒绝原因(null ID)
+    const requirements = loadAllOfRequirements(h.db, claim.claimId)
+    expect(requirements).toHaveLength(1)
+    const requirement = requirements[0]!
+    expect(requirement.expectedIndices.sort()).toEqual([0, 1])
+    expect(requirement.members).toHaveLength(2)
+    expect(requirement.members[0]!.rejectionReason).toBeNull()
+    expect(requirement.members[0]!.citationId).not.toBeNull()
+    expect(requirement.members[1]!.evidenceId).toBeNull()
+    expect(requirement.members[1]!.citationId).toBeNull()
+    expect(requirement.members[1]!.rejectionReason).not.toBeNull()
+    // 缺员整组不成立:确定性落 unsupported,语义审核不能升级
+    expect(claim.supportStatus).toBe('unsupported')
+    // 报告事实区不含缺员命题
+    const report = h.db.get<{ structured_json: string; markdown: string }>(
+      'SELECT structured_json, markdown FROM research_reports WHERE research_task_id = ? ORDER BY version DESC LIMIT 1',
+      [task.researchTaskId]
+    )!
+    expect((JSON.parse(report.structured_json) as { claim_order: string[] }).claim_order).not.toContain(claim.claimId)
+    expect(report.markdown).not.toContain('该岗位同时要求 Python 与不存在的 X。')
+  })
+
+  it('all_of 支持引用空组/重复/越界属无效抽取输出,触发受控重试后仍失败则运行错误', async () => {
+    const h = await makeHarness((ids) => (_callIndex, request) => {
+      if (request.system.includes('研究规划器')) return planOf([{ question: '该岗位要求什么编程语言?' }])
+      if (request.system.includes('证据抽取器')) {
+        // supports 引用越界(evidence 只有 1 条,supports 引用下标 1)且 all_of
+        return {
+          evidence: [{ snapshot_id: ids.snapshotId, chunk_id: ids.chunkId, quote: QUOTE_PYTHON }],
+          claims: [
+            {
+              text: '越界引用的 all_of 命题。',
+              claim_type: 'fact',
+              subject: { entity: '数据工程师', attribute: '要求' },
+              supports: [0, 1],
+              all_of: true
+            }
+          ]
+        }
+      }
+      if (request.system.includes('证据审核员')) return supportedVerdictsFrom(request.prompt)
+      return { sections: ['core_findings'], claim_order: [] }
+    })
+    const runId = await createAndDrive(h)
+    // 首次输出无效 → 唯一一次受控重试 → 仍无效 → 运行错误 MODEL_OUTPUT_INVALID
+    const run = getRun(h.db, runId)
+    expect(run?.status).toBe('failed')
+    expect(run?.errorCode).toBe('MODEL_OUTPUT_INVALID')
+    expect(h.provider.callTotal).toBe(3) // 规划1 + 抽取首试1 + 受控重试1
   })
 })
