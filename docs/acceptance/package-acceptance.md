@@ -189,3 +189,11 @@
 3. **打包态数据集发现语义**：存在性与路径契约已验证，端到端加载待真人桌面验收补测。
 4. **Electron 真实环境性能**：本报告为 Node 基准（p95 余量 >50 倍），真实 IPC/runtime 指标由桌面验收补测。
 5. **gitDirty=true**：本包构建时含本任务未提交修改；主代理提交后按同链路重打即可获得 clean 构建（build-info 会如实反映）。
+
+## 追加：全部提交后的干净重打（2026-10-01）
+
+- 构建树：HEAD `82f44e3`（行尾归一与 PKG-01 链路提交后），`gitDirty: false`
+- 新包：`dist/事务助手-0.1.0-portable-x64.zip`，195,498,305 字节，SHA-256 `183e7e6c23d11fc8fbbe44b466a217d59ad96912dd398710735bc618230b80cb`
+- 同目录另生成 `ai-desk-companion-0.1.0-portable-x64.zip`（171,457,033 字节，electron-builder 英文命名的同内容产物，以中文文件名为准）
+- 打包验证：解压全新目录 → `事务助手.exe --healthcheck --user-data <全新目录>` → exit 0、迁移 v9、todo.list 返回 2 条种子、resources/evals/{datasets,fixtures,prompts} 与 build-info.json 在位
+- 干净克隆复验（crlf-verify-clone，autocrlf=false）：npm ci、typecheck、全量 vitest（MCP 进程级测试需先 build——文档已记）、build 全部通过；字节锚点 locate-006/010 LF、bom_crlf.txt 保留 CR
