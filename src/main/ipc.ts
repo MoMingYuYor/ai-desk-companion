@@ -80,7 +80,7 @@ import type { ReminderService } from './services/reminder'
 import type { PersistenceCoordinator } from './db/operations'
 import type { AgentEventStream } from './agent/eventStream'
 import type { RunOrchestrator, AnswerItem } from './agent/orchestrator'
-import { listEvalDatasets, startEvalBatch, getEvalRunState, getEvalReport, type EvalsDeps } from './evals/api'
+import { EvalsService, type EvalReviewInput, type EvalStartRequest } from './evals/api'
 import type { RunMode } from '../shared/agent'
 import { getRun, listTraceEvents, listRecentRuns, listApprovals } from './runs/repository'
 import {
@@ -133,8 +133,8 @@ export interface IpcDeps {
   agentEvents?: AgentEventStream
   /** Agent 运行编排器(A-05):缺省时 Agent 写侧通道不可用(兼容现有测试桩) */
   orchestrator?: RunOrchestrator
-  /** 评测(E-07):缺省时评测通道不可用 */
-  evals?: EvalsDeps
+  /** 评测(EVAL-05):EvalsService 路径化实例;缺省时评测通道不可用 */
+  evals?: EvalsService
   /**
    * 研究工作流(R-04,最小结构接口;实现在 research/workflow.ts)。
    * 缺省时研究运行仍创建落库,但启动驱动报明确错误——由主代理在 R-04 分支合并后注入。
@@ -218,6 +218,10 @@ const WRITE_CHANNELS: ReadonlySet<string> = new Set([
   Channels.AgentRunAnswers,
   Channels.AgentRunCancel,
   Channels.AgentApprovalDecide,
+  // 评测(EVAL-05):批次启动与人工审阅为修改型通道(恢复排他窗口内拒绝);
+  // 其余评测通道为只读
+  Channels.EvalStartBatch,
+  Channels.EvalReviewSave,
   // 研究(R-06):创建/导入为修改型通道;报告与快照读取为只读
   Channels.ResearchRunCreate,
   Channels.ResearchImportDocuments
@@ -430,23 +434,27 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     return deps.orchestrator.decide(approvalId, decision)
   })
 
-  // ---- evals(E-07) ----
-  handle(Channels.EvalListDatasets, () => {
-    if (!deps.evals) throw new OperationError(appError('MODEL_UNAVAILABLE', '评测未接线', { retryable: false }))
-    return listEvalDatasets(deps.evals.evalsRoot)
-  })
-  handle(Channels.EvalStartBatch, (params: { datasetVersion: string; splits: Array<'dev' | 'holdout'> }) => {
-    if (!deps.evals) throw new OperationError(appError('MODEL_UNAVAILABLE', '评测未接线', { retryable: false }))
-    return startEvalBatch(deps.evals, params)
-  })
-  handle(Channels.EvalGetRun, (evalRunId: string) => {
-    if (!deps.evals) throw new OperationError(appError('MODEL_UNAVAILABLE', '评测未接线', { retryable: false }))
-    return getEvalRunState(deps.evals.evalsRoot, evalRunId)
-  })
-  handle(Channels.EvalGetReport, (evalRunId: string) => {
-    if (!deps.evals) throw new OperationError(appError('MODEL_UNAVAILABLE', '评测未接线', { retryable: false }))
-    return getEvalReport(deps.evals.evalsRoot, evalRunId)
-  })
+  // ---- evals(E-07 + EVAL-05) ----
+  // 评测服务未接线时以明确错误拒绝,不做静默桩;权限由 authorizeIpc 统一收口
+  // (eval:* 通道仅 workbench 全能力,桌宠与面板按能力表拒绝)。
+  const evals = (): EvalsService => {
+    if (!deps.evals) {
+      throw new OperationError(appError('MODEL_UNAVAILABLE', '评测未接线', { retryable: false }))
+    }
+    return deps.evals
+  }
+  handle(Channels.EvalListDatasets, () => evals().listDatasets())
+  handle(Channels.EvalStartBatch, (params: EvalStartRequest) => evals().startBatch(params))
+  handle(Channels.EvalGetRun, (evalRunId: string) => evals().getRun(evalRunId))
+  handle(Channels.EvalGetReport, (evalRunId: string) => evals().getReport(evalRunId))
+  // EVAL-05:取消、case 产物查询、配置发现、人工审阅读写
+  handle(Channels.EvalCancelRun, (evalRunId: string) => evals().cancelRun(evalRunId))
+  handle(Channels.EvalListConfigs, () => evals().listConfigs())
+  handle(Channels.EvalCaseArtifacts, (evalRunId: string, configId: string, caseId: string, repeatIndex: number) =>
+    evals().getCaseArtifacts(evalRunId, configId, caseId, repeatIndex)
+  )
+  handle(Channels.EvalReviewSave, (input: EvalReviewInput) => evals().saveReview(input))
+  handle(Channels.EvalReviewList, (evalRunId: string) => evals().getReviewOverview(evalRunId))
 
   // ---- research(R-06):API 语义经 IPC(错误码代替 HTTP 状态码) ----
   // 创建:幂等键 operationId(走 R-01 createResearchRun 的幂等回执);

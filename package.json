@@ -60,6 +60,8 @@
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
     "test": "vitest run",
+    "eval:run": "node out/main/eval-cli.js run",
+    "eval:report": "node out/main/eval-cli.js report",
     "gen:assets": "node scripts/gen-assets.mjs",
     "dist": "electron-vite build && electron-builder --win"
   },

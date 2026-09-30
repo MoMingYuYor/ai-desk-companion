@@ -29,6 +29,8 @@ import { createAgentGateway } from './agent/runtime'
 import { ModelCompleter } from './agent/completer'
 import { startPersonalOpsMcpStdio } from './mcp/server'
 import { appendTraceEvent, createRun, transitionRun } from './runs/repository'
+import { resolveEvalPaths } from './evals/resources'
+import { EvalsService } from './evals/api'
 import { ToolRegistry } from './tools/registry'
 import { ToolGateway } from './tools/gateway'
 import { registerOpsTools } from './tools/definitions'
@@ -368,6 +370,23 @@ function bootstrap(): void {
       return
     }
 
+    // EVAL-05:评测服务路径化注入——数据集/fixtures 按 packaged/sourceRoot 定位,
+    // 产物/配置/审阅写入 userData/evals;real 凭据仅运行时解析,不落盘
+    const evalPaths = resolveEvalPaths({
+      packaged: app.isPackaged,
+      resourceRoot: process.resourcesPath,
+      sourceRoot: app.getAppPath(),
+      userData: app.getPath('userData')
+    })
+    const evals = new EvalsService({
+      paths: evalPaths,
+      sqlJsDistDir,
+      credentialOf: (providerId) => {
+        const enc = getProviderApiKey(db, providerId)
+        return enc ? decryptApiKey(enc) : (process.env.AI_DESK_EVAL_API_KEY ?? null)
+      }
+    })
+
     registerIpcHandlers({
       db,
       engine,
@@ -378,6 +397,7 @@ function bootstrap(): void {
       persistCoordinator,
       agentEvents,
       orchestrator,
+      evals,
       // IpcResearchWorkflow 适配:创建路径由 api.ts 自己落库,这里只出驱动方法
       researchWorkflow: {
         startDriver: (runId) => void researchWorkflow.driveResearch(runId),

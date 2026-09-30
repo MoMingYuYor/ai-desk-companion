@@ -189,6 +189,12 @@ const api: RendererApi = {
   startEvalBatch: invoke(Channels.EvalStartBatch),
   getEvalRun: invoke(Channels.EvalGetRun),
   getEvalReport: invoke(Channels.EvalGetReport),
+  // evals(EVAL-05):取消 / 配置发现 / case 产物查询 / 人工审阅读写
+  cancelEvalRun: invoke(Channels.EvalCancelRun),
+  listEvalConfigs: invoke(Channels.EvalListConfigs),
+  getEvalCaseArtifacts: invoke(Channels.EvalCaseArtifacts),
+  saveEvalReview: invoke(Channels.EvalReviewSave),
+  getEvalReviewOverview: invoke(Channels.EvalReviewList),
 
   // research(R-06):薄 invoke 包装;错误码与幂等语义在主进程 handler 实现
   createResearchRun: invoke(Channels.ResearchRunCreate),

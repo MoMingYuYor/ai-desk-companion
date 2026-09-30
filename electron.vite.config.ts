@@ -10,6 +10,15 @@ export default defineConfig({
         '@shared': resolve('src/shared'),
         '@main': resolve('src/main')
       }
+    },
+    build: {
+      rollupOptions: {
+        input: {
+          index: resolve('src/main/index.ts'),
+          // EVAL-05:评测 CLI 第二入口 → out/main/eval-cli.js(纯 Node 运行,无 Electron 依赖)
+          'eval-cli': resolve('src/main/eval-cli.ts')
+        }
+      }
     }
   },
   preload: {

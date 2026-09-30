@@ -159,6 +159,13 @@ export const Channels = {
   EvalStartBatch: 'eval:start-batch',
   EvalGetRun: 'eval:get-run',
   EvalGetReport: 'eval:get-report',
+  // EVAL-05:取消、case 产物查询、配置发现与人工审阅读写(仅 workbench 能力;
+  // 桌宠与面板按 ipcPolicy 能力表拒绝)
+  EvalCancelRun: 'eval:cancel-run',
+  EvalListConfigs: 'eval:list-configs',
+  EvalCaseArtifacts: 'eval:case-artifacts',
+  EvalReviewSave: 'eval:review-save',
+  EvalReviewList: 'eval:review-list',
 
   // 研究契约(R-06):API 语义经 IPC 通道实现(错误码代替 HTTP 状态码)。
   // 详情与事件订阅复用 Agent 通道(getAgentRun/getAgentRunEvents 已有);
@@ -276,6 +283,139 @@ export interface ImportPreview {
   payload: unknown
   /** 提取失败的原因;payload 为空时用于界面诊断 */
   error?: string | null
+}
+
+// ---------- 评测契约(E-07 + EVAL-05;渲染层可见形态) ----------
+
+/** 数据集概览 */
+export interface EvalDatasetView {
+  version: string
+  total: number
+  dev: number
+  holdout: number
+}
+
+/** 冻结配置概览(不含任何凭据;providerId 是唯一的凭据引用形态) */
+export interface EvalConfigView {
+  configId: string
+  executionKind: 'fake' | 'real'
+  pipelineVariant: string
+  model: string
+  providerId: string
+  rubricVersion: string
+}
+
+/**
+ * 批次启动请求:不含任何自动批准标志——批准脚本只来自数据集
+ * interaction_script,且仅由隔离 runner 读取。
+ */
+export interface EvalStartParams {
+  datasetVersion: string
+  split: 'dev' | 'holdout'
+  executionKind: 'fake' | 'real'
+  configIds: string[]
+  repeats: number
+  maxCases: number
+}
+
+/** 单案例结果行(渲染层可见形态) */
+export interface EvalCaseOutcomeView {
+  configId: string
+  caseId: string
+  repeatIndex: number
+  status: string
+  runId: string | null
+  terminalStatus: string | null
+  failureReasons: string[]
+  executedTools: string[]
+  /** 合并后的工具观测;缺省/空 = 未测(缺观测,不得显示为 0 绕过) */
+  toolObservations?: unknown[] | null
+  ruleChecks?: unknown[] | null
+  durationMs?: number | null
+  artifactStatus?: string | null
+  artifactDir?: string | null
+  /** research gold 判分(仅 research case;ops 为 null) */
+  researchScoring?: unknown
+  actualProvider?: unknown
+  modelAttempts?: unknown[] | null
+}
+
+/** 批次状态(状态文件投影视图) */
+export interface EvalRunStateView {
+  evalRunId: string
+  datasetVersion: string
+  casesSha256: string
+  splits: string[]
+  configIds: string[]
+  executionKind: string
+  repeats: number
+  maxCases: number
+  status: string
+  startedAt: string
+  finishedAt: string | null
+  stopReason?: string | null
+  results: EvalCaseOutcomeView[]
+  lastInterruption?: { detectedAt: string; combos: string[] } | null
+}
+
+/** case 产物查询结果(完整性校验失败 ok=false 并给出原因) */
+export interface EvalCaseArtifactsView {
+  ok: boolean
+  manifest: Record<string, unknown> | null
+  manifestError: string | null
+  mismatched: string[]
+  missing: string[]
+  run?: Record<string, unknown>
+  traceEvents?: Array<Record<string, unknown>>
+  observations?: Array<Record<string, unknown>>
+  ruleChecks?: Array<Record<string, unknown>>
+  evidence?: Record<string, unknown>
+  report?: Record<string, unknown>
+  snapshots?: Record<string, unknown>
+}
+
+/** 人工审阅提交(渲染层传六段引用;服务端重组并校验 subjectKey) */
+export interface EvalReviewInput {
+  evalRunId: string
+  configId: string
+  caseId: string
+  repeatIndex: number
+  claimId: string
+  /** 引用的证据 ID;无引用传空串 */
+  evidenceId: string
+  decision: 'supported' | 'contradicted' | 'insufficient' | 'unreviewed'
+  reason: string
+  reviewer: string
+  rubricVersion?: string
+}
+
+/** 审阅记录(渲染层可见形态) */
+export interface EvalReviewRecordView {
+  reviewId: string
+  subjectKey: string
+  decision: string
+  reason: string
+  reviewer: string
+  rubricVersion: string
+  reviewedAt: string
+}
+
+/** 审阅总览:unreviewed 显式可见;coverage 不足 100% 即 holdout 未完成 */
+export interface EvalReviewOverviewView {
+  evalRunId: string
+  subjects: Array<{
+    subjectKey: string
+    configId: string
+    caseId: string
+    repeatIndex: number
+    claimId: string
+    evidenceId: string
+    latest: EvalReviewRecordView | null
+  }>
+  coverage: { value: number | null; reviewed: number; expected: number }
+  supportPrecision: { value: number | null; reviewed: number; supported: number }
+  holdoutComplete: boolean
+  unreviewed: string[]
 }
 
 // ---------- 研究契约(R-06;§7 API 语义经 IPC 映射) ----------
@@ -418,11 +558,27 @@ export interface RendererApi {
   submitAgentAnswers(runId: string, answers: Array<{ questionId: string; answer: string }>): Promise<{ runId: string; status: string }>
   cancelAgentRun(runId: string): Promise<import('./agent').AgentRunView>
   decideAgentApproval(approvalId: string, decision: 'approved' | 'rejected'): Promise<{ already: boolean }>
-  // evals(E-07)
-  listEvalDatasets(): Promise<Array<{ version: string; total: number }>>
-  startEvalBatch(params: { datasetVersion: string; splits: Array<'dev' | 'holdout'> }): Promise<{ evalRunId: string; status: string }>
-  getEvalRun(evalRunId: string): Promise<Record<string, unknown> | null>
+  // evals(E-07 + EVAL-05:数据集/配置发现、启动与取消、状态/报告、
+  // case 产物查询与人工审阅读写)
+  listEvalDatasets(): Promise<EvalDatasetView[]>
+  startEvalBatch(params: EvalStartParams): Promise<{ evalRunId: string; status: string }>
+  getEvalRun(evalRunId: string): Promise<EvalRunStateView | null>
   getEvalReport(evalRunId: string): Promise<string | null>
+  /** 取消运行中批次:已终态或未知 run 返回 cancelled=false */
+  cancelEvalRun(evalRunId: string): Promise<{ cancelled: boolean }>
+  /** 配置发现:冻结配置清单(fake/real 标签来自 executionKind) */
+  listEvalConfigs(): Promise<EvalConfigView[]>
+  /** case 产物查询(完整性校验失败 ok=false,不抛异常) */
+  getEvalCaseArtifacts(
+    evalRunId: string,
+    configId: string,
+    caseId: string,
+    repeatIndex: number
+  ): Promise<EvalCaseArtifactsView | null>
+  /** 人工审阅提交:先持久写成功再返回 */
+  saveEvalReview(input: EvalReviewInput): Promise<EvalReviewRecordView>
+  /** 审阅总览:应审对象 + 未审清单 + coverage/holdoutComplete */
+  getEvalReviewOverview(evalRunId: string): Promise<EvalReviewOverviewView | null>
   // research(R-06):API 语义经 IPC;错误以研究错误码前缀(message `[CODE] …`)与公共 AppError 体系透传
   /** 创建研究运行:幂等键 operationId,同键同请求回放原运行(replayed=true) */
   createResearchRun(input: {

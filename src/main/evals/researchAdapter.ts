@@ -20,7 +20,7 @@
 // 不为 40 条全部编写脚本:全量 40 条真实模型执行属 E-08/M6 范围,本集成只证明通路。
 
 import { readdirSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { SqliteDb } from '../db/connection'
 import type { StructuredCompleteRequest } from '../agent/llm'
 import { importResearchSources, type ImportedResearchSource } from '../research/snapshots'
@@ -32,6 +32,25 @@ import type { EvalCase } from './types'
 
 /** 仓库内语料根目录(fixtures 与 snapshots 副本逐字节一致,读 fixtures 侧) */
 export const RESEARCH_FIXTURE_ROOT = join(process.cwd(), 'fixtures', 'research')
+
+/**
+ * EVAL-05:fixture 语料根目录的运行时注入点。RESEARCH_FIXTURE_ROOT 依赖
+ * process.cwd()(过渡形态);组合入口(EvalsService / eval-cli)在启动批次前
+ * 用 EvalResourcePaths.fixtureRoot 调 setResearchFixtureRoot 覆盖,打包与 CLI
+ * 场景不再依赖 cwd。seed 闭包在执行时读取 researchFixtureRoot(),因此
+ * 先注册后覆盖同样生效。单应用单资源根,不做按批次隔离。
+ */
+let fixtureRootOverride: string | null = null
+
+/** 注入 fixture 语料根(绝对路径;必须经 resources.resolveEvalPaths 构造) */
+export function setResearchFixtureRoot(root: string): void {
+  fixtureRootOverride = resolve(root)
+}
+
+/** 当前生效的 fixture 语料根(注入优先,缺省回退仓库 cwd 约定) */
+export function researchFixtureRoot(): string {
+  return fixtureRootOverride ?? RESEARCH_FIXTURE_ROOT
+}
 
 /** 一个研究 fixture 播种后的映射信息(逻辑 snapshot_id → 真实记录) */
 export interface ResearchSeedResult {
@@ -58,7 +77,8 @@ export interface ResearchSeedResult {
  * 不能静默产空库)。
  */
 export function seedResearchFixture(db: SqliteDb, fixtureId: string): ResearchSeedResult {
-  const dir = join(RESEARCH_FIXTURE_ROOT, fixtureId)
+  // EVAL-05:语料根由路径契约注入,不再依赖调用时 cwd
+  const dir = join(researchFixtureRoot(), fixtureId)
   const files = readdirSync(dir).sort()
   if (files.length === 0) {
     throw new Error(`研究 fixture 语料目录为空:${fixtureId}`)
