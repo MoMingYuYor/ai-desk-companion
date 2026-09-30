@@ -7,6 +7,11 @@
 //
 // 边界(模块规格第 16 节):空输入禁止提交;partial 不可伪装成完整成功;
 // 过期提案禁止批准;渲染层不保存模型 Key。
+//
+// OPS-04(F-03):澄清回答改为按 questionId 的受控字段,一次提交全部当前问题,
+// 每条上限 1000 码点(与服务端 acceptAnswers 同一规则);异步刷新统一用
+// runId+递增请求代号守卫——旧响应不覆盖新运行或较新 seq;seq 缺口先补齐再前进
+// lastSeq;等待人工状态触发一次合并刷新(run+approvals),input 事件触发补发。
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Channels, type AgentApprovalView, type AgentRunListItem, type AgentRunView, type AgentRunEventsResult } from '../../../shared/api'
@@ -14,6 +19,14 @@ import type { TraceEvent } from '../../../shared/agent'
 import { useSubscribe } from '../../shared/util'
 
 type RunStatus = AgentRunView['status']
+
+/** 每条澄清回答的码点上限;与服务端 acceptAnswers 使用一致规则(OPS-04) */
+const MAX_ANSWER_CODEPOINTS = 1000
+
+/** 按码点截断:emoji 等代理对按 1 个码点计(不用 UTF-16 长度) */
+function clampToCodepoints(value: string): string {
+  return [...value].slice(0, MAX_ANSWER_CODEPOINTS).join('')
+}
 
 const STATUS_LABEL: Record<RunStatus, string> = {
   queued: '排队中',
@@ -101,21 +114,33 @@ export function AgentPage({ refreshKey }: { refreshKey: number }): JSX.Element {
   const [history, setHistory] = useState<Array<{ runId: string; status: string; input: string; startedAt: string }>>([])
   const [error, setError] = useState<string | null>(null)
   const [decideBusy, setDecideBusy] = useState(false)
+  // OPS-04:受控澄清回答表单(questionId → 已输入文本)与提交防重
+  const [answerDrafts, setAnswerDrafts] = useState<Record<string, string>>({})
+  const [answerBusy, setAnswerBusy] = useState(false)
   // 只关注当前查看的运行;ref 用于事件回调内拿到最新 runId
   const runIdRef = useRef<string | null>(null)
   const lastSeqRef = useRef(0)
+  // OPS-04 刷新竞态守卫:openToken 为当前打开代(切换运行即失效旧响应),
+  // refreshSeq/backfillSeq 为递增请求代号(同代内仅最新请求的响应可应用)
+  const openTokenRef = useRef(0)
+  const refreshSeqRef = useRef(0)
+  const backfillSeqRef = useRef(0)
 
   const refreshRun = useCallback(
     async (id: string) => {
+      const openToken = openTokenRef.current
+      const req = ++refreshSeqRef.current
       try {
-        const [view, approvals] = await Promise.all([
+        const [view, approvalList] = await Promise.all([
           window.api.getAgentRun(id),
           window.api.getAgentRunApprovals(id)
         ])
-        if (runIdRef.current !== id) return
+        // 守卫:旧代、已切换运行或非最新请求的响应一律丢弃,不覆盖新状态
+        if (openTokenRef.current !== openToken || runIdRef.current !== id || refreshSeqRef.current !== req) return
         setRun(view)
-        setApprovals(approvals)
+        setApprovals(approvalList)
       } catch (err) {
+        if (openTokenRef.current !== openToken || runIdRef.current !== id) return
         setError(err instanceof Error ? err.message : String(err))
       }
     },
@@ -123,20 +148,34 @@ export function AgentPage({ refreshKey }: { refreshKey: number }): JSX.Element {
   )
 
   const backfillEvents = useCallback(async (id: string) => {
-    const result: AgentRunEventsResult = await window.api.getAgentRunEvents(id, lastSeqRef.current)
-    if (runIdRef.current !== id) return
-    if (result.events.length > 0) {
-      lastSeqRef.current = result.events[result.events.length - 1]!.seq
-      setEvents((prev) => mergeEvents(prev, result.events))
+    const openToken = openTokenRef.current
+    const req = ++backfillSeqRef.current
+    const after = lastSeqRef.current
+    try {
+      const result: AgentRunEventsResult = await window.api.getAgentRunEvents(id, after)
+      if (openTokenRef.current !== openToken || runIdRef.current !== id || backfillSeqRef.current !== req) return
+      if (result.events.length > 0) {
+        // lastSeq 只前进到实际拿到的最大 seq:缺口补齐前不跳过遗漏事件
+        const maxSeq = result.events[result.events.length - 1]!.seq
+        lastSeqRef.current = Math.max(lastSeqRef.current, maxSeq)
+        setEvents((prev) => mergeEvents(prev, result.events))
+      }
+    } catch (err) {
+      // 读取失败显示可识别错误并保留已有内容;下次有效事件重新触发补发
+      if (openTokenRef.current !== openToken || runIdRef.current !== id) return
+      setError(err instanceof Error ? err.message : String(err))
     }
   }, [])
 
   const openRun = useCallback(
     async (id: string) => {
+      openTokenRef.current += 1
       runIdRef.current = id
       lastSeqRef.current = 0
       setEvents([])
       setApprovals([])
+      // 运行切换重置回答表单:答案不泄漏到另一个 run
+      setAnswerDrafts({})
       setError(null)
       await Promise.all([refreshRun(id), backfillEvents(id)])
     },
@@ -165,11 +204,27 @@ export function AgentPage({ refreshKey }: { refreshKey: number }): JSX.Element {
   useSubscribe(Channels.EventAgentRunUpdated, (...args: unknown[]) => {
     const payload = args[0] as { run: AgentRunView; event: TraceEvent } | undefined
     if (!payload || payload.run.runId !== runIdRef.current) return
-    if (payload.event.seq > lastSeqRef.current) {
-      lastSeqRef.current = payload.event.seq
-      setEvents((prev) => mergeEvents(prev, [payload.event]))
-    }
     setRun(payload.run)
+    const event = payload.event
+    const last = lastSeqRef.current
+    // 重复/滞后 seq:不重复渲染、不重复触发刷新
+    if (event.seq <= last) return
+    setEvents((prev) => mergeEvents(prev, [event]))
+    if (event.seq === last + 1) {
+      lastSeqRef.current = event.seq
+    } else {
+      // seq 缺口:先补齐遗漏区间再前进 lastSeq(缺补前不跳过)
+      void backfillEvents(payload.run.runId)
+    }
+    if (event.eventType === 'input') void backfillEvents(payload.run.runId)
+    if (
+      event.eventType === 'confirmation' ||
+      payload.run.status === 'awaiting_confirmation' ||
+      payload.run.status === 'awaiting_input'
+    ) {
+      // 等待人工的状态:一次合并刷新,同时读取 run+approvals
+      void refreshRun(payload.run.runId)
+    }
   })
   useSubscribe(Channels.EventAgentRunFinished, (...args: unknown[]) => {
     const payload = args[0] as { run: AgentRunView } | undefined
@@ -217,35 +272,52 @@ export function AgentPage({ refreshKey }: { refreshKey: number }): JSX.Element {
     [run, refreshRun, backfillEvents, loadHistory]
   )
 
-  const answer = useCallback(
-    async (questionId: string, answer: string) => {
-      if (!run) return
-      try {
-        await window.api.submitAgentAnswers(run.runId, [{ questionId, answer }])
-        await refreshRun(run.runId)
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err))
-      }
-    },
-    [run, refreshRun]
-  )
-
   const pendingConfirmations = useMemo(
     () => approvals.filter((a) => a.decision === 'pending'),
     [approvals]
   )
   const questions = useMemo(() => {
     const inputEvents = events.filter((e) => e.eventType === 'input')
-    const last = inputEvents[inputEvents.length - 1]
-    const qs = (last?.payload as { questions?: Array<{ questionId: string; question: string }> } | undefined)?.questions
+    // 最近一批未回答的澄清问题:取最后一条带 questions 的 input 事件
+    // (答案事件本身也是 input 类型,但没有 questions 字段)
+    const lastQuestions = [...inputEvents]
+      .reverse()
+      .find((e) => {
+        const qs = (e.payload as { questions?: unknown }).questions
+        return Array.isArray(qs) && qs.length > 0
+      })
+    const qs =
+      (lastQuestions?.payload as { questions?: Array<{ questionId: string; question: string }> } | undefined)
+        ?.questions ?? []
     // 已回答过的澄清不再展示
     const answered = new Set(
       inputEvents.flatMap((e) => (e.payload as { answers?: Array<{ questionId: string }> }).answers ?? []).map(
         (a) => a.questionId
       )
     )
-    return (qs ?? []).filter((q) => !answered.has(q.questionId))
+    return qs.filter((q) => !answered.has(q.questionId))
   }, [events])
+  const allAnswered = questions.every((q) => (answerDrafts[q.questionId] ?? '').trim() !== '')
+
+  /** 提交澄清回答:按当前全部问题构造 answers,一次提交;成功清空,失败保留 */
+  const submitAnswers = useCallback(async () => {
+    if (!run || answerBusy) return
+    const items = questions.map((q) => ({ questionId: q.questionId, answer: answerDrafts[q.questionId] ?? '' }))
+    if (items.length === 0) return
+    if (items.some((item) => item.answer.trim() === '')) return
+    setAnswerBusy(true)
+    setError(null)
+    try {
+      await window.api.submitAgentAnswers(run.runId, items)
+      // 成功清空;运行已切换时不动新运行的表单
+      if (runIdRef.current === run.runId) setAnswerDrafts({})
+      await refreshRun(run.runId)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setAnswerBusy(false)
+    }
+  }, [run, answerBusy, questions, answerDrafts, refreshRun])
 
   return (
     <div className="page" style={{ flexDirection: 'column', gap: 12 }}>
@@ -290,15 +362,30 @@ export function AgentPage({ refreshKey }: { refreshKey: number }): JSX.Element {
             </span>
           </div>
 
-          {/* 澄清问题 */}
+          {/* 澄清问题:受控字段按 questionId 保存输入,一次提交全部当前问题(OPS-04) */}
           {run.status === 'awaiting_input' && questions.length > 0 && (
             <div style={{ marginTop: 10 }}>
               {questions.map((q) => (
                 <div key={q.questionId} style={{ marginBottom: 8 }}>
-                  <div>{q.question}</div>
-                  <button onClick={() => void answer(q.questionId, '好的,按建议执行')}>按建议继续</button>
+                  <label htmlFor={`agent-question-${q.questionId}`}>{q.question}</label>
+                  <textarea
+                    id={`agent-question-${q.questionId}`}
+                    data-testid="agent-question-input"
+                    value={answerDrafts[q.questionId] ?? ''}
+                    onChange={(e) =>
+                      setAnswerDrafts((prev) => ({ ...prev, [q.questionId]: clampToCodepoints(e.target.value) }))
+                    }
+                    style={{ width: '100%', minHeight: 40, resize: 'vertical' }}
+                  />
                 </div>
               ))}
+              <button
+                data-testid="agent-answers-submit"
+                disabled={answerBusy || !allAnswered}
+                onClick={() => void submitAnswers()}
+              >
+                {answerBusy ? '提交中…' : '提交回答'}
+              </button>
             </div>
           )}
 

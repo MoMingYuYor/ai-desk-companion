@@ -34,7 +34,8 @@ interface Harness {
 async function makeHarness(
   responsesOrScript:
     | readonly unknown[]
-    | ((callIndex: number, request: StructuredCompleteRequest) => unknown)
+    | ((callIndex: number, request: StructuredCompleteRequest) => unknown),
+  completerOverride?: import('../../src/main/agent/llm').StructuredCompleter
 ): Promise<Harness> {
   const db = await makeTestDb()
   initWorkspaceEpoch()
@@ -87,7 +88,7 @@ async function makeHarness(
     registry,
     gateway,
     queue,
-    completer: provider,
+    completer: completerOverride ?? provider,
     events
   })
   return { db, orchestrator, provider, events: sent, writeFailCalls: () => failCalls }
@@ -493,5 +494,187 @@ describe('取消与模型缺失', () => {
     const run = createRun(h.db, { mode: 'personal_ops' as RunMode, input: '任务', contextClock: NOW })
     await h.orchestrator.drivePlanning(run.runId)
     expect(getRun(h.db, run.runId)?.errorCode).toBe('MODEL_OUTPUT_INVALID')
+  })
+})
+
+// ---------- OPS-03 预算收口:冻结 budgetJson + RES-01 ModelRequestControl 准入 ----------
+
+interface FrozenBudgetJson {
+  budget: { maxModelCalls: number; maxActiveSeconds: number; maxRetrievalChunks: number; maxTotalTokens: number }
+  usage: { logicalModelCalls: number; sentModelAttempts: number; activeMs: number }
+}
+
+function budgetOf(h: Harness, runId: string): FrozenBudgetJson {
+  return JSON.parse(getRun(h.db, runId)!.budgetJson) as FrozenBudgetJson
+}
+
+/** 下调后的预算 JSON(测试专用;生产由 createQueuedRun 冻结 resolveAgentBudget) */
+function budgetJsonWith(over: Partial<FrozenBudgetJson['budget']>): string {
+  return JSON.stringify({
+    budget: { maxModelCalls: 6, maxActiveSeconds: 120, maxRetrievalChunks: 8, maxTotalTokens: 18000, ...over },
+    usage: { logicalModelCalls: 0, sentModelAttempts: 0, activeMs: 0 }
+  })
+}
+
+describe('OPS-03 预算收口', () => {
+  it('创建运行时冻结解析后的 AgentBudget 到 budgetJson,计数从零开始', async () => {
+    const h = await makeHarness([planOf([{ tool: 'todo.list', arguments: {} }])])
+    const run = h.orchestrator.createQueuedRun({ mode: 'personal_ops' as RunMode, input: '预算冻结' })
+    const frozen = budgetOf(h, run.runId)
+    expect(frozen.budget.maxModelCalls).toBe(6)
+    expect(frozen.budget.maxActiveSeconds).toBe(120)
+    expect(frozen.usage).toEqual({ logicalModelCalls: 0, sentModelAttempts: 0, activeMs: 0 })
+  })
+
+  it('6 次模型调用用尽后停止新规划:逻辑与发送计数均为 6,已完成读取保留', async () => {
+    // 每轮读取参数不同:不触发 PLAN_NO_PROGRESS 指纹去重,让预算成为唯一停止原因
+    const h = await makeHarness((callIndex) =>
+      planOf([{ tool: 'todo.list', arguments: { status: `round-${callIndex}` } }], { continue_after_read: true })
+    )
+    await seedTodos(h.db)
+    const run = createRun(h.db, { mode: 'personal_ops' as RunMode, input: '循环读取', contextClock: NOW })
+    await h.orchestrator.drivePlanning(run.runId)
+    const after = getRun(h.db, run.runId)
+    expect(after?.status).toBe('failed')
+    expect(after?.errorCode).toBe('PLAN_NO_PROGRESS')
+    // 逻辑计数与真实发送计数分列且一致(单发送策略);已完成的 6 轮读取保留
+    const frozen = budgetOf(h, run.runId)
+    expect(frozen.usage.logicalModelCalls).toBe(6)
+    expect(frozen.usage.sentModelAttempts).toBe(6)
+    const readEvents = listTraceEvents(h.db, run.runId).filter(
+      (e) => e.eventType === 'tool_call' && (e.payload as { phase?: string }).phase === 'tool'
+    )
+    expect(readEvents).toHaveLength(6)
+  })
+
+  it('下调 maxModelCalls 后预算守卫先于轮次上限停止新规划', async () => {
+    const h = await makeHarness((callIndex) =>
+      planOf([{ tool: 'todo.list', arguments: { status: `r-${callIndex}` } }], { continue_after_read: true })
+    )
+    await seedTodos(h.db)
+    const run = createRun(h.db, {
+      mode: 'personal_ops' as RunMode,
+      input: '低预算',
+      contextClock: NOW,
+      budgetJson: budgetJsonWith({ maxModelCalls: 2 })
+    })
+    await h.orchestrator.drivePlanning(run.runId)
+    const after = getRun(h.db, run.runId)
+    expect(after?.status).toBe('failed')
+    expect(after?.errorCode).toBe('PLAN_NO_PROGRESS')
+    expect(after?.errorCode !== null && listTraceEvents(h.db, run.runId).some((e) => e.eventType === 'error')).toBe(true)
+    expect(budgetOf(h, run.runId).usage.logicalModelCalls).toBe(2)
+  })
+
+  it("RES-01 单发送契约:control 携带 policy={maxAttempts:1,fallback:'disabled'} 与准入回调,不发生重试/备用切换", async () => {
+    const h = await makeHarness((callIndex) =>
+      planOf([{ tool: 'todo.list', arguments: { status: `c-${callIndex}` } }], { continue_after_read: true })
+    )
+    await seedTodos(h.db)
+    const run = createRun(h.db, { mode: 'personal_ops' as RunMode, input: '单发送', contextClock: NOW })
+    await h.orchestrator.drivePlanning(run.runId)
+    // FakeProvider 执行 beforeSend(准入)但不冒充网络发送:6 轮 = 6 次准入(单发送,无重试)
+    expect(h.provider.calls).toHaveLength(6)
+    for (const call of h.provider.calls) {
+      const control = call.request.control!
+      expect(control).toBeTruthy()
+      expect(control.policy).toEqual({ maxAttempts: 1, fallback: 'disabled' })
+      expect(control.signal).toBeInstanceOf(AbortSignal)
+      expect(control.timeoutMs).toBeLessThanOrEqual(30000)
+      expect(typeof control.beforeSend).toBe('function')
+      expect(typeof control.onAttempt).toBe('function')
+      expect(control.requestId).toContain(run.runId)
+    }
+    expect(budgetOf(h, run.runId).usage.sentModelAttempts).toBe(6)
+  })
+
+  it('坏 JSON 后逻辑计数与发送计数一致', async () => {
+    const h = await makeHarness(['这不是JSON'])
+    const run = createRun(h.db, { mode: 'personal_ops' as RunMode, input: '坏输出', contextClock: NOW })
+    await h.orchestrator.drivePlanning(run.runId)
+    expect(getRun(h.db, run.runId)?.errorCode).toBe('MODEL_OUTPUT_INVALID')
+    const frozen = budgetOf(h, run.runId)
+    expect(frozen.usage.logicalModelCalls).toBe(1)
+    expect(frozen.usage.sentModelAttempts).toBe(1)
+  })
+
+  it('旧运行 budgetJson={} 使用默认上限且不阻塞规划', async () => {
+    const h = await makeHarness([planOf([{ tool: 'todo.list', arguments: {} }])])
+    await seedTodos(h.db)
+    const run = createRun(h.db, { mode: 'personal_ops' as RunMode, input: '旧运行', contextClock: NOW })
+    expect(run.budgetJson).toBe('{}')
+    await h.orchestrator.drivePlanning(run.runId)
+    expect(getRun(h.db, run.runId)?.status).toBe('succeeded')
+  })
+
+  it('onAttempt 观测落 model 轨迹:sent/settled 各一条,settled 记 outcome/耗时/用量', async () => {
+    let attemptSeq = 0
+    const emitting: import('../../src/main/agent/llm').StructuredCompleter = {
+      completeJson: async <T>(request: StructuredCompleteRequest) => {
+        const control = request.control!
+        attemptSeq += 1
+        const info = {
+          providerId: 'p1',
+          providerName: 'P1',
+          model: 'm1',
+          requestId: control.requestId,
+          attemptId: `attempt-${attemptSeq}`,
+          ordinal: 1
+        }
+        control.beforeSend(info)
+        control.onAttempt({ type: 'sent', attempt: info })
+        const usage = { inputTokens: 10, outputTokens: 5, totalTokens: 15, source: 'test' }
+        control.onAttempt({
+          type: 'settled',
+          attempt: { ...info, outcome: 'succeeded' as const, latencyMs: 12, httpStatus: 200, responseModel: null, usage }
+        })
+        return {
+          data: planOf([{ tool: 'todo.list', arguments: {} }]) as T,
+          model: 'm1',
+          usage,
+          latencyMs: 12,
+          actualProvider: null,
+          actualAttempts: 1,
+          attempts: []
+        }
+      }
+    }
+    const h = await makeHarness([], emitting)
+    await seedTodos(h.db)
+    const run = createRun(h.db, { mode: 'personal_ops' as RunMode, input: '观测轨迹', contextClock: NOW })
+    await h.orchestrator.drivePlanning(run.runId)
+    expect(getRun(h.db, run.runId)?.status).toBe('succeeded')
+    const modelEvents = listTraceEvents(h.db, run.runId).filter((e) => e.eventType === 'model')
+    expect(modelEvents.map((e) => (e.payload as { event?: string }).event)).toEqual(['sent', 'settled'])
+    const settled = modelEvents[1]!
+    expect(settled.payload).toMatchObject({ attemptId: 'attempt-1', ordinal: 1, outcome: 'succeeded', latencyMs: 12 })
+    // 耗时至 trace durationMs(monotonicMs 语义由传输层保证);usage 写事件列,缺失为 null
+    expect(settled.durationMs).toBe(12)
+    expect(settled.tokenUsage).toEqual({ inputTokens: 10, outputTokens: 5, totalTokens: 15, source: 'test' })
+    expect(budgetOf(h, run.runId).usage).toMatchObject({ logicalModelCalls: 1, sentModelAttempts: 1 })
+  })
+
+  it('重启(重建 orchestrator 同库)预算不重置:澄清重入从已耗计数继续', async () => {    const h = await makeHarness((callIndex) =>
+      callIndex === 0
+        ? planOf([], { clarifications: [{ question_id: 'q-when', question: '哪天?' }] })
+        : planOf([{ tool: 'todo.list', arguments: {} }])
+    )
+    const run = createRun(h.db, { mode: 'personal_ops' as RunMode, input: '重启预算', contextClock: NOW })
+    await h.orchestrator.drivePlanning(run.runId)
+    expect(getRun(h.db, run.runId)?.status).toBe('awaiting_input')
+    expect(budgetOf(h, run.runId).usage).toMatchObject({ logicalModelCalls: 1, sentModelAttempts: 1 })
+
+    // "重启":同库新编排器实例,无任何内存预算状态
+    const revived = new RunOrchestrator({
+      db: h.db,
+      registry: (h.orchestrator as unknown as { deps: OrchestratorDeps }).deps.registry,
+      gateway: (h.orchestrator as unknown as { deps: OrchestratorDeps }).deps.gateway,
+      queue: (h.orchestrator as unknown as { deps: OrchestratorDeps }).deps.queue,
+      completer: h.provider
+    })
+    await revived.submitAnswers(run.runId, [{ questionId: 'q-when', answer: '9月30日' }])
+    expect(getRun(h.db, run.runId)?.status).toBe('succeeded')
+    // 若重置于 0,第二轮后应停在 1;持久化计数证明累计为 2
+    expect(budgetOf(h, run.runId).usage).toMatchObject({ logicalModelCalls: 2, sentModelAttempts: 2 })
   })
 })
