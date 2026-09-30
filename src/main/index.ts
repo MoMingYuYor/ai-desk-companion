@@ -1,6 +1,8 @@
 // 应用入口:数据库、引擎、提醒、窗口、托盘与单实例锁
 import { app, BrowserWindow, Notification, nativeTheme, dialog } from 'electron'
-import { join } from 'node:path'
+import { join, isAbsolute } from 'node:path'
+import { mkdirSync } from 'node:fs'
+import { createInterface } from 'node:readline'
 import { openDatabase } from './db/connection'
 import { getProviderApiKey, initSchema } from './db/dao'
 import { createPersistenceCoordinator, initWorkspaceEpoch } from './db/operations'
@@ -22,7 +24,11 @@ import {
 import { AgentEventStream } from './agent/eventStream'
 import { RunOrchestrator } from './agent/orchestrator'
 import { RunQueue } from './agent/runQueue'
+import { RunScheduler } from './agent/runScheduler'
+import { createAgentGateway } from './agent/runtime'
 import { ModelCompleter } from './agent/completer'
+import { startPersonalOpsMcpStdio } from './mcp/server'
+import { appendTraceEvent } from './runs/repository'
 import { ToolRegistry } from './tools/registry'
 import { ToolGateway } from './tools/gateway'
 import { registerOpsTools } from './tools/definitions'
@@ -48,9 +54,40 @@ const safeStorageAdapter: CredentialStorage = {
   decryptString: (value: Buffer) => safeStorage.decryptString(value)
 }
 
-// 单实例锁:避免重复启动造成多份托盘/桌宠
+// E2E-01/MCP-01:启动参数——--user-data <绝对目录>(隔离用户目录,测试与验收用)、
+// --mcp(以 stdio MCP 服务模式运行,不创建窗口)。必须在 app ready 前 setPath。
+const CLI_USER_DATA = (() => {
+  const argv = process.argv
+  const i = argv.indexOf('--user-data')
+  if (i === -1) return null
+  const dir = argv[i + 1]
+  if (!dir || !isAbsolute(dir)) {
+    console.error('[startup] --user-data 需要一个绝对路径参数,收到:', dir ?? '(缺失)')
+    app.quit()
+    return null
+  }
+  try {
+    mkdirSync(dir, { recursive: true })
+  } catch (err) {
+    console.error('[startup] --user-data 目录创建失败:', err instanceof Error ? err.message : String(err))
+    app.quit()
+    return null
+  }
+  return dir
+})()
+const CLI_MCP_MODE = process.argv.includes('--mcp')
+if (CLI_USER_DATA) {
+  app.setPath('userData', CLI_USER_DATA)
+  console.log(`[startup] 使用隔离用户目录:${CLI_USER_DATA}`)
+}
+
+// 单实例锁:避免重复启动造成多份托盘/桌宠;
+// MCP 模式与桌面实例争锁时给出可诊断冲突(E2E-01/MCP-01)。
 const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) {
+  if (CLI_MCP_MODE) {
+    console.error('[mcp] 无法获取单实例锁:同一 userData 已有运行中的应用;MCP 模式需独占用户目录')
+  }
   app.quit()
 } else {
   bootstrap()
@@ -186,40 +223,70 @@ function bootstrap(): void {
     const agentRegistry = new ToolRegistry()
     registerOpsTools(agentRegistry)
     const agentQueue = new RunQueue(db)
-    const agentGateway = new ToolGateway({ db, registry: agentRegistry, clock: systemClock })
+    // OPS-01:生产网关必须经工厂创建——关键写入经 persistCoordinator 落盘确认;
+    // OPS-03:工具观测单一出口落轨迹(与 makeHarness 同构),只落库不广播,
+    // UI 时间线刷新仍走 run-updated 状态事件
+    const agentGateway = createAgentGateway({
+      db,
+      registry: agentRegistry,
+      clock: systemClock,
+      persistCoordinator,
+      onObservation: (record) => {
+        appendTraceEvent(db, {
+          runId: record.runId,
+          eventType: 'tool_call',
+          payload: { ...record },
+          durationMs: record.durationMs
+        })
+      }
+    })
     seedDemoData(db)
     const interrupted = recoverInterruptedRuns(db)
     if (interrupted.length > 0) {
       console.warn(`[agent] 恢复:${interrupted.length} 个中断运行标记为失败`)
     }
+    const scheduler = new RunScheduler(db, agentQueue)
     const orchestrator = new RunOrchestrator({
       db,
       registry: agentRegistry,
       gateway: agentGateway,
       queue: agentQueue,
       events: agentEvents,
-      completer: new ModelCompleter({ db, router })
+      completer: new ModelCompleter({ db, router }),
+      scheduler
     })
 
-    // R-06:研究工作流与 Ops 编排器共享同一 RunQueue(单执行权);
-    // 两条链收尾后把执行权交还:研究→Ops 经 onNonResearchQueued,
-    // Ops→研究经 onNonOpsQueued(组合层互相转交,避免用对方规划路径误驱)。
+    // OPS-02:两套工作流共享同一 RunQueue 与 RunScheduler;
+    // 执行权接力(等待/失败/取消/批准/重启)统一由调度器唤醒,删除旧双向钩子。
     const researchWorkflow = new ResearchWorkflow({
       db,
       queue: agentQueue,
       completer: new ModelCompleter({ db, router }),
       events: agentEvents,
-      onNonResearchQueued: (runId) => {
-        void orchestrator.drivePlanning(runId).catch((err: unknown) => {
-          console.error('[research] Ops 接力驱动异常:', err instanceof Error ? err.message : String(err))
-        })
-      }
+      scheduler
     })
-    orchestrator.setOnNonOpsQueued((runId) => {
-      void researchWorkflow.driveResearch(runId).catch((err: unknown) => {
-        console.error('[agent] 研究接力驱动异常:', err instanceof Error ? err.message : String(err))
-      })
-    })
+    scheduler.register('personal_ops', orchestrator.asRunDriver())
+    scheduler.register('research', (runId) => researchWorkflow.driveResearch(runId))
+    // 重启后已批准未执行审批与排队运行由调度器统一再领取
+    scheduler.request()
+
+    // MCP-01:--mcp 模式以 stdio 提供同一网关/审批边界,不创建窗口与 GUI IPC
+    if (CLI_MCP_MODE) {
+      const stdinReader = createInterface({ input: process.stdin })
+      startPersonalOpsMcpStdio(
+        { db, registry: agentRegistry, gateway: agentGateway },
+        {
+          readLine: () => {
+            const it = stdinReader[Symbol.asyncIterator]()
+            return it.next().then((r) => (r.done ? null : (r.value as string)))
+          },
+          writeLine: (line) => {
+            process.stdout.write(`${line}\n`)
+          }
+        }
+      )
+      return
+    }
 
     registerIpcHandlers({
       db,
