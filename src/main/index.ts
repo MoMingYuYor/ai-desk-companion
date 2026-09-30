@@ -1,7 +1,7 @@
 // 应用入口:数据库、引擎、提醒、窗口、托盘与单实例锁
 import { app, BrowserWindow, Notification, nativeTheme, dialog } from 'electron'
 import { join, isAbsolute } from 'node:path'
-import { mkdirSync } from 'node:fs'
+import { mkdirSync, writeFileSync, createReadStream } from 'node:fs'
 import { createInterface } from 'node:readline'
 import { openDatabase } from './db/connection'
 import { getProviderApiKey, initSchema } from './db/dao'
@@ -28,7 +28,7 @@ import { RunScheduler } from './agent/runScheduler'
 import { createAgentGateway } from './agent/runtime'
 import { ModelCompleter } from './agent/completer'
 import { startPersonalOpsMcpStdio } from './mcp/server'
-import { appendTraceEvent } from './runs/repository'
+import { appendTraceEvent, createRun, transitionRun } from './runs/repository'
 import { ToolRegistry } from './tools/registry'
 import { ToolGateway } from './tools/gateway'
 import { registerOpsTools } from './tools/definitions'
@@ -76,9 +76,15 @@ const CLI_USER_DATA = (() => {
   return dir
 })()
 const CLI_MCP_MODE = process.argv.includes('--mcp')
+const CLI_HEALTHCHECK = process.argv.includes('--healthcheck')
+const HEALTHCHECK_OUTPUT = (() => {
+  const i = process.argv.indexOf('--healthcheck-output')
+  return i === -1 ? null : process.argv[i + 1] ?? null
+})()
 if (CLI_USER_DATA) {
   app.setPath('userData', CLI_USER_DATA)
-  console.log(`[startup] 使用隔离用户目录:${CLI_USER_DATA}`)
+  // MCP-01:协议模式下 stdout 是 JSON-RPC 通道,启动日志一律走 stderr
+  console.error(`[startup] 使用隔离用户目录:${CLI_USER_DATA}`)
 }
 
 // 单实例锁:避免重复启动造成多份托盘/桌宠;
@@ -270,21 +276,95 @@ function bootstrap(): void {
     // 重启后已批准未执行审批与排队运行由调度器统一再领取
     scheduler.request()
 
-    // MCP-01:--mcp 模式以 stdio 提供同一网关/审批边界,不创建窗口与 GUI IPC
+    // MCP-01:--mcp 模式以 stdio 提供同一网关/审批边界,不创建窗口与 GUI IPC。
+    // Windows/Electron 的 process.stdin 首读即合成 EOF(MCP-01 实测),改用 fd 0
+    // 的原始流接线;行缓冲队列避免迭代器泄漏与并发丢行。
     if (CLI_MCP_MODE) {
-      const stdinReader = createInterface({ input: process.stdin })
+      const pending: string[] = []
+      let waiter: ((line: string | null) => void) | null = null
+      let stdinClosed = false
+      const stdinReader = createInterface({ input: createReadStream('', { fd: 0 }) })
+      stdinReader.on('line', (line: string) => {
+        if (waiter) {
+          const w = waiter
+          waiter = null
+          w(line)
+        } else {
+          pending.push(line)
+        }
+      })
+      stdinReader.on('close', () => {
+        stdinClosed = true
+        if (waiter) {
+          const w = waiter
+          waiter = null
+          w(null)
+        }
+      })
       startPersonalOpsMcpStdio(
         { db, registry: agentRegistry, gateway: agentGateway },
         {
-          readLine: () => {
-            const it = stdinReader[Symbol.asyncIterator]()
-            return it.next().then((r) => (r.done ? null : (r.value as string)))
-          },
+          readLine: () =>
+            new Promise<string | null>((resolve) => {
+              const buffered = pending.shift()
+              if (buffered !== undefined) {
+                resolve(buffered)
+              } else if (stdinClosed) {
+                resolve(null)
+              } else {
+                waiter = resolve
+              }
+            }),
           writeLine: (line) => {
             process.stdout.write(`${line}\n`)
           }
         }
       )
+      return
+    }
+
+    // E2E-01:健康检查模式——不创建窗口,验证初始化、迁移到最新与一次
+    // 确定性只读工具调用,结果写 JSON 后退出(0 成功 / 1 失败)。
+    if (CLI_HEALTHCHECK) {
+      let ok = false
+      let toolDetail: unknown = null
+      try {
+        // 网关校验 run 必须存在:健康检查创建真实运行执行只读调用,收尾取消
+        const hcRun = createRun(db, {
+          mode: 'personal_ops',
+          input: 'healthcheck 只读自检',
+          contextClock: new Date().toISOString()
+        })
+        const todoResult = await agentGateway.execute({
+          runId: hcRun.runId,
+          tool: 'todo.list',
+          arguments: { status: 'open' },
+          planVersion: 1,
+          callIndex: 0
+        })
+        ok = todoResult.ok
+        toolDetail = todoResult.ok
+          ? { tool: 'todo.list', count: Array.isArray((todoResult.data as { todos?: unknown[] }).todos) ? (todoResult.data as { todos: unknown[] }).todos.length : null }
+          : todoResult.error
+        transitionRun(db, hcRun.runId, 'cancelled', { errorCode: 'CANCELLED' })
+      } catch (err) {
+        toolDetail = err instanceof Error ? err.message : String(err)
+      }
+      const migrations = db.all<{ version: number }>('SELECT MAX(version) AS version FROM schema_migrations')
+      const report = {
+        schemaVersion: 1,
+        ok,
+        userDataDir: app.getPath('userData'),
+        appliedMigrationVersion: migrations[0]?.version ?? null,
+        readOnlyTool: toolDetail,
+        checkedAt: new Date().toISOString()
+      }
+      if (HEALTHCHECK_OUTPUT) {
+        writeFileSync(HEALTHCHECK_OUTPUT, JSON.stringify(report, null, 2))
+      }
+      console.error('[healthcheck]', JSON.stringify(report))
+      db.flush()
+      app.exit(ok ? 0 : 1)
       return
     }
 

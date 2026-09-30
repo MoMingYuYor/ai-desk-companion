@@ -93,6 +93,20 @@ npm run dist       # 打包 Windows 便携 zip
 2. **邮箱(可选)**:工作台 → 邮箱 → 添加账号。QQ 邮箱与 163 使用客户端授权码,Gmail 使用应用专用密码。
 3. **课表与画像(可选)**:导入课表图片、维护个人作息与偏好,使分析结果与安排建议更贴合实际情况。
 
+## personal-ops-mcp 启动
+
+应用可作为 stdio MCP 服务启动,对 MCP 客户端暴露四个受控工具(读两个、写两个);
+与桌面端共用同一工具网关与审批边界——写操作只生成待批准提案,
+需在桌面端对同一用户目录批准后才执行。启动命令(开发版,先 `npm run build`):
+
+```bash
+node_modules/electron/dist/electron.exe . --mcp --user-data <独立绝对目录>
+```
+
+`--user-data` 必须是独立的绝对路径(与日常 `%APPDATA%` 数据隔离);
+同一目录不允许 MCP 与桌面实例同时占用。工具清单、审批入口、客户端配置样例
+与实测连接记录见 [docs/mcp-connection.md](docs/mcp-connection.md)。
+
 ## Roadmap
 
 - [x] 通知分析、候选确认与去重机制

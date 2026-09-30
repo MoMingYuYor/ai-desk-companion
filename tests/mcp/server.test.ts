@@ -22,26 +22,27 @@ async function makeMcp(): Promise<{ db: SqliteDb; deps: McpDeps }> {
   return { db, deps: { db, registry, gateway } }
 }
 
-function call(deps: McpDeps, method: string, params?: unknown, id: unknown = 1): unknown {
+// MCP-01:读工具改经网关异步执行,gateway.execute 为 Promise,handleMcpMessage 随之异步
+async function call(deps: McpDeps, method: string, params?: unknown, id: unknown = 1): Promise<unknown> {
   return handleMcpMessage(deps, { jsonrpc: '2.0', id, method, params })
 }
 
 describe('MCP 协议', () => {
   it('initialize 返回协议版本与服务器信息', async () => {
     const { deps } = await makeMcp()
-    const res = call(deps, 'initialize') as { result: { protocolVersion: string; serverInfo: typeof MCP_SERVER_INFO } }
+    const res = await call(deps, 'initialize') as { result: { protocolVersion: string; serverInfo: typeof MCP_SERVER_INFO } }
     expect(res.result.protocolVersion).toBe('2024-11-05')
     expect(res.result.serverInfo.name).toBe('personal-ops-mcp')
   })
 
   it('通知(no id)返回 null 不响应', async () => {
     const { deps } = await makeMcp()
-    expect(handleMcpMessage(deps, { jsonrpc: '2.0', method: 'notifications/initialized' })).toBeNull()
+    expect(await handleMcpMessage(deps, { jsonrpc: '2.0', method: 'notifications/initialized' })).toBeNull()
   })
 
   it('tools/list 只暴露四个受控工具', async () => {
     const { deps } = await makeMcp()
-    const res = call(deps, 'tools/list') as { result: { tools: Array<{ name: string }> } }
+    const res = await call(deps, 'tools/list') as { result: { tools: Array<{ name: string }> } }
     expect(res.result.tools.map((t) => t.name)).toEqual([
       'list_todos',
       'create_todo',
@@ -52,9 +53,11 @@ describe('MCP 协议', () => {
 
   it('未知方法返回 -32601;未知工具返回 -32602', async () => {
     const { deps } = await makeMcp()
-    const badMethod = call(deps, 'resources/list') as { error: { code: number } }
+    const badMethod = (await call(deps, 'resources/list')) as { error: { code: number } }
     expect(badMethod.error.code).toBe(-32601)
-    const badTool = call(deps, 'tools/call', { name: 'shell.exec', arguments: {} }) as { error: { code: number } }
+    const badTool = (await call(deps, 'tools/call', { name: 'shell.exec', arguments: {} })) as {
+      error: { code: number }
+    }
     expect(badTool.error.code).toBe(-32602)
   })
 })
@@ -65,7 +68,7 @@ describe('MCP 读工具', () => {
     deps.db.run(
       "INSERT INTO todos (id, title, priority, completed_at, source, revision, created_at, updated_at) VALUES ('t1', '写周报', 'normal', NULL, 'manual', 1, '2026-09-28T00:00', '2026-09-28T00:00')"
     )
-    const res = call(deps, 'tools/call', { name: 'list_todos', arguments: {} }) as {
+    const res = await call(deps, 'tools/call', { name: 'list_todos', arguments: {} }) as {
       result: { content: Array<{ text: string }>; isError: boolean }
     }
     expect(res.result.isError).toBe(false)
@@ -78,7 +81,7 @@ describe('MCP 读工具', () => {
     deps.db.run(
       "INSERT INTO events (id, title, start_at, end_at, all_day, status, revision, created_at, updated_at) VALUES ('e1', '周会', '2026-09-29T10:00', '2026-09-29T11:00', 0, 'active', 1, '2026-09-28T00:00', '2026-09-28T00:00')"
     )
-    const res = call(deps, 'tools/call', {
+    const res = await call(deps, 'tools/call', {
       name: 'list_calendar_events',
       arguments: { from: '2026-09-29', to: '2026-09-30' }
     }) as { result: { content: Array<{ text: string }> } }
@@ -88,7 +91,7 @@ describe('MCP 读工具', () => {
 
   it('参数不满足 schema 返回工具错误结果', async () => {
     const { deps } = await makeMcp()
-    const res = call(deps, 'tools/call', { name: 'list_todos', arguments: { limit: 5 } }) as {
+    const res = await call(deps, 'tools/call', { name: 'list_todos', arguments: { limit: 5 } }) as {
       result: { isError: boolean }
     }
     expect(res.result.isError).toBe(true)
@@ -98,7 +101,7 @@ describe('MCP 读工具', () => {
 describe('MCP 写工具:只产生提案(OPS-09 边界)', () => {
   it('create_todo 返回确认信息,业务写入零发生', async () => {
     const { deps } = await makeMcp()
-    const res = call(deps, 'tools/call', {
+    const res = await call(deps, 'tools/call', {
       name: 'create_todo',
       arguments: { title: '经 MCP 请求创建' }
     }) as { result: { content: Array<{ text: string }>; isError: boolean } }
@@ -118,7 +121,7 @@ describe('MCP 写工具:只产生提案(OPS-09 边界)', () => {
 
   it('arguments 带 approved=true:被拒绝(OPS-09)', async () => {
     const { deps } = await makeMcp()
-    const res = call(deps, 'tools/call', {
+    const res = await call(deps, 'tools/call', {
       name: 'create_todo',
       arguments: { title: '越权创建', approved: true }
     }) as { result: { content: Array<{ text: string }>; isError: boolean } }
@@ -129,7 +132,7 @@ describe('MCP 写工具:只产生提案(OPS-09 边界)', () => {
 
   it('create_calendar_event 同样只产生提案', async () => {
     const { deps } = await makeMcp()
-    const res = call(deps, 'tools/call', {
+    const res = await call(deps, 'tools/call', {
       name: 'create_calendar_event',
       arguments: { title: 'MCP 日程', startAt: '2026-09-30T09:00', endAt: '2026-09-30T10:00' }
     }) as { result: { isError: boolean } }
