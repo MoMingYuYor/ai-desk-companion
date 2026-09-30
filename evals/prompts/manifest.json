@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "configs": {
+    "ops-planning-baseline": {
+      "template": "ops-planning-baseline.txt",
+      "stageMarker": "你是个人事务助手的规划器"
+    },
+    "ops-planning-candidate": {
+      "template": "ops-planning-candidate.txt",
+      "stageMarker": "你是个人事务助手的规划器"
+    },
+    "research-extraction-baseline": {
+      "template": "research-extraction-baseline.txt",
+      "stageMarker": "你是证据抽取器"
+    },
+    "research-extraction-candidate": {
+      "template": "research-extraction-candidate.txt",
+      "stageMarker": "你是证据抽取器"
+    }
+  }
+}

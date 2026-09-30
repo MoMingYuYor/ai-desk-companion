@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest'
+import { createHash } from 'node:crypto'
+import { join } from 'node:path'
 import { calculateMetrics, latencyPercentiles } from '../../src/main/evals/metrics'
-import { checkComparable, registerFrozenConfig } from '../../src/main/evals/comparison'
+import {
+  checkComparable,
+  comparableVariables,
+  frozenVariableDiff,
+  type ComparisonCandidate
+} from '../../src/main/evals/comparison'
+import { frozenConfigSha256, type FrozenEvalConfig } from '../../src/main/evals/configStore'
+import { roundOneConfigs } from '../../src/main/evals/completerFactory'
 import { ReviewStore, reviewCompliance } from '../../src/main/evals/reviews'
 import { renderEvalReport } from '../../src/main/evals/report'
 import type { EvalCaseOutcome, EvalRunState } from '../../src/main/evals/runner'
@@ -228,20 +237,62 @@ describe('latencyPercentiles', () => {
   })
 })
 
-describe('可比性守卫(E-05)', () => {
-  it('不同 split 与 fake/real 混排:拒绝比较并给出理由', () => {
-    registerFrozenConfig({
-      config_id: 'cfg-a',
-      description: 'A',
-      execution_kind: 'fake',
-      freeze_note: 'code@123, prompt@abc'
-    })
-    const a = {
+describe('可比性守卫(E-05 + EVAL-04 冻结 hash)', () => {
+  const sha = (text: string): string => createHash('sha256').update(text).digest('hex')
+  const fixedInput = {
+    datasetSha256: sha('dataset'),
+    fixtureSha256: sha('fixture'),
+    budgetSha256: sha('budget'),
+    interactionScriptSha256: sha('interaction-script'),
+    codeCommit: 'c0ffee',
+    toolsVersion: '0.1.0-test',
+    rubricVersion: 'rubric-v1'
+  }
+  const pair = roundOneConfigs('ops-planning', fixedInput, join(process.cwd(), 'evals', 'prompts'))
+
+  function candidateOf(config: FrozenEvalConfig): ComparisonCandidate {
+    return {
+      configId: config.configId,
+      datasetVersion: 'personal_ops_v1',
+      casesSha256: 'hash1',
+      splits: ['dev'],
+      executionKind: config.executionKind,
+      frozen: config,
+      configSha256: frozenConfigSha256(config)
+    }
+  }
+
+  it('baseline/candidate 只差记录的流程变量:可比;允许变量清单显式记录', () => {
+    const verdict = checkComparable(candidateOf(pair.baseline), candidateOf(pair.candidate))
+    expect(verdict.comparable).toBe(true)
+    expect(verdict.reasons).toEqual([])
+    expect(comparableVariables).toEqual(['pipelineVariant', 'promptSha256'])
+  })
+
+  it('同模型/数据/工具/预算/审批脚本/rubric 被改动:拒绝(冻结字段接线)', () => {
+    const drifted = { ...pair.candidate, model: 'other-model', providerId: 'other-provider' }
+    const verdict = checkComparable(candidateOf(pair.baseline), candidateOf(drifted))
+    expect(verdict.comparable).toBe(false)
+    expect(verdict.reasons.some((r) => r.includes('model'))).toBe(true)
+    expect(verdict.reasons.some((r) => r.includes('providerId'))).toBe(true)
+    expect(verdict.reasons.some((r) => r.includes('只允许'))).toBe(true)
+  })
+
+  it('配置对象被篡改(configSha256 与内容不符):拒绝比较', () => {
+    const a = candidateOf(pair.baseline)
+    const b = candidateOf(pair.candidate)
+    b.frozen = { ...pair.candidate, datasetSha256: sha('forged') }
+    expect(checkComparable(a, b).comparable).toBe(false)
+    expect(checkComparable(a, b).reasons.some((r) => r.includes('内容不一致'))).toBe(true)
+  })
+
+  it('不同 split 与 fake/real 混排:拒绝比较并给出理由(原语义保留)', () => {
+    const a: ComparisonCandidate = {
       configId: 'cfg-a',
       datasetVersion: 'personal_ops_v1',
       casesSha256: 'hash1',
-      splits: ['dev' as const],
-      executionKind: 'fake' as const
+      splits: ['dev'],
+      executionKind: 'fake'
     }
     const b = { ...a, splits: ['dev', 'holdout'] as const, executionKind: 'real' as const, configId: 'cfg-b' }
     const verdict = checkComparable(a, b)
@@ -251,14 +302,23 @@ describe('可比性守卫(E-05)', () => {
   })
 
   it('同配置自身比较拒绝', () => {
-    const a = {
+    const a: ComparisonCandidate = {
       configId: 'same',
       datasetVersion: 'v1',
       casesSha256: 'h',
-      splits: ['dev' as const],
-      executionKind: 'fake' as const
+      splits: ['dev'],
+      executionKind: 'fake'
     }
     expect(checkComparable(a, a).comparable).toBe(false)
+  })
+
+  it('frozenVariableDiff 生成可比性差异表:仅流程变量不同且被允许', () => {
+    const diff = frozenVariableDiff(pair.baseline, pair.candidate)
+    const differing = diff.filter((d) => !d.equal)
+    expect(differing.map((d) => d.variable).sort()).toEqual(['pipelineVariant', 'promptSha256'])
+    expect(differing.every((d) => d.allowedToDiffer)).toBe(true)
+    // 其余冻结字段逐字段一致
+    expect(diff.filter((d) => d.equal).every((d) => d.a === d.b)).toBe(true)
   })
 })
 

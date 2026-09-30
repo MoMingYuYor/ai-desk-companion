@@ -3,7 +3,8 @@
 // 规则(LLM Eval Lab 规格第 5 节与总体规格第 9 节):
 // - 判定四态:supported / contradicted / insufficient / unreviewed;
 // - 未审不能视作通过;unreviewed 不计入支持精度分母(但展示复核覆盖率);
-// - 修改产生新记录,保留审阅历史(不可变追加);
+// - 修改产生新记录,保留审阅历史(不可变追加);持久化形态见 reviewStore.ts
+//   (追加式 JSONL,先持久写成功再返回;本文件保留内存语义供流程测试);
 // - 主观评分独立字段,不覆盖原始规则成绩。
 
 export type ReviewDecision = 'supported' | 'contradicted' | 'insufficient' | 'unreviewed'
@@ -19,11 +20,29 @@ export interface ReviewAnnotation {
   reviewedAt: string
 }
 
+/** 校验审阅输入:空理由(有效判定)、rubric 版本与审阅人必填;内存/持久存储共用 */
+export function assertAnnotationInput(annotation: Omit<ReviewAnnotation, 'reviewId'>): void {
+  if (annotation.decision !== 'unreviewed' && annotation.reason.trim() === '') {
+    throw new Error('人工复核必须给出理由')
+  }
+  if (annotation.rubricVersion.trim() === '' || annotation.reviewer.trim() === '') {
+    throw new Error('复核必须记录 rubric 版本与审阅人')
+  }
+  if (!['supported', 'contradicted', 'insufficient', 'unreviewed'].includes(annotation.decision)) {
+    throw new Error(`复核判定非法:${String(annotation.decision)}`)
+  }
+}
+
 export interface ReviewCompliance {
   /** 引用支持精度:人工判 supported 的对数 / 已人工复核的对数;零复核为 N/A */
   supportPrecision: { value: number | null; reviewed: number; supported: number }
   /** 复核覆盖率:已复核 / 应复核 */
   coverage: { value: number | null; reviewed: number; expected: number }
+}
+
+/** 只读审阅来源:内存 ReviewStore 与持久化 FileReviewStore 共同满足的最小面 */
+export interface ReviewSource {
+  all(): readonly ReviewAnnotation[]
 }
 
 /** 追加式审阅历史:同一对象的新审阅追加在后,旧记录保留 */
@@ -32,12 +51,7 @@ export class ReviewStore {
 
   /** 记录一次审阅;rubric 版本与审阅人必填 */
   annotate(annotation: Omit<ReviewAnnotation, 'reviewId'>): ReviewAnnotation {
-    if (annotation.decision !== 'unreviewed' && annotation.reason.trim() === '') {
-      throw new Error('人工复核必须给出理由')
-    }
-    if (annotation.rubricVersion.trim() === '' || annotation.reviewer.trim() === '') {
-      throw new Error('复核必须记录 rubric 版本与审阅人')
-    }
+    assertAnnotationInput(annotation)
     const record: ReviewAnnotation = {
       reviewId: `rv-${this.records.length + 1}`,
       ...annotation
@@ -67,7 +81,7 @@ export class ReviewStore {
  * - 复核覆盖率 = 已复核 / 应复核总数;零分母 N/A。
  */
 export function reviewCompliance(
-  store: ReviewStore,
+  store: ReviewSource,
   expectedSubjects: readonly string[]
 ): ReviewCompliance {
   const latest = new Map<string, ReviewAnnotation>()

