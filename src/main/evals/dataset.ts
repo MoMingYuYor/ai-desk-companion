@@ -85,7 +85,14 @@ export function loadDatasetFromText(jsonl: string, manifest: unknown): LoadedDat
     if (!declared) errors.push(`manifest 缺少类别声明:${category}`)
     else if (declared.total !== stat.total) {
       errors.push(`类别 ${category} 数量与 manifest 不一致:声明 ${declared.total},实际 ${stat.total}`)
+    } else if (declared.dev !== stat.dev || declared.holdout !== stat.holdout) {
+      // DATA-01:total 相同但 dev/holdout 拆分漂移同样拒绝,拆分在冻结后不可变
+      errors.push(`类别 ${category} dev/holdout 与 manifest 不一致:声明 ${declared.dev}/${declared.holdout},实际 ${stat.dev}/${stat.holdout}`)
     }
+  }
+  // DATA-01:manifest 声明了实际不存在的类别同样拒绝(防止冻结后残留幻影类别)
+  for (const category of Object.keys(manifestParsed.categories)) {
+    if (!categoryStats[category]) errors.push(`manifest 声明了实际不存在的类别:${category}`)
   }
   if (manifestParsed.total !== cases.length) {
     errors.push(`manifest.total(${manifestParsed.total})与实际案例数(${cases.length})不一致`)

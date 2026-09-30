@@ -5,15 +5,24 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createTodo } from '../../src/main/db/dao'
-import { initWorkspaceEpoch } from '../../src/main/db/operations'
+import { getWorkspaceEpoch } from '../../src/main/db/operations'
 import { ToolGateway } from '../../src/main/tools/gateway'
 import { ToolRegistry } from '../../src/main/tools/registry'
 import { registerOpsTools } from '../../src/main/tools/definitions'
 
 // E-02:隔离执行。EVAL-01:两 case 修改相同 task ID,各自只看到本 case 数据;
-// EVAL-02:自动批准开关不存在(网关拒绝 approved 声明)。
+// EVAL-02:自动批准开关不存在(网关拒绝 approved 声明);案例局部 epoch 不触碰生产全局。
 
 const SQL_JS = join(process.cwd(), 'node_modules', 'sql.js', 'dist')
+
+/** 安全读取生产 epoch:未初始化返回 'uninitialized'(评测不得改变其状态) */
+function safeEpoch(): string {
+  try {
+    return getWorkspaceEpoch()
+  } catch {
+    return 'uninitialized'
+  }
+}
 
 const CASE_BASE: EvalCase = {
   schema_version: 1,
@@ -85,7 +94,6 @@ describe('EVAL-02 无自动批准开关', () => {
   it('正常入口不存在 autoApprove 类选项:网关仍拒绝 approved 声明', async () => {
     const root = mkdtempSync(join(tmpdir(), 'eval-iso-'))
     const env = await createIsolatedCaseEnv(root, caseWith('case-approve'), SQL_JS)
-    initWorkspaceEpoch()
     const registry = new ToolRegistry()
     registerOpsTools(registry)
     const gateway = new ToolGateway({ db: env.db, registry, clock: env.clock })
@@ -102,5 +110,30 @@ describe('EVAL-02 无自动批准开关', () => {
     expect(env.db.all("SELECT * FROM todos WHERE title = '越权'").length).toBe(0)
     void getFixtureById
     env.dispose()
+  })
+})
+
+describe('EVAL-02 案例局部 workspaceEpoch(F-12 隔离)', () => {
+  it('每个案例环境得到独立局部 epoch;getter 稳定', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'eval-iso-'))
+    const envA = await createIsolatedCaseEnv(root, caseWith('case-epoch-a'), SQL_JS)
+    const envB = await createIsolatedCaseEnv(root, caseWith('case-epoch-b'), SQL_JS)
+    expect(envA.workspaceEpoch).toMatch(/^eval-epoch-/)
+    expect(envA.workspaceEpochGetter()).toBe(envA.workspaceEpoch)
+    expect(envB.workspaceEpoch).not.toBe(envA.workspaceEpoch)
+    // 案例局部操作上下文携带同一 epoch
+    expect(envA.operationContext.workspaceEpoch).toBe(envA.workspaceEpoch)
+    expect(envA.operationContext.db).toBe(envA.db)
+    envA.dispose()
+    envB.dispose()
+  })
+
+  it('创建与销毁案例环境前后,生产全局 epoch 保持不变', async () => {
+    const before = safeEpoch()
+    const root = mkdtempSync(join(tmpdir(), 'eval-iso-'))
+    const env = await createIsolatedCaseEnv(root, caseWith('case-epoch-prod'), SQL_JS)
+    expect(env.workspaceEpoch).not.toBe(before)
+    env.dispose()
+    expect(safeEpoch()).toBe(before)
   })
 })

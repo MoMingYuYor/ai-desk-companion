@@ -1,13 +1,16 @@
 // 评测隔离执行(E-02):每个 case、配置和重复各得一个全新数据库与临时目录。
 //
-// 隔离契约(LLM Eval Lab 规格第 6 节):
+// 隔离契约(LLM Eval Lab 规格第 6 节 + EVAL-02 修正 F-12):
 // - 业务工具全部指向临时实例,证明不能访问用户库或跨 case 污染;
 // - 固定时钟只控制领域日期,耗时测量仍走单调钟(C-02 契约);
+// - 案例环境产出局部 operationContext.workspaceEpoch,绝不调用
+//   initWorkspaceEpoch() 修改生产全局;生产 epoch 在评测前后保持不变;
 // - interaction_script 只经测试注入的 EvaluationContext 启用,
 //   正常应用不存在"评测模式自动批准"公开开关;
 // - 临时目录只在预先创建的评测根目录下清理,不根据 case 输入拼接系统路径。
 
 import { mkdtempSync, rmSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fixedClock, type Clock } from '../../shared/clock'
@@ -83,6 +86,20 @@ export interface IsolatedCaseEnv {
   /** 临时目录(评测根目录之下) */
   dir: string
   /**
+   * 案例局部工作空间代数(F-12 隔离):只标识本案例的临时库与执行上下文,
+   * 与生产全局 epoch 完全独立;案例结束随环境一起废弃。
+   */
+  workspaceEpoch: string
+  /**
+   * 局部 epoch getter:供网关构造注入(网关增加 workspaceEpoch 依赖后,
+   * 评测案例传本 getter,生产组合传 getWorkspaceEpoch)。
+   */
+  workspaceEpochGetter: () => string
+  /**
+   * 案例局部操作上下文:业务工具执行应使用该上下文而非任何全局单例。
+   */
+  operationContext: { db: SqliteDb; clock: Clock; workspaceEpoch: string }
+  /**
    * fixture seed 的返回值(如研究侧的 snapshot_id 映射);内置 ops fixture 为 undefined。
    * 供评测判定读取 fixture 播种产物,不改变隔离契约。
    */
@@ -112,12 +129,18 @@ export async function createIsolatedCaseEnv(
   }
   const seedResult: unknown = fixture.seed(db)
 
+  // 案例局部 epoch:随机生成,绝不写生产全局(db/operations.workspaceEpoch)
+  const clock = fixedClock(caseDef.clock)
+  const workspaceEpoch = `eval-epoch-${randomUUID()}`
   return {
     db,
     // 固定时钟冻结领域时间;monotonicMs 始终真实(C-02 契约)
-    clock: fixedClock(caseDef.clock),
+    clock,
     caseDef,
     dir,
+    workspaceEpoch,
+    workspaceEpochGetter: () => workspaceEpoch,
+    operationContext: { db, clock, workspaceEpoch },
     seedResult,
     dispose: () => {
       try {

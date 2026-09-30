@@ -1,11 +1,15 @@
 // 评测报告(E-07 报告部分):确定性 Markdown 生成。
 //
 // 报告纪律:Fake 结果显著标示非模型能力成绩;未测显示"未测";未知费用/用量
-// 为 null 不显示免费;零分母显示 N/A;报告附限制说明与产物 hash。
+// 为 null 不显示免费;零分母显示 N/A;报告注明评测结果 schema 版本;
+// 缺观测项标未测,不用兼容分支重建虚假成绩。
 
 import type { EvalRunState } from './runner'
 import type { EvalMetrics } from './metrics'
 import type { LoadedDataset } from './dataset'
+
+/** 评测结果 schema 版本:报告与产物按此版本解读(规范 EVAL-01 验收要求) */
+export const EVAL_RESULT_SCHEMA_VERSION = 1
 
 export interface ReportInput {
   state: EvalRunState
@@ -15,8 +19,12 @@ export interface ReportInput {
   reproduceCommand: string
 }
 
-function fmtMetric(label: string, value: { value: number | null; n: number; denominator: number }): string {
-  const display = value.value === null ? 'N/A' : `${(value.value * 100).toFixed(1)}%`
+function fmtMetric(label: string, value: { value: number | null; n: number; denominator: number; untested?: boolean }): string {
+  const display = value.untested === true
+    ? '未测(缺观测)'
+    : value.value === null
+      ? 'N/A'
+      : `${(value.value * 100).toFixed(1)}%`
   return `| ${label} | ${display} | ${value.n}/${value.denominator} |`
 }
 
@@ -33,9 +41,15 @@ export function renderEvalReport(input: ReportInput): string {
       : `> execution_kind = real(模型成绩记录见配置冻结说明)`
   )
   lines.push('')
+  lines.push(`- 评测结果 schema 版本:v${EVAL_RESULT_SCHEMA_VERSION}`)
   lines.push(`- 数据集:${state.datasetVersion}(cases sha256 \`${state.casesSha256.slice(0, 16)}…\`,共 ${dataset.cases.length} 条)`)
   lines.push(`- split:${state.splits.join(' / ')};重复:${state.repeats};配置:${state.configIds.join(', ')}`)
   lines.push(`- 状态:${state.status};起止:${state.startedAt} ~ ${state.finishedAt ?? '进行中'}`)
+  if (state.stopReason) lines.push(`- 终止原因:${state.stopReason}`)
+  if (state.originEvalRunId) lines.push(`- 来源运行(显式重新试验):${state.originEvalRunId}`)
+  if (state.lastInterruption && state.lastInterruption.combos.length > 0) {
+    lines.push(`- 上次批次中断:检测到 ${state.lastInterruption.combos.length} 个已启动未收尾组合(已保留分母)`)
+  }
   lines.push(`- 复现:\`${input.reproduceCommand}\``)
   lines.push('')
 
@@ -43,7 +57,9 @@ export function renderEvalReport(input: ReportInput): string {
   const notRun = state.results.filter((r) => r.status === 'not_run').length
   lines.push('## 覆盖')
   lines.push('')
-  lines.push(`- 已启动:${started};预算外未启动:${notRun}${notRun > 0 ? '(部分批次,不构成完整发布结论)' : ''}`)
+  lines.push(
+    `- 已启动:${started}/${state.results.length};预算外未启动:${notRun}${notRun > 0 ? '(部分批次,不构成完整发布结论)' : ''}`
+  )
   lines.push('')
 
   lines.push('## 指标')
@@ -51,15 +67,19 @@ export function renderEvalReport(input: ReportInput): string {
   lines.push('| 指标 | 值 | n/N |')
   lines.push('|---|---|---|')
   lines.push(fmtMetric('完成率', metrics.completion))
+  lines.push(fmtMetric('启动覆盖率', metrics.coverage))
   lines.push(fmtMetric('工具选择准确率', metrics.toolSelection))
   lines.push(fmtMetric('参数准确率', metrics.argumentAccuracy))
   lines.push(fmtMetric('工具错误率', metrics.toolErrorRate))
-  lines.push(
-    `| 确认绕过 | ${metrics.confirmationBypass.count}(必须为 0)/ 已尝试写 ${metrics.confirmationBypass.attemptedWrites} | — |`
-  )
+  const bypass = metrics.confirmationBypass
+  const bypassDisplay = bypass.count === null ? '未测(缺观测)' : `${bypass.count}(必须为 0)`
+  const attemptDisplay = bypass.attemptedWrites === null ? '未测' : String(bypass.attemptedWrites)
+  lines.push(`| 确认绕过 | ${bypassDisplay} / 已尝试写 ${attemptDisplay} | — |`)
   const lat = metrics.latency
+  const latencyDisplay = lat.p50Ms === null ? 'N/A' : `${lat.p50Ms}`
+  const latencyP95Display = lat.p95Ms === null ? 'N/A' : `${lat.p95Ms}`
   lines.push(
-    `| 延迟 p50/p95 | ${lat.p50Ms ?? 'N/A'} / ${lat.p95Ms ?? 'N/A'} ms${lat.smallSample ? '(小样本,n<20)' : ''};超时 ${lat.timeouts} | — |`
+    `| 延迟 p50/p95(ms) | ${latencyDisplay} / ${latencyP95Display}${lat.smallSample ? '(小样本,n<20)' : ''};超时 ${lat.timeouts}(单列,留在成绩分母) | — |`
   )
   lines.push('')
 
@@ -90,6 +110,7 @@ export function renderEvalReport(input: ReportInput): string {
       ? '- Fake Provider 仅证明工程流程,不得在简历或主页中作为模型能力数据引用;'
       : '- 真实模型成绩受供应商与提示词版本影响,复现需同一冻结配置;'
   )
+  lines.push('- 观测缺失的指标显示"未测",不以 0 补齐或据案例终态反推;')
   lines.push(`- 未知 usage/费用以 null 表示,报告中不出现"免费"。`)
   lines.push('')
 
