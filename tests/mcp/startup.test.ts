@@ -141,18 +141,25 @@ class StdioMcp {
   }
 }
 
-function spawnMcp(userDataDir: string, registry: StdioMcp[]): StdioMcp {
+async function spawnMcp(userDataDir: string, registry: StdioMcp[]): Promise<StdioMcp> {
   if (!existsSync(outMain)) {
     throw new Error(`缺少构建产物 ${outMain};进程级测试前先运行 npm run build`)
   }
-  const child = spawn(electronBinary, ['.', '--mcp', '--user-data', userDataDir], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    windowsHide: true,
-    cwd: projectRoot
-  }) as ChildProcessWithoutNullStreams
-  const client = new StdioMcp(child)
-  registry.push(client)
-  return client
+  // Windows 新安装的 exe 可能短暂被扫描占用；只重试尚未启动的 EBUSY。
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const child = spawn(electronBinary, ['.', '--mcp', '--user-data', userDataDir], {
+        stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, cwd: projectRoot
+      }) as ChildProcessWithoutNullStreams
+      const client = new StdioMcp(child)
+      registry.push(client)
+      return client
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EBUSY' || attempt >= 3) throw error
+      console.warn(`[mcp-test] Electron 尚未启动，EBUSY 等待 ${250 * (attempt + 1)}ms`)
+      await sleep(250 * (attempt + 1))
+    }
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -199,7 +206,7 @@ describe('MCP-01 进程级:--mcp 模式与相同审批边界', () => {
     async () => {
       const dir = makeUserDataDir()
       const clients: StdioMcp[] = []
-      const mcp = spawnMcp(dir, clients)
+      const mcp = await spawnMcp(dir, clients)
       try {
         // 协议握手
         const initRes = await mcp.request('initialize')
@@ -329,7 +336,7 @@ describe('MCP-01 进程级:--mcp 模式与相同审批边界', () => {
         // 第一会话:创建提案后 EOF 退出
         let approvalId = ''
         {
-          const mcp = spawnMcp(dir, clients)
+          const mcp = await spawnMcp(dir, clients)
           const propRes = await mcp.request('tools/call', {
             name: 'create_todo',
             arguments: { title: '重启存活提案' }
@@ -350,7 +357,7 @@ describe('MCP-01 进程级:--mcp 模式与相同审批边界', () => {
         }
         // 第二会话:重启同一 userData,服务可用,数据未丢
         {
-          const mcp = spawnMcp(dir, clients)
+          const mcp = await spawnMcp(dir, clients)
           const initRes = await mcp.request('initialize')
           expect(initRes.result).toMatchObject({ protocolVersion: '2024-11-05' })
           const readRes = await mcp.request('tools/call', { name: 'list_todos', arguments: {} })

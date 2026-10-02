@@ -3,6 +3,7 @@
 # 原始字节;若 checkout 配置不同(如 core.autocrlf=true/false)导致工作树行尾漂移,
 # 冻结 hash 校验在干净克隆中必然失败。此处强制 LF 使任何配置下检出字节一致。
 evals/datasets/** text eol=lf
+evals/prompts/** text eol=lf
 fixtures/research/** text eol=lf
 
 # 例外:BOM+CRLF 规范化 golden 样例(golden.expected.json 的 raw_sha256 绑定其
