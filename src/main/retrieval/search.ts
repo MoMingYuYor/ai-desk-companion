@@ -72,6 +72,11 @@ function compareCandidateRows(a: ChunkRow, b: ChunkRow): number {
  * options.frozenSnapshotIds 提供时(RES-02),冻结过滤发生在 MATCH 候选阶段。
  */
 export function searchDocuments(db: SqliteDb, query: string, limit = 8, options?: SearchDocumentsOptions): SearchHit[] {
+  const candidateLimit = options?.candidateLimit ?? MATCH_CANDIDATE_LIMIT
+  if (!Number.isInteger(candidateLimit) || candidateLimit < 0 || candidateLimit > MATCH_CANDIDATE_LIMIT) {
+    throw new Error('candidateLimit 必须是 0 至 500 的整数')
+  }
+  if (candidateLimit === 0) return []
   const tokens = tokenizeForSearch(query)
   if (tokens.length === 0) return []
   const match = buildMatchQuery(tokens)
@@ -80,11 +85,12 @@ export function searchDocuments(db: SqliteDb, query: string, limit = 8, options?
   if (options !== undefined) {
     // RES-02 路径:候选阶段 JOIN retrieval_chunks 按冻结 document_id 过滤;
     // 冻结集合为空直接返回 [];超过 SQL 参数上限分批取候选
-    const frozen = [...options.frozenSnapshotIds]
+    const frozen = [...new Set(options.frozenSnapshotIds)].sort()
     if (frozen.length === 0) return []
-    const candidateLimit = options.candidateLimit ?? MATCH_CANDIDATE_LIMIT
     const candidateRows: Array<ChunkRow & DocumentRow> = []
     for (let i = 0; i < frozen.length; i += SQL_PARAM_BATCH) {
+      const remaining = candidateLimit - candidateRows.length
+      if (remaining === 0) break
       const batch = frozen.slice(i, i + SQL_PARAM_BATCH)
       const placeholders = batch.map(() => '?').join(', ')
       candidateRows.push(
@@ -94,8 +100,9 @@ export function searchDocuments(db: SqliteDb, query: string, limit = 8, options?
              FROM retrieval_fts f
              JOIN retrieval_chunks c ON c.rowid = f.docid
              JOIN retrieval_documents d ON d.document_id = c.document_id
-            WHERE retrieval_fts MATCH ? AND c.document_id IN (${placeholders})`,
-          [match, ...batch]
+            WHERE retrieval_fts MATCH ? AND c.document_id IN (${placeholders})
+            ORDER BY c.document_id COLLATE BINARY, c.chunk_index, c.chunk_id COLLATE BINARY LIMIT ?`,
+          [match, ...batch, remaining]
         )
       )
     }

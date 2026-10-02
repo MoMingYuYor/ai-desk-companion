@@ -55,6 +55,8 @@ function reportView(over: Partial<ResearchReportResponse> = {}): ResearchReportR
     report_state: 'final',
     run_status: 'succeeded',
     manifest_sha256: 'a'.repeat(64),
+    scope_verification: 'verified',
+    scope_warning: null,
     sections: [
       { section: 'core_findings', title: '核心结论', markdown: '## 核心结论\n\n1. 该岗位明确要求 Python。' },
       { section: 'conflicts_and_gaps', title: '冲突与不足', markdown: '## 冲突与不足\n\n未检测到冲突。' }
@@ -302,6 +304,14 @@ describe('ResearchPage 澄清', () => {
 // ---------- 报告 ----------
 
 describe('ResearchPage 报告', () => {
+  it('范围未验证的历史报告展示警告，仍可阅读正文', async () => {
+    installApi({ run: runView({ status: 'succeeded' }), report: reportView({ scope_verification: 'legacy_unverified', scope_warning: '历史报告的记录范围未验证，请从原始资料重新导入后创建新运行' }),
+      historyRuns: [{ runId: 'run-r1', mode: 'research', status: 'succeeded', input: '比较岗位要求', errorCode: null, startedAt: '2026-09-28T01:00:00.000Z', finishedAt: '2026-09-28T01:02:00.000Z' }] })
+    render(<ResearchPage refreshKey={0} />)
+    const report = await screen.findByTestId('research-report')
+    expect(report.textContent).toContain('历史报告的记录范围未验证')
+    expect(report.textContent).toContain('该岗位明确要求 Python')
+  })
   it('报告按结论—证据—限制渲染,含引用编号', async () => {
     installApi({
       run: runView({ status: 'succeeded' }),

@@ -58,6 +58,8 @@ export interface ResearchReportResponse {
   report_state: string
   run_status: string
   manifest_sha256: string
+  scope_verification: 'verified' | 'legacy_unverified'
+  scope_warning: string | null
   sections: ResearchReportSection[]
   claims: ResearchReportClaim[]
   citations: ResearchReportCitation[]

@@ -63,7 +63,7 @@ import {
   type ResearchBudgetLedger,
   type SlotKind
 } from './budget'
-import { codePointLength } from './schemas'
+import { codePointLength, type SnapshotManifest } from './schemas'
 import {
   assertResearchRun,
   createClaim,
@@ -74,6 +74,7 @@ import {
   getResearchTaskByRun,
   getSnapshotManifest,
   getSnapshotText,
+  getChunkBoundary,
   listClaims,
   listSubQuestions,
   loadResearchCheckpoint,
@@ -85,7 +86,7 @@ import {
   type ResearchRunHandle
 } from './repository'
 import { retrieveForSubquestion } from './retrieval'
-import { resolveSpanOffsets, validateCitations, type AllOfRequirement, type CitationValidationReport, type OffsetResolution } from './citations'
+import { resolveSpanOffsets, validateCitations, type AllOfRequirement, type CitationValidationReport } from './citations'
 import { detectConflicts, persistSubquestionOutcomes, reviewClaims, type ReviewOutcome } from './evidence'
 import { buildReport } from './reports'
 
@@ -153,6 +154,10 @@ export interface ExtractionModelOutput {
   evidence: ExtractionEvidenceItem[]
   claims: ExtractionClaimItem[]
 }
+
+type ExtractionEvidenceValidation =
+  | { ok: true; startOffset: number; endOffset: number }
+  | { ok: false; reason: string }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -344,6 +349,10 @@ function isRetryableModelError(err: unknown): boolean {
   return true
 }
 
+function isObservationFailedError(err: unknown): err is ModelRequestError {
+  return err instanceof ModelRequestError && err.code === 'OBSERVATION_FAILED'
+}
+
 // ---------- 驱动状态(每次 driveResearch 一个实例) ----------
 
 interface ClarificationQuestionSet {
@@ -370,6 +379,8 @@ interface DriverState {
   determinedSubIds: string[]
   /** RES-01:每次 driveResearch 独立的取消控制器;signal 贯穿到 fetch 与 reader.read */
   abortController: AbortController
+  /** 观测持久化失败后保持关闭发送准入,数据库恢复也不得继续运行。 */
+  observationFailed: boolean
 }
 
 interface WorkflowCheckpoint {
@@ -487,11 +498,11 @@ export class ResearchWorkflow {
   }
 
   /** 失败落库:终态 + error 事件;调用方随后抛 WorkflowFailed 退出循环 */
-  private failRun(runId: string, errorCode: string, message: string): void {
+  private failRun(runId: string, errorCode: string, message: string, diagnostic: Record<string, unknown> = {}): void {
     const run = getRun(this.db, runId)
     if (!run || run.status === 'failed' || run.finishedAt != null) return
     this.transition(runId, 'failed', { errorCode })
-    this.trace(runId, 'error', { code: errorCode, message })
+    this.trace(runId, 'error', { ...diagnostic, code: errorCode, message })
   }
 
   /** 协作取消检查:阶段边界与每次模型调用返回后调用;已取消即中断写入 */
@@ -538,6 +549,9 @@ export class ResearchWorkflow {
       timeoutMs: driver.ledger.modelCallTimeoutMs(MODEL_CALL_LIMIT_MS),
       policy: { maxAttempts: 1, fallback: 'disabled' },
       beforeSend: (attempt) => {
+        if (driver.observationFailed) {
+          throw new ModelRequestError('OBSERVATION_FAILED', '观测持久化已失败,禁止后续发送', [], false)
+        }
         // 取消检查:已取消/已终结即中止,不占预算
         this.assertActive(driver.runId)
         if (opts.consumeReservation !== true) {
@@ -552,7 +566,13 @@ export class ResearchWorkflow {
       },
       onAttempt: (event) => {
         // 观测持久化:抛错由 Router 转 OBSERVATION_FAILED 并 abort 在途请求
-        this.traceAttempt(driver.runId, event)
+        try {
+          this.traceAttempt(driver.runId, event)
+        } catch (err) {
+          // 必须先关闭准入再抛出,后续阶段不能因数据库恢复重新发送。
+          driver.observationFailed = true
+          throw err
+        }
       }
     }
   }
@@ -633,7 +653,8 @@ export class ResearchWorkflow {
       answers: ckpt?.answers ?? {},
       reviewCompleted: ckpt?.reviewCompleted === true,
       determinedSubIds: ckpt?.determinedSubIds ?? [],
-      abortController: new AbortController()
+      abortController: new AbortController(),
+      observationFailed: false
     }
     this.activeControllers.set(runId, driver.abortController)
     try {
@@ -694,6 +715,24 @@ export class ResearchWorkflow {
         driver.phase = 'synthesizing'
         await this.synthesisStage(driver)
       } catch (err) {
+        if (driver.observationFailed || isObservationFailedError(err)) {
+          driver.observationFailed = true
+          const failure = isObservationFailedError(err)
+            ? err
+            : new ModelRequestError('OBSERVATION_FAILED', err instanceof Error ? err.message : String(err), [], false)
+          try {
+            // 沿用既有 AppError 映射,领域原因和原始 attempts 单独保留在诊断中。
+            this.failRun(runId, 'MODEL_OUTPUT_INVALID', failure.message, {
+              domain_code: failure.code,
+              attempts: failure.attempts
+            })
+          } catch (saveErr) {
+            // 终态无法保存时同时报告原错和保存异常,交由外层恢复/调度补偿。
+            throw new AggregateError([failure, saveErr], 'OBSERVATION_FAILED:观测失败且终态保存失败', { cause: failure })
+          }
+          this.driveNextQueued()
+          return
+        }
         if (err instanceof WorkflowAborted) {
           // 用户取消:不做任何收尾写入,不伪装 partial;让出执行权并驱动下一个
           this.driveNextQueued()
@@ -774,6 +813,7 @@ export class ResearchWorkflow {
       raw = result.data
       model = result.model
     } catch (err) {
+      if (isObservationFailedError(err)) throw err
       this.assertActive(runId)
       if (isBudgetExhaustedError(err)) throw err // 预算/时限耗尽 → 收尾路径
       // 规划槽位受账本状态机限制不允许重试:调用失败直接失败落库
@@ -906,6 +946,7 @@ export class ResearchWorkflow {
         parsed = call.parsed
         retried = call.retried
       } catch (err) {
+        if (isObservationFailedError(err)) throw err
         if (isBudgetExhaustedError(err)) throw err // 预算/时限耗尽 → 收尾
         this.assertActive(runId) // 取消 → 协作中断
         // 受控重试后仍失败(结构化输出无效/429/超时):运行错误 MODEL_OUTPUT_INVALID
@@ -922,8 +963,8 @@ export class ResearchWorkflow {
         subquestion_id: sub.subquestionId,
         retry: retried
       })
-      driver.determinedSubIds.push(sub.subquestionId) // 抽取产物已落库:子问题已被确定性处理
       this.persistExtraction(driver, sub.subquestionId, sub.ordinal, retrieval.hits.map((h) => h.chunkId), parsed, snapshotTexts)
+      driver.determinedSubIds.push(sub.subquestionId) // 整批提交和审计成功后才进入已处理检查点
       this.saveCheckpoint(driver)
     }
   }
@@ -964,6 +1005,7 @@ export class ResearchWorkflow {
     try {
       return { parsed: await attemptOnce(false), retried: false }
     } catch (err) {
+      if (isObservationFailedError(err)) throw err // 原样保留 attempts,不包装成 OperationError
       this.assertActive(driver.runId) // 取消:不占重试预算,直接中断
       if (isBudgetExhaustedError(err)) throw err // 预算/时限耗尽 → 收尾
       if (!isRetryableModelError(err)) {
@@ -978,13 +1020,68 @@ export class ResearchWorkflow {
     }
   }
 
+  /** 只读验证全部成员;数据库 I/O 或清单损坏异常原样向外传播。 */
+  private validateExtractionEvidence(
+    ev: ExtractionEvidenceItem,
+    delivered: ReadonlySet<string>,
+    manifest: SnapshotManifest,
+    snapshotTexts: Map<string, string>
+  ): ExtractionEvidenceValidation {
+    const reject = (reason: string): ExtractionEvidenceValidation => ({ ok: false, reason })
+    const entry = manifest.entries.find((e) => e.snapshot_id === ev.snapshot_id)
+    if (!entry) return reject('快照不在冻结清单内')
+    if (!delivered.has(ev.chunk_id)) return reject('chunk 不在交付候选集合内')
+    const chunk = getChunkBoundary(this.db, ev.chunk_id)
+    if (!chunk || chunk.snapshotId !== ev.snapshot_id) return reject('chunk 不存在或快照不匹配')
+    let text = snapshotTexts.get(ev.snapshot_id)
+    if (text === undefined) {
+      const snapshot = getSnapshotText(this.db, ev.snapshot_id)
+      if (!snapshot) return reject('快照不存在')
+      text = snapshot.normalizedText
+      snapshotTexts.set(ev.snapshot_id, text)
+    }
+    const cps = Array.from(text)
+    let startOffset: number
+    let endOffset: number
+    if (ev.start_offset !== undefined || ev.end_offset !== undefined) {
+      if (ev.start_offset === undefined || ev.end_offset === undefined) return reject('显式 offset 必须同时提供起止坐标')
+      startOffset = ev.start_offset
+      endOffset = ev.end_offset
+    } else {
+      const resolved = resolveSpanOffsets({ quote: ev.quote, snapshotText: text, chunk })
+      if (!resolved.ok) return reject(resolved.reason ?? '证据定位失败')
+      startOffset = resolved.startOffset
+      endOffset = resolved.endOffset
+    }
+    if (startOffset < 0 || startOffset >= endOffset || endOffset > cps.length) return reject('offset 超出快照范围或顺序颠倒')
+    if (entry.record_scope && (startOffset < entry.record_scope.startOffset || endOffset > entry.record_scope.endOffset)) {
+      return reject('offset 超出冻结记录范围')
+    }
+    if (startOffset < chunk.startOffset || endOffset > chunk.endOffset) return reject('chunk 未覆盖显式 offset 范围')
+    if (cps.slice(startOffset, endOffset).join('') !== ev.quote) return reject('offset 处切片与 quote 不一致')
+    if (cps.slice(chunk.startOffset, chunk.endOffset).join('') !== chunk.content) return reject('chunk 内容与快照切片不一致')
+    return { ok: true, startOffset, endOffset }
+  }
+
+  /** 抽取审计保存失败与模型观测保存失败共用停止闩锁。 */
+  private traceExtractionAudit(driver: DriverState, payload: Record<string, unknown>): void {
+    try {
+      this.trace(driver.runId, 'error', payload)
+    } catch (err) {
+      driver.observationFailed = true
+      const failure = new ModelRequestError('OBSERVATION_FAILED', `抽取审计保存失败:${err instanceof Error ? err.message : String(err)}`, [], false)
+      failure.cause = err
+      throw failure
+    }
+  }
+
   /**
    * 抽取产物落库:证据只在「服务端候选集合内 + 可唯一定位」时收下——
    * chunk 不在交付命中内、quote 与切片不符、同 quote 多处命中均拒绝该证据
    * (多处命中必须显式定位或拒绝);模型自报 offset 一律服务端重验,不采信。
    * 引用只指向已落库证据;被拒证据的下标失联,对应 claim 将在结构检查中落 unsupported。
    * RES-03:all_of 命题先记录全部预期成员下标,再写通过验证的引用;被拒成员保存
-   * null ID 与拒绝原因,Claim、引用与预期清单同事务落库,禁止只留下有效成员。
+   * null ID 与拒绝原因,本批证据、Claim、引用与清单同事务落库,禁止只留下有效成员。
    */
   private persistExtraction(
     driver: DriverState,
@@ -998,123 +1095,97 @@ export class ResearchWorkflow {
     const delivered = new Set(deliveredChunkIds)
     const evidenceIds = new Map<number, string>()
     const rejectionReasons = new Map<number, string>()
-
-    for (let i = 0; i < parsed.evidence.length; i += 1) {
-      const ev = parsed.evidence[i]!
-      const chunkRow = this.db.get<{ document_id: string }>(
-        'SELECT document_id FROM retrieval_chunks WHERE chunk_id = ?',
-        [ev.chunk_id]
-      )
-      // 候选集合守卫:chunk 必须在本次交付命中内且属于所声明的快照
-      if (!chunkRow || !delivered.has(ev.chunk_id) || chunkRow.document_id !== ev.snapshot_id) {
-        rejectionReasons.set(i, 'chunk 不在交付候选集合内或快照不匹配')
-        this.trace(runId, 'error', {
-          code: 'CITATION_INVALID',
-          message: `证据 ${i} 被拒绝:chunk 不在交付候选集合内或快照不匹配`,
-          subquestion_id: subquestionId
-        })
-        continue
-      }
-      let text = snapshotTexts.get(ev.snapshot_id)
-      if (text === undefined) {
-        const record = getSnapshotText(this.db, ev.snapshot_id)
-        text = record?.normalizedText ?? ''
-        snapshotTexts.set(ev.snapshot_id, text)
-      }
-      let offsets: OffsetResolution
-      if (ev.start_offset !== undefined && ev.end_offset !== undefined) {
-        // 模型给了 offset:服务端验证切片一致,否则拒绝(不采信模型坐标)
-        const resliced = Array.from(text).slice(ev.start_offset, ev.end_offset).join('')
-        offsets =
-          resliced === ev.quote
-            ? { ok: true, startOffset: ev.start_offset, endOffset: ev.end_offset, reason: null }
-            : { ok: false, startOffset: -1, endOffset: -1, reason: `offset [${ev.start_offset},${ev.end_offset}) 处切片与 quote 不一致` }
-      } else {
-        // 只给 quote:限定 chunk 内唯一精确匹配才补 offset;多处命中必须显式定位或拒绝
-        const chunkBoundary = this.db.get<{ start_offset: number; end_offset: number }>(
-          'SELECT start_offset, end_offset FROM retrieval_chunks WHERE chunk_id = ?',
-          [ev.chunk_id]
-        )
-        offsets = resolveSpanOffsets({
-          quote: ev.quote,
-          snapshotText: text,
-          chunk: { startOffset: chunkBoundary?.start_offset ?? 0, endOffset: chunkBoundary?.end_offset ?? 0 }
-        })
-      }
-      if (!offsets.ok) {
-        rejectionReasons.set(i, offsets.reason ?? '证据定位失败')
-        this.trace(runId, 'error', {
-          code: 'CITATION_INVALID',
-          message: `证据 ${i} 被拒绝:${offsets.reason}`,
-          subquestion_id: subquestionId
-        })
-        continue
-      }
-      const span = createEvidenceSpan(this.db, runId, subquestionId, {
-        snapshot_id: ev.snapshot_id,
-        chunk_id: ev.chunk_id,
-        start_offset: offsets.startOffset,
-        end_offset: offsets.endOffset,
-        quote: ev.quote
+    try {
+      const task = getResearchTaskByRun(this.db, runId)
+      if (!task) throw new Error(`运行缺少研究任务:${runId}`)
+      const manifest = verifySnapshotManifest(this.db, task.snapshotManifestId)
+      // 在第一条 INSERT 前准备所有成员结果,拒绝不是 I/O 异常,不能吞掉读取故障。
+      const preparedEvidence = parsed.evidence.map((ev, index) => {
+        const result = this.validateExtractionEvidence(ev, delivered, manifest, snapshotTexts)
+        if (!result.ok) {
+          rejectionReasons.set(index, result.reason)
+          return { ok: false as const, index, reason: result.reason }
+        }
+        return { ok: true as const, index, input: {
+          snapshot_id: ev.snapshot_id, chunk_id: ev.chunk_id, quote: ev.quote,
+          start_offset: result.startOffset, end_offset: result.endOffset
+        } }
       })
-      evidenceIds.set(i, span.evidenceId)
-    }
-
-    // 每题初始至多 4 个候选 Claim(规格第 4 节)
-    const claims = parsed.claims.slice(0, MAX_CANDIDATE_CLAIMS_PER_SUBQUESTION)
-    for (let ci = 0; ci < claims.length; ci += 1) {
-      const item = claims[ci]!
-      const groupId = item.all_of === true ? `allg-${ordinal}-${ci}` : undefined
-      // RES-03:Claim、引用与 all_of 预期成员清单同事务;写入失败回滚整条命题
+      // 每题初始至多 4 个候选 Claim(规格第 4 节);整次响应只使用一个同步事务。
+      const claims = parsed.claims.slice(0, MAX_CANDIDATE_CLAIMS_PER_SUBQUESTION)
       this.db.transaction(() => {
-        const claim = createClaim(this.db, runId, {
-          subquestionId,
-          claim: {
-            text: item.text,
-            claim_type: item.claim_type,
-            ...(item.subject ? { subject: item.subject } : {}),
-            ...(item.qualifier ? { qualifier: item.qualifier } : {})
-          }
-        })
-        const citationIdByIndex = new Map<number, string>()
-        const cite = (indices: readonly number[], relation: 'supports' | 'contradicts' | 'context'): void => {
-          for (const idx of indices) {
-            const evidenceId = evidenceIds.get(idx)
-            if (!evidenceId) continue // 被拒证据:引用不成立,结构检查将如实落 unsupported
-            const citation = createCitation(this.db, runId, {
-              claim_id: claim.claimId,
-              evidence_id: evidenceId,
-              relation,
-              ...(relation === 'supports' && groupId
-                ? { evidence_group_id: groupId, group_operator: 'all_of' as const }
-                : {})
-            })
-            if (relation === 'supports') citationIdByIndex.set(idx, citation.citationId)
-          }
+        for (const prepared of preparedEvidence) {
+          if (!prepared.ok) continue
+          const span = createEvidenceSpan(this.db, runId, subquestionId, prepared.input)
+          evidenceIds.set(prepared.index, span.evidenceId)
         }
-        cite(item.supports, 'supports')
-        if (item.contradicts) cite(item.contradicts, 'contradicts')
-        if (item.context) cite(item.context, 'context')
+        for (let ci = 0; ci < claims.length; ci += 1) {
+          const item = claims[ci]!
+          const groupId = item.all_of === true ? `allg-${ordinal}-${ci}` : undefined
+          const claim = createClaim(this.db, runId, {
+            subquestionId,
+            claim: {
+              text: item.text,
+              claim_type: item.claim_type,
+              ...(item.subject ? { subject: item.subject } : {}),
+              ...(item.qualifier ? { qualifier: item.qualifier } : {})
+            }
+          })
+          const citationIdByIndex = new Map<number, string>()
+          const cite = (indices: readonly number[], relation: 'supports' | 'contradicts' | 'context'): void => {
+            for (const idx of indices) {
+              const evidenceId = evidenceIds.get(idx)
+              if (!evidenceId) continue // 被拒证据:引用不成立,结构检查将如实落 unsupported
+              const citation = createCitation(this.db, runId, {
+                claim_id: claim.claimId,
+                evidence_id: evidenceId,
+                relation,
+                ...(relation === 'supports' && groupId
+                  ? { evidence_group_id: groupId, group_operator: 'all_of' as const }
+                  : {})
+              })
+              if (relation === 'supports') citationIdByIndex.set(idx, citation.citationId)
+            }
+          }
+          cite(item.supports, 'supports')
+          if (item.contradicts) cite(item.contradicts, 'contradicts')
+          if (item.context) cite(item.context, 'context')
 
-        if (groupId !== undefined) {
-          // 先记录原始 supports 全部预期下标,再写通过验证的成员;被拒成员保存 null ID 与原因
-          const requirement: AllOfRequirement = {
-            version: 1,
-            groupId,
-            expectedIndices: [...item.supports].sort((a, b) => a - b),
-            members: item.supports.map((idx) => {
-              const evidenceId = evidenceIds.get(idx) ?? null
-              const citationId = citationIdByIndex.get(idx) ?? null
-              return {
-                index: idx,
-                evidenceId,
-                citationId,
-                rejectionReason: evidenceId === null ? (rejectionReasons.get(idx) ?? '证据被拒绝') : null
-              }
-            })
+          if (groupId !== undefined) {
+            // 先记录原始 supports 全部预期下标,再写通过验证的成员;被拒成员保存 null ID 与原因
+            const requirement: AllOfRequirement = {
+              version: 1,
+              groupId,
+              expectedIndices: [...item.supports].sort((a, b) => a - b),
+              members: item.supports.map((idx) => {
+                const evidenceId = evidenceIds.get(idx) ?? null
+                const citationId = citationIdByIndex.get(idx) ?? null
+                return {
+                  index: idx,
+                  evidenceId,
+                  citationId,
+                  rejectionReason: evidenceId === null ? (rejectionReasons.get(idx) ?? '证据被拒绝') : null
+                }
+              })
+            }
+            saveAllOfRequirement(this.db, claim.claimId, requirement)
           }
-          saveAllOfRequirement(this.db, claim.claimId, requirement)
         }
+      })
+    } catch (err) {
+      // transaction 已回滚或准备尚未写入;失败审计在事务之外落库。
+      this.traceExtractionAudit(driver, {
+        event: 'research.extraction_batch_failed', code: 'CITATION_INVALID',
+        subquestion_id: subquestionId, ordinal,
+        message: err instanceof Error ? err.message : String(err)
+      })
+      throw err
+    }
+    // 成员拒绝只在批次成功提交后审计,包含原始下标/原因,不包含 quote 或资料全文。
+    for (const [index, reason] of rejectionReasons) {
+      this.traceExtractionAudit(driver, {
+        event: 'research.evidence_rejected', code: 'CITATION_INVALID',
+        subquestion_id: subquestionId, ordinal, index, reason
       })
     }
   }
@@ -1149,6 +1220,7 @@ export class ResearchWorkflow {
           control: this.stageControl(driver, 'review', { consumeReservation: true })
         })
       } catch (err) {
+        if (isObservationFailedError(err)) throw err
         // RES-01:取消与预算/时限耗尽必须穿过异常兜底重新抛出(取消 → 协作中断,
         // 预算 → 收尾路径);其余异常按候选处理,不升级(防御 DB 级异常)
         if (err instanceof WorkflowAborted) throw err

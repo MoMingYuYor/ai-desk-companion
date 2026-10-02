@@ -241,7 +241,7 @@ describe('mergeObservations:两阶段合并', () => {
     expect(merged[0]!.businessApplied).toBe(false)
   })
 
-  it('落盘失败:工具业务结果与落盘失败分别报告,不得计为已应用', () => {
+  it('落盘失败:工具业务结果与保存失败分别报告，已提交业务仍计为已应用', () => {
     const merged = mergeObservations([
       obs({ operationId: 'op-z', arguments: { title: 'x' }, outcome: 'success' }),
       obs({
@@ -254,8 +254,19 @@ describe('mergeObservations:两阶段合并', () => {
     ])
     const m = merged[0]!
     expect(m.ok).toBe(true) // 工具业务结果成功
-    expect(m.businessApplied).toBe(false) // 落盘失败:不计真实业务变更
+    expect(m.businessApplied).toBe(true) // 保存失败不回滚已提交的业务事务
     expect(m.errorCode).toBe('PERSIST_FAILED')
+  })
+
+  it('同一尝试先保存成功再保存失败，失败优先且真实应用事实保留', () => {
+    const merged = mergeObservations([
+      obs({ operationId: 'op-final', outcome: 'success' }),
+      obs({ operationId: 'op-final', phase: 'persistence', committed: true, outcome: 'success' }),
+      obs({ operationId: 'op-final', phase: 'persistence', committed: true, outcome: 'persist_error', error: { code: 'PERSIST_FAILED', message: '最终观察未保存', retryable: true } })
+    ])
+    expect(merged).toHaveLength(1)
+    expect(merged[0]!.errorCode).toBe('PERSIST_FAILED')
+    expect(merged[0]!.businessApplied).toBe(true)
   })
 
   it('验证拒绝:arguments 为 null,ok=false,仍计一次尝试', () => {

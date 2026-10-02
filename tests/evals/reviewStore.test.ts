@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest'
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { caseArtifactDir, exportCaseArtifacts, type CaseArtifactPayload } from '../../src/main/evals/artifacts'
 import {
   FileReviewStore,
   NO_EVIDENCE_SEGMENT,
@@ -40,6 +41,11 @@ function annotationInput(over: Record<string, unknown> = {}) {
 }
 
 describe('FileReviewStore:追加式 JSONL 持久化', () => {
+  it.each(['not-a-date', '2026-02-30T00:00:00.000Z', ''])('T16 reviewedAt=%s 非法时间不能落盘', (reviewedAt) => {
+    const root = mkdtempSync(join(tmpdir(), 't16-review-time-'))
+    expect(() => new FileReviewStore(root).annotate(annotationInput({ reviewedAt }))).toThrow(/时间|reviewedAt/)
+    expect(existsSync(join(root, 'reviews.jsonl'))).toBe(false)
+  })
   it('先持久写成功再返回:annotate 返回时记录已在文件中;reviewId 随机唯一', () => {
     const root = mkdtempSync(join(tmpdir(), 'eval-review-'))
     const store = new FileReviewStore(root)
@@ -142,6 +148,55 @@ describe('FileReviewStore:追加式 JSONL 持久化', () => {
     const store = new FileReviewStore(root)
     expect(() => store.annotate(annotationInput({ subjectKey: 'a::b' }))).toThrow(ReviewStoreError)
     expect(existsSync(join(root, 'reviews.jsonl'))).toBe(false)
+  })
+})
+
+describe('T16 审阅绑定已验证产物内容，重开与篡改', () => {
+  function setup() {
+    const root = mkdtempSync(join(tmpdir(), 't16-review-bound-'))
+    const artifactRoot = join(root, 'artifacts')
+    const reviewRoot = join(root, 'reviews')
+    const ids = { evalRunId: 'eval-1', configId: 'ops-planning-baseline', caseId: 'c1', repeatIndex: 0 }
+    const payload: CaseArtifactPayload = {
+      run: { runId: 'r1' }, traceEvents: [], observations: [], ruleChecks: [],
+      report: { title: '合成报告' },
+      evidence: { applicable: true, claims: [{ claim_id: 'claim-1', claim_type: 'fact', text: '原始命题' }], citations: [{ claim_id: 'claim-1', evidence_id: 'ev-1', relation: 'supports' }], spans: [{ evidence_id: 'ev-1', quote: '原始证据', snapshot_id: 'doc-1' }] },
+      snapshots: { documents: [{ snapshotId: 'doc-1', normalizedText: '原始证据' }] }, meta: { executionKind: 'fake' }
+    }
+    exportCaseArtifacts(artifactRoot, ids, payload)
+    return { artifactRoot, reviewRoot, ids, payload, dir: caseArtifactDir(artifactRoot, ids.evalRunId, ids.configId, ids.caseId, 0) }
+  }
+
+  it('服务端绑定内容hash，重开同一证据读取同一判定；合法重新导出也不能复用旧标签', () => {
+    const env = setup()
+    const first = new FileReviewStore(env.reviewRoot, 'reviews.jsonl', env.artifactRoot)
+    const label = first.annotate(annotationInput())
+    expect(label).toMatchObject({ contentSha256: expect.stringMatching(/^[a-f0-9]{64}$/) })
+    const reopened = new FileReviewStore(env.reviewRoot, 'reviews.jsonl', env.artifactRoot)
+    expect(reopened.latestFor(SUBJECT)).toEqual(label)
+    expect(reviewHoldoutStatus(reopened, [SUBJECT]).holdoutComplete).toBe(true)
+    exportCaseArtifacts(env.artifactRoot, env.ids, { ...env.payload, evidence: { ...env.payload.evidence, claims: [{ claim_id: 'claim-1', claim_type: 'fact', text: '替换了命题' }] } })
+    expect(reopened.latestFor(SUBJECT)).toBeNull()
+    expect(reopened.historyFor(SUBJECT)).toEqual([label])
+    expect(reviewHoldoutStatus(reopened, [SUBJECT]).coverage).toEqual({ value: 0, reviewed: 0, expected: 1 })
+    expect(reviewHoldoutStatus(reopened, [SUBJECT]).holdoutComplete).toBe(false)
+    if (process.env.T16_EVIDENCE_DIR) writeFileSync(join(process.env.T16_EVIDENCE_DIR, 'review-reopen.json'), JSON.stringify({ label, reopenedBeforeChange: label, afterContentChange: reopened.latestFor(SUBJECT), history: reopened.historyFor(SUBJECT), coverage: reviewHoldoutStatus(reopened, [SUBJECT]) }, null, 2))
+  })
+
+  it('篡改证据使manifest失效时旧标签不可用，也不能再保存审阅', () => {
+    const env = setup()
+    const store = new FileReviewStore(env.reviewRoot, 'reviews.jsonl', env.artifactRoot)
+    store.annotate(annotationInput())
+    writeFileSync(join(env.dir, 'evidence.json'), JSON.stringify({ applicable: true, claims: [] }))
+    expect(store.latestFor(SUBJECT)).toBeNull()
+    expect(() => store.annotate(annotationInput())).toThrow(/完整性|产物/)
+  })
+
+  it('不存在的claim/evidence对不能通过安全ID校验后伪造标签', () => {
+    const env = setup()
+    const store = new FileReviewStore(env.reviewRoot, 'reviews.jsonl', env.artifactRoot)
+    expect(() => store.annotate(annotationInput({ subjectKey: SUBJECT.replace('claim-1', 'other-claim') }))).toThrow(/对象|claim/)
+    expect(() => store.annotate(annotationInput({ subjectKey: SUBJECT.replace('ev-1', 'other-evidence') }))).toThrow(/对象|evidence/)
   })
 })
 

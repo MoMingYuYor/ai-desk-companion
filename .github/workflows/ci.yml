@@ -33,14 +33,15 @@ jobs:
       - name: Install dependencies from lockfile
         run: npm ci
 
-      - name: Unit tests
-        run: npm test
+      # MCP 进程测试读取 out/，首次干净运行必须先生成构建产物。
+      - name: Build
+        run: npm run build
 
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Build
-        run: npm run build
+      - name: Unit tests
+        run: npm test
 
       # PKG-01:生成构建信息并校验产物与只读数据资源完整性(缺失即失败);
       # build-info 与检查日志作为 workflow artifact 留存,便于分发记录溯源

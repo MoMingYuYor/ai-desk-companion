@@ -15,7 +15,7 @@ import { expect, it, vi } from 'vitest'
 import { openDatabase, type FileOps, type SqliteDb } from '../../src/main/db/connection'
 import { initSchema } from '../../src/main/db/dao'
 import { createPersistenceCoordinator, initWorkspaceEpoch } from '../../src/main/db/operations'
-import { createRun, decideApproval, getApproval } from '../../src/main/runs/repository'
+import { appendTraceEvent, createRun, decideApproval, getApproval, listTraceEvents } from '../../src/main/runs/repository'
 import { createAgentGateway } from '../../src/main/agent/runtime'
 import { ToolRegistry } from '../../src/main/tools/registry'
 import { registerOpsTools } from '../../src/main/tools/definitions'
@@ -110,7 +110,8 @@ it('成功返回时业务、回执和冻结参数已经存在于磁盘', async (
   const clock = fixedClock('2026-09-30T01:00:00.000Z')
   const registry = new ToolRegistry()
   registerOpsTools(registry)
-  const gateway = createAgentGateway({ db, registry, clock, persistCoordinator: createPersistenceCoordinator(db) })
+  const gateway = createAgentGateway({ db, registry, clock, persistCoordinator: createPersistenceCoordinator(db),
+    onObservation: record => { appendTraceEvent(db, { runId: record.runId, eventType: 'tool_call', payload: { ...record } }) } })
   const run = createRun(db, { mode: 'personal_ops', input: '创建待办', contextClock: clock.now().toISOString() })
   const args = { title: '磁盘可见' }
   const p = gateway.propose({ runId: run.runId, tool: 'todo.create', arguments: args, planVersion: 1 })
@@ -123,6 +124,7 @@ it('成功返回时业务、回执和冻结参数已经存在于磁盘', async (
   expect(disk.all('SELECT * FROM todos')).toHaveLength(1)
   expect(disk.all('SELECT * FROM operation_receipts')).toHaveLength(1)
   expect(JSON.parse(getApproval(disk, p.approvalId!)!.argumentsJson!)).toEqual(args)
+  expect(listTraceEvents(disk, run.runId).some(event => event.payload.phase === 'persistence' && event.payload.outcome === 'success')).toBe(true)
   disk.close()
   db.close()
 
@@ -131,6 +133,37 @@ it('成功返回时业务、回执和冻结参数已经存在于磁盘', async (
   await again.execute(call)
   expect(reopened.all('SELECT * FROM todos')).toHaveLength(1)
   reopened.close()
+})
+
+it('最终观察保存失败保留已落盘业务回执，同 ID 重试只重放', async () => {
+  const t = await makeFaultyDb()
+  initWorkspaceEpoch()
+  const registry = makeRegistry()
+  const gateway = createAgentGateway({ db: t.db, registry, clock: fixedClock(NOW), persistCoordinator: createPersistenceCoordinator(t.db),
+    onObservation: record => { appendTraceEvent(t.db, { runId: record.runId, eventType: 'tool_call', payload: { ...record } }) } })
+  const run = createRun(t.db, { mode: 'personal_ops', input: '最终观察故障', contextClock: NOW })
+  const args = { title: '首轮已保存' }
+  const proposal = gateway.propose({ runId: run.runId, tool: 'todo.create', arguments: args, planVersion: 1 })
+  decideApproval(t.db, proposal.approvalId!, 'approved')
+  const call = { runId: run.runId, tool: 'todo.create', arguments: args, planVersion: 1, callIndex: 0, approvalId: proposal.approvalId }
+  t.armWriteFailure(1)
+  await expect(gateway.execute(call)).rejects.toMatchObject({ appError: { code: 'PERSIST_FAILED', operationId: `${run.runId}:todo.create:0` } })
+  const disk = await reopen(t.dbPath)
+  expect(disk.all('SELECT * FROM todos')).toHaveLength(1)
+  expect(disk.all('SELECT * FROM operation_receipts')).toHaveLength(1)
+  expect((await gateway.execute(call)).ok).toBe(true)
+  expect(t.db.all('SELECT * FROM todos')).toHaveLength(1)
+})
+
+it('观察器抛错只调用一次并明确 OBSERVATION_FAILED，业务事务回滚', async () => {
+  const t = await makeFaultyDb()
+  initWorkspaceEpoch()
+  const observe = vi.fn(() => { throw new Error('无法写观察') })
+  const gateway = createAgentGateway({ db: t.db, registry: makeRegistry(), clock: fixedClock(NOW), persistCoordinator: createPersistenceCoordinator(t.db), onObservation: observe })
+  const run = createRun(t.db, { mode: 'personal_ops', input: '观察失败', contextClock: NOW })
+  await expect(gateway.execute({ runId: run.runId, tool: 'todo.list', arguments: {}, planVersion: 1, callIndex: 0 })).rejects.toMatchObject({ appError: { code: 'OBSERVATION_FAILED' } })
+  expect(observe).toHaveBeenCalledTimes(1)
+  expect(t.db.all('SELECT * FROM operation_receipts')).toHaveLength(0)
 })
 
 // ---------- 2. 保存故障:PERSIST_FAILED 与回执重放 ----------

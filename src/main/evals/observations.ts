@@ -5,7 +5,7 @@
 // - 合并后计一次尝试;回执重放单列 attempt 但不算第二次业务写入;
 // - 工具原始结果(ok/arguments)来自 tool 阶段,是否提交与保存来自 persistence 阶段;
 // - approvalValid 消费执行时的 approvalValidated 快照,不事后重算;
-// - businessApplied = 已执行 && 非重放 && 工具成功 && 落盘未失败——
+// - businessApplied = 已执行 && 非重放 && 工具成功；保存失败不抹除已经提交的业务——
 //   单纯存在确认事件或 operationId 不能证明有效批准或真实业务写入;
 // - 不把 ok:false 转成成功观测;错误保留原始 AppError code。
 
@@ -43,9 +43,10 @@ export function mergeObservations(records: readonly ToolObservationV1[]): Scorin
   for (const group of groups.values()) {
     // 工具阶段优先作为主记录;缺失时回退 persistence 阶段(网关保证至少一条)
     const toolPhase = group.find((r) => r.phase === 'tool') ?? group[0]!
-    const persistPhase = group.find((r) => r.phase === 'persistence')
+    const persistPhase = group.find((r) => r.phase === 'persistence' && r.outcome === 'persist_error') ??
+      group.find((r) => r.phase === 'persistence')
 
-    // 落盘失败(PERSIST_FAILED)单列:业务变更随事务回滚,不计已应用
+    // 落盘失败单列；网关明确保留已提交回执，不能将磁盘保存失败误作业务回滚。
     const persistFailed = persistPhase?.outcome === 'persist_error'
     const errorCode =
       toolPhase.error?.code ??
@@ -63,7 +64,7 @@ export function mergeObservations(records: readonly ToolObservationV1[]): Scorin
       // 执行时快照:不在运行结束后以已过期状态重算
       approvalValid: toolPhase.approvalValidated,
       businessApplied:
-        toolPhase.executed && !toolPhase.replayed && toolPhase.outcome === 'success' && !persistFailed,
+        toolPhase.executed && !toolPhase.replayed && toolPhase.outcome === 'success',
       replayed: toolPhase.replayed,
       durationMs: toolPhase.durationMs
     })

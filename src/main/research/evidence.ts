@@ -337,10 +337,11 @@ export async function reviewClaims(db: SqliteDb, runId: string, completer: Struc
     })
     data = result.data
   } catch (err) {
-    // RES-01:取消与预算/时限耗尽必须穿过异常兜底重新抛出,不得按候选处理吞掉;
+    // 取消、观测失败与预算/时限耗尽必须原样传播,不得按候选处理吞掉。
     // 其余模型调用失败(异常):本次候选全部按候选处理,不升级
     if (isBudgetExhaustedError(err)) throw err
     if (err instanceof ModelRequestError && err.code === 'CANCELLED') throw err
+    if (err instanceof ModelRequestError && err.code === 'OBSERVATION_FAILED') throw err
     if (options.control?.signal.aborted) throw err
     outcome.invalidOutputClaimIds = [...allowed]
     return outcome

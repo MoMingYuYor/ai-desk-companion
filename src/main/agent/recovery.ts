@@ -16,6 +16,7 @@
 import type { SqliteDb } from '../db/connection'
 import { listRunsByStatuses, transitionRun, expireUnexecutedApprovals, type AgentRunRecord } from '../runs/repository'
 import { SLOT_HOLDING_STATUSES } from './runQueue'
+import { getResearchTaskByRun, updateResearchTaskPhase } from '../research/repository'
 
 /** 进程中断的错误码,与总体规格的 WORKER_INTERRUPTED 一致 */
 export const WORKER_INTERRUPTED = 'WORKER_INTERRUPTED'
@@ -32,6 +33,10 @@ export function recoverInterruptedRuns(
   const recovered: AgentRunRecord[] = []
   for (const run of interrupted) {
     recovered.push(transitionRun(db, run.runId, 'failed', { errorCode }))
+    if (run.mode === 'research') {
+      const task = getResearchTaskByRun(db, run.runId)
+      if (task) updateResearchTaskPhase(db, task.researchTaskId, 'failed')
+    }
     // 未执行审批随运行失败一并过期(已提交回执的审批保持原决定,回执不重写)
     expireUnexecutedApprovals(db, run.runId)
   }

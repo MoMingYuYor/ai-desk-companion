@@ -20,6 +20,8 @@ import type { SqliteDb } from '../db/connection'
 import { listApprovals, listRunsByStatus, listTraceEvents, isApprovalExecuted, type AgentRunRecord } from '../runs/repository'
 import type { RunMode } from '../../shared/agent'
 import type { RunQueue } from './runQueue'
+import { OperationError } from '../db/operations'
+import { appError } from '../../shared/operations'
 
 export type DispatchIntent = { kind: 'plan' } | { kind: 'approved'; approvalId: string }
 
@@ -38,6 +40,14 @@ interface DispatchItem {
 interface ActiveDriver {
   runId: string
   controller: AbortController
+  settled: Promise<void>
+  epoch: string | undefined
+}
+
+export interface RunSchedulerOptions {
+  /** 生产组合传入当前 workspace epoch；独立调度测试可只依赖对象身份。 */
+  workspaceEpoch?: () => string
+  onDriverError?: (runId: string, error: unknown) => Promise<void>
 }
 
 export class RunScheduler {
@@ -46,10 +56,13 @@ export class RunScheduler {
   private active: ActiveDriver | null = null
   /** 合并唤醒标记:已有待执行微任务时忽略后续 request */
   private scheduled = false
+  private pauses = 0
+  private faulted = false
 
   constructor(
     private readonly db: SqliteDb,
-    private readonly queue: RunQueue
+    private readonly queue: RunQueue,
+    private readonly options: RunSchedulerOptions = {}
   ) {}
 
   /** 按 mode 注册驱动;重复注册视为接线错误抛错 */
@@ -82,11 +95,45 @@ export class RunScheduler {
     return this.active ? { runId: this.active.runId, signal: this.active.controller.signal } : null
   }
 
+  /** 暂停先于 await 生效；必须等包括 finally 在内的旧驱动退出后才能替换数据库。 */
+  async quiesceForRestore(cancelActive: (runId: string) => void, timeoutMs = 5000): Promise<() => void> {
+    this.pauses++
+    let resumed = false
+    const resume = (): void => {
+      if (resumed) return
+      resumed = true
+      this.pauses--
+      this.request()
+    }
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      const active = this.active
+      if (active) {
+        active.controller.abort()
+        cancelActive(active.runId)
+        await Promise.race([
+          active.settled,
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(() => reject(new OperationError(
+              appError('BUSY', '恢复中止：Agent 驱动排空超时，未替换数据', { retryable: true })
+            )), timeoutMs)
+          })
+        ])
+      }
+      return resume
+    } catch (error) {
+      resume()
+      throw error
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout)
+    }
+  }
+
   // ---------- 派发 ----------
 
   private dispatch(): void {
     // 内存占用:旧异步驱动尚未退出,不得叠加第二个驱动(由其 finally 重新唤醒)
-    if (this.active) return
+    if (this.faulted || this.pauses > 0 || this.active) return
     // 数据库占用:仍有 planning/executing 运行时不派发(双保险;正常路径驱动
     // 已在等待人工/终态时退出,不会同时持有状态与在途 Promise)
     if (this.queue.isBusy()) return
@@ -97,19 +144,34 @@ export class RunScheduler {
     const driver = this.drivers.get(item.mode)
     if (!driver) return
     const controller = new AbortController()
-    this.active = { runId: item.runId, controller }
-    void Promise.resolve()
+    const active: ActiveDriver = {
+      runId: item.runId, controller, epoch: this.options.workspaceEpoch?.(), settled: Promise.resolve()
+    }
+    this.active = active
+    const ownsSlot = (): boolean => this.active === active &&
+      this.options.workspaceEpoch?.() === active.epoch
+    active.settled = Promise.resolve()
       .then(() => driver(item.runId, item.intent, controller.signal))
-      .catch((err: unknown) => {
+      .catch(async (err: unknown) => {
+        if (!ownsSlot()) return
         console.error(
           '[run-scheduler] 驱动异常:',
           err instanceof Error ? err.message : String(err)
         )
+        try {
+          if (!this.options.onDriverError) throw new Error('未接线驱动错误收尾')
+          await this.options.onDriverError(item.runId, err)
+        } catch (cleanupError) {
+          this.faulted = true
+          console.error('[run-scheduler] 错误收尾失败，已暂停派发:', cleanupError)
+        }
       })
       .finally(() => {
         // 到 finally 才释放驱动;释放后合并唤醒挑选下一就绪项
-        if (this.active?.runId === item.runId) this.active = null
-        this.request()
+        if (ownsSlot()) {
+          this.active = null
+          this.request()
+        }
       })
   }
 

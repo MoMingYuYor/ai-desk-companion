@@ -6,6 +6,7 @@ export type ErrorCode =
   | 'FORBIDDEN'
   | 'CONFLICT'
   | 'PERSIST_FAILED'
+  | 'OBSERVATION_FAILED'
   | 'BACKUP_INVALID'
   | 'AUTH_REQUIRED'
   | 'NETWORK'

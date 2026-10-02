@@ -8,7 +8,8 @@
 import type { SqliteDb } from '../db/connection'
 import { uid } from '../db/dao'
 import { nowTimestamp } from '../../shared/dateUtils'
-import { getOperationReceipt } from '../db/operations'
+import { getOperationReceipt, OperationError } from '../db/operations'
+import { appError } from '../../shared/operations'
 import {
   isRunMode,
   isRunStatus,
@@ -537,4 +538,32 @@ export function expireUnexecutedApprovals(db: SqliteDb, runId: string, now: stri
     expired += 1
   }
   return expired
+}
+
+/** 跨审批重新汇总真实回执；重复观察、保存阶段和回执重放均只计一次业务结果。 */
+export function summarizeRunToolResults(db: SqliteDb, runId: string): { executed: number; failed: number } {
+  const results = new Map<string, boolean>()
+  const prefix = `${runId}:`
+  const receipts = db.all<{ operation_id: string; result_ref: string }>(
+    'SELECT operation_id, result_ref FROM operation_receipts WHERE substr(operation_id, 1, ?) = ?',
+    [prefix.length, prefix]
+  )
+  for (const receipt of receipts) {
+    let value: unknown
+    try { value = JSON.parse(receipt.result_ref) } catch { value = null }
+    const parsed = value as { kind?: unknown; value?: { ok?: unknown } } | null
+    if (parsed?.kind !== 'json' || typeof parsed.value?.ok !== 'boolean') {
+      throw new OperationError(appError('VALIDATION', '工具回执结果损坏，无法确认运行结果'))
+    }
+    results.set(receipt.operation_id, parsed.value.ok)
+  }
+  for (const event of listTraceEvents(db, runId)) {
+    if (event.eventType !== 'tool_call') continue
+    const record = event.payload as { operationId?: unknown; phase?: unknown; outcome?: unknown }
+    if (typeof record.operationId !== 'string' || results.has(record.operationId)) continue
+    if (record.phase === 'tool' && (record.outcome === 'gateway_error' || record.outcome === 'business_error')) {
+      results.set(record.operationId, false)
+    }
+  }
+  return { executed: results.size, failed: [...results.values()].filter(ok => !ok).length }
 }

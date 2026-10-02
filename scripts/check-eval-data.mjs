@@ -20,10 +20,12 @@
 // 产冻结证据;规范化实现为只读复刻,漂移由 tests/evals/dataset.test.ts 的交叉核对用例兜底。
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
+import { projectRecordRanges, validateConclusion, validateGoldEvidence } from './lib/eval-data-validation.mjs'
 
 const ROOT = process.cwd()
-const OPS_DIR = join(ROOT, 'evals', 'datasets', 'personal_ops_v1')
+const opsDirArg = process.argv.indexOf('--ops-dir')
+const OPS_DIR = opsDirArg >= 0 ? resolve(ROOT, process.argv[opsDirArg + 1]) : join(ROOT, 'evals', 'datasets', 'personal_ops_v2')
 const RES_DIR = join(ROOT, 'evals', 'datasets', 'research_v1')
 const RES_FIXTURES = join(ROOT, 'fixtures', 'research')
 
@@ -325,7 +327,7 @@ function verifyEvidence(fixtureId, e, normText, fail) {
 }
 
 function checkResearchCases(ds, corpus) {
-  const coord = { evidence_total: 0, hash_match: 0, slice_match: 0, unique_hit: 0, failures: [] }
+  const coord = { evidence_total: 0, hash_match: 0, slice_match: 0, unique_hit: 0, record_ownership_matches: 0, record_map: [], failures: [] }
   let pgCrossSplit = []
   const pgToSplits = new Map()
   const fail = (msg) => coord.failures.push(msg)
@@ -379,19 +381,29 @@ function checkResearchCases(ds, corpus) {
     }
 
     // 坐标重放
-    for (const cl of g.gold_claims) {
-      for (const set of cl.acceptable_evidence_sets) {
-        for (const e of set) {
+    for (const [claimIndex, cl] of g.gold_claims.entries()) {
+      for (const [setIndex, set] of cl.acceptable_evidence_sets.entries()) {
+        for (const [evidenceIndex, e] of set.entries()) {
           coord.evidence_total += 1
           check(`research.${id}.relation_valid`, e.relation === 'supports' || e.relation === 'contradicts', `relation=${e.relation}`)
-          const norm = corpus.get(`${c.fixture_id}/${e.snapshot_id.split('/')[1]}`)?.norm
-          if (norm === undefined) { fail(`语料未装载:${e.snapshot_id}`); continue }
+          const source = corpus.get(e.snapshot_id)
+          const norm = source?.norm
+          const mapping = { case_id: id, category: c.category, split: c.split, claim_id: cl.gold_claim_id,
+            claim_index: claimIndex, set_index: setIndex, evidence_index: evidenceIndex,
+            snapshot_id: e.snapshot_id, start_offset: e.start_offset, end_offset: e.end_offset, gold_text_sha256: e.text_sha256 }
+          if (norm === undefined) { fail(`语料未装载:${e.snapshot_id}`); coord.record_map.push({ ...mapping, status: 'fail', reason: '语料未装载' }); continue }
           const r = verifyEvidence(c.fixture_id, e, norm, fail)
           if (r) {
             if (r.hashOk) coord.hash_match += 1
             if (r.sliceOk) coord.slice_match += 1
             if (r.uniqueHit) coord.unique_hit += 1
           }
+          const ownership = validateGoldEvidence(source.projected, e)
+          const owned = ownership.ok && e.snapshot_id.split('/')[0] === c.fixture_id
+          if (owned) coord.record_ownership_matches += 1
+          else fail(`${id}/claim:${claimIndex}/set:${setIndex}/evidence:${evidenceIndex}:${ownership.reason ?? 'snapshot fixture 不匹配'}`)
+          coord.record_map.push({ ...mapping, status: owned ? 'pass' : 'fail', source_locator: ownership.sourceLocator,
+            computed_text_sha256: ownership.textSha256, containing_records: ownership.containingRecords, reason: ownership.reason })
         }
       }
     }
@@ -431,14 +443,17 @@ function checkResearchCorpus(ds) {
       if (a.equals(b)) byteIdentical += 1
       else failures.push(`fixtures 与 snapshots 副本不一致:${c.fixture_id}/${f}`)
       const entry = snapManifest.entries.find((e) => e.file === f)
-      const norm = canonOf(a, f)
+      const sourceType = f.endsWith('.json') ? 'json' : f.endsWith('.csv') ? 'csv' : f.endsWith('.md') ? 'markdown' : 'txt'
+      const projected = projectRecordRanges(sourceType, decodeBytes(a))
+      const norm = projected.normalizedText
+      if (norm !== canonOf(a, f)) failures.push(`记录投影与规范全文重放不一致:${c.fixture_id}/${f}`)
       if (entry) {
         if (entry.raw_sha256 !== sha256Hex(a)) failures.push(`raw_sha256 不一致:${c.fixture_id}/${f}`)
         if (entry.text_sha256 !== sha256Hex(Buffer.from(norm, 'utf8'))) failures.push(`text_sha256 不一致:${c.fixture_id}/${f}`)
       } else failures.push(`快照清单缺文件:${c.fixture_id}/${f}`)
       const key = `${c.fixture_id}/${f}`
-      corpus.set(key, { norm, fixture: c.fixture_id, caseId: c.case_id, split: c.split })
-      rawHashIndex.set(sha256Hex(a), [...(rawHashIndex.get(key) ?? []), { key }])
+      corpus.set(key, { norm, projected, fixture: c.fixture_id, caseId: c.case_id, split: c.split })
+      rawHashIndex.set(sha256Hex(a), [...(rawHashIndex.get(sha256Hex(a)) ?? []), { key }])
       // URL 归一化索引
       const rawText = a.toString('utf8')
       for (const u of rawText.match(/https?:\/\/[^\s)"\]]+/g) ?? []) {
@@ -563,6 +578,9 @@ function main() {
   const opsChecks = checkOpsCases(ops)
   const resCorpus = checkResearchCorpus(res)
   const resCoord = checkResearchCases(res, resCorpus.corpus)
+  check('research.gold_record_ownership', resCoord.failures.length === 0 && resCoord.record_ownership_matches === resCoord.evidence_total,
+    `${resCoord.record_ownership_matches}/${resCoord.evidence_total} 条 gold 证据唯一归属记录;${resCoord.failures.join('; ')}`)
+  const datasetHashes = { [ops.manifest.dataset_version]: treeSha256(ops.dir), [res.manifest.dataset_version]: treeSha256(res.dir) }
 
   // 跨 split 检查:规范化输入、语料规范文本 hash、raw source identity、URL 归一化
   const crossSplit = {}
@@ -615,7 +633,7 @@ function main() {
   const groups = [
     ['research_corpus_vs_corpus', corpusUnitsForDup],
     ['research_input_vs_input', inputUnits(res, 'research_v1')],
-    ['ops_input_vs_input', inputUnits(ops, 'personal_ops_v1')]
+    ['ops_input_vs_input', inputUnits(ops, ops.manifest.dataset_version)]
   ]
   for (const [groupName, units] of groups) {
     const r = screenPairs(units, NEAR_DUP_THRESHOLD)
@@ -638,22 +656,26 @@ function main() {
     conclusions = raw.conclusions ?? {}
   }
   const missingConclusions = []
+  const invalidConclusions = []
   let leakPairs = []
   for (const cand of nearDup.candidates) {
     const c = conclusions[cand.pair_key]
-    if (!c) { missingConclusions.push(cand.pair_key); continue }
+    if (c === undefined) { missingConclusions.push(cand.pair_key); continue }
+    if (!validateConclusion(cand, c, datasetHashes[cand.dataset])) { invalidConclusions.push(cand.pair_key); continue }
     cand.conclusion = c
     if (c.verdict === 'leak') leakPairs.push(cand.pair_key)
   }
   nearDup.conclusion_coverage = {
     candidates: nearDup.candidates.length,
-    concluded: nearDup.candidates.length - missingConclusions.length,
+    concluded: nearDup.candidates.length - missingConclusions.length - invalidConclusions.length,
     missing: missingConclusions,
+    invalid: invalidConclusions,
+    stale: Object.keys(conclusions).filter((key) => !nearDup.candidates.some((c) => c.pair_key === key)).sort(),
     leak_pairs: leakPairs
   }
-  check('near_duplicate.manual_conclusions', missingConclusions.length === 0,
-    missingConclusions.length ? `候选缺人工结论:${missingConclusions.join('; ')}` : `全部 ${nearDup.candidates.length} 个候选均有逐对人工结论`)
-  check('near_duplicate.no_leak', leakPairs.length === 0, leakPairs.length ? `判定泄漏:${leakPairs.join('; ')}` : '人工复核未发现跨 split 泄漏')
+  check('near_duplicate.manual_conclusions', missingConclusions.length === 0 && invalidConclusions.length === 0,
+    missingConclusions.length || invalidConclusions.length ? `候选缺有效绑定结论:missing=${missingConclusions.join('; ')},invalid=${invalidConclusions.join('; ')}` : `全部 ${nearDup.candidates.length} 个候选均有有效绑定结论`)
+  check('near_duplicate.no_leak', leakPairs.length === 0, leakPairs.length ? `判定泄漏:${leakPairs.join('; ')}` : '有效绑定结论未报告泄漏;审查者性质及独立复核另行记录')
 
   // 诚实不足语义
   const honestMachine = [{
@@ -669,18 +691,22 @@ function main() {
   const failed = checks.filter((c) => c.status === 'fail').map((c) => c.id)
   const status = failed.length === 0 ? 'pass' : (missingConclusions.length > 0 && failed.every((f) => f === 'near_duplicate.manual_conclusions') ? 'pending-manual-conclusions' : 'fail')
   const review = {
-    schema_version: 'dataset-review.v1',
+    schema_version: 'dataset-review.v2',
     generated_at: new Date().toISOString(),
     generator: { script: 'scripts/check-eval-data.mjs', node: process.version, rubric: GOLD_GUIDELINE_VERSION, claim_types: [...CLAIM_TYPES] },
     conclusions_file: conclusionsFile,
     status,
+    review_scope: 'machine-only',
+    freeze_eligible: false,
     datasets: {
-      personal_ops_v1: {
+      [ops.manifest.dataset_version]: {
+        path: ops.dir,
         counts: { total: ops.cases.length, dev: ops.cases.filter((c) => c.split === 'dev').length, holdout: ops.cases.filter((c) => c.split === 'holdout').length, categories: opsStats },
         hashes: {
           cases_jsonl_sha256: sha256Hex(Buffer.from(ops.casesText, 'utf8')),
           manifest_cases_sha256: ops.manifest.cases_sha256,
           manifest_json_sha256: sha256Hex(readFileSync(join(ops.dir, 'manifest.json')))
+          , dataset_tree_sha256: datasetHashes[ops.manifest.dataset_version]
         },
         terminal_status: ops.cases.reduce((acc, c) => { acc[c.expected.terminal_status] = (acc[c.expected.terminal_status] ?? 0) + 1; return acc }, {}),
         ops_checks: opsChecks,
@@ -688,6 +714,7 @@ function main() {
         cross_split: crossSplit
       },
       research_v1: {
+        path: res.dir,
         counts: { total: res.cases.length, dev: res.cases.filter((c) => c.split === 'dev').length, holdout: res.cases.filter((c) => c.split === 'holdout').length, categories: resStats },
         hashes: {
           cases_jsonl_sha256: sha256Hex(Buffer.from(res.casesText, 'utf8')),
@@ -697,6 +724,7 @@ function main() {
           snapshots_tree_sha256: treeSha256(join(res.dir, 'snapshots')),
           fixtures_tree_sha256: treeSha256(RES_FIXTURES),
           fixtures_tree_note: 'fixtures/research 全目录(含 demo/ 演示语料,亦属冻结范围)'
+          , dataset_tree_sha256: datasetHashes[res.manifest.dataset_version]
         },
         terminal_status: res.cases.reduce((acc, c) => { acc[c.expected.terminal_status] = (acc[c.expected.terminal_status] ?? 0) + 1; return acc }, {}),
         coordinate_check: resCoord,

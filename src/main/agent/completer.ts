@@ -13,6 +13,7 @@ import { ModelRequestError, nullTokenUsage, type ModelRequestControl } from '../
 import { appError } from '../../shared/operations'
 import { systemClock, type Clock } from '../../shared/clock'
 import type { TokenUsage } from '../../shared/agent'
+import type { ProviderInfo } from '../../shared/types'
 import type {
   StructuredCompleteRequest,
   StructuredCompleteResult,
@@ -41,8 +42,7 @@ export function extractJson(text: string): unknown {
   }
 }
 
-export interface ModelCompleterDeps {
-  db: SqliteDb
+export type ModelCompleterDeps = ({ db: SqliteDb; providers?: never } | { providers: () => ProviderInfo[]; db?: never }) & {
   router: ModelRouter
   clock?: Clock
   /** 单次请求超时(毫秒);缺省 control 时的默认超时仍取本配置 */
@@ -53,7 +53,7 @@ export class ModelCompleter implements StructuredCompleter {
   constructor(private readonly deps: ModelCompleterDeps) {}
 
   async completeJson<T>(request: StructuredCompleteRequest): Promise<StructuredCompleteResult<T>> {
-    const providers = listProviders(this.deps.db)
+    const providers = this.deps.providers ? this.deps.providers() : listProviders(this.deps.db)
     if (providers.length === 0) {
       throw new ModelOutputError('未配置模型服务商')
     }

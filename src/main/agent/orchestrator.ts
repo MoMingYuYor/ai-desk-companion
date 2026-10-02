@@ -59,6 +59,7 @@ import {
   readApprovalCallIndex,
   appendCallIndexMapping,
   expireUnexecutedApprovals,
+  summarizeRunToolResults,
   type AgentRunRecord,
   type Approval
 } from '../runs/repository'
@@ -706,6 +707,11 @@ export class RunOrchestrator {
           callIndex
         })
       } catch (err) {
+        if (err instanceof OperationError && (err.appError.code === 'OBSERVATION_FAILED' || err.appError.code === 'PERSIST_FAILED')) {
+          try { this.failRun(runId, err.appError.code, err.message) }
+          catch { console.error('[agent] 基础设施失败留痕未确认') }
+          throw err
+        }
         // 网关级拒绝(如参数校验)按失败读取继续,让重规划看到真实错误
         result = {
           ok: false,
@@ -783,6 +789,7 @@ export class RunOrchestrator {
 
   /** 收尾:全部成功 → succeeded;存在工具级失败 → partial(保留已完成影响) */
   private finishRun(runId: string, failedSteps: number): void {
+    failedSteps = Math.max(failedSteps, summarizeRunToolResults(this.deps.db, runId).failed)
     transitionRun(this.deps.db, runId, failedSteps > 0 ? 'partial' : 'succeeded', {
       resultRef: JSON.stringify({ failedSteps })
     })
@@ -1049,12 +1056,12 @@ export class RunOrchestrator {
       // 网关级拒绝(如目标版本变化,OPS-06)→ 运行失败
       failed += 1
       const message = err instanceof Error ? err.message : String(err)
-      this.failRun(run.runId, 'CONFLICT', message)
+      this.failRun(run.runId, err instanceof OperationError ? err.appError.code : 'CONFLICT', message)
       return { already: false }
     }
 
     // 其余待批/已批准未执行提案:仍在等待 → 回到 awaiting_confirmation;全部已决 → 收尾
-    expireStaleApprovals(this.deps.db, new Date().toISOString())
+    expireStaleApprovals(this.deps.db, this.clock.now().toISOString())
     const remaining = this.pendingCount(run.runId)
     const remainingApproved = listApprovals(this.deps.db, run.runId).filter(
       (a) => a.decision === 'approved' && !isApprovalExecuted(this.deps.db, run.runId, a)
@@ -1182,7 +1189,7 @@ export class RunOrchestrator {
     const run = getRun(this.deps.db, runId)
     if (!run) throw new OperationError(appError('VALIDATION', `运行不存在:${runId}`, { retryable: false }))
     const updated = transitionRun(this.deps.db, runId, 'cancelled', { errorCode: 'CANCELLED' })
-    expireStaleApprovals(this.deps.db, new Date().toISOString())
+    expireStaleApprovals(this.deps.db, this.clock.now().toISOString())
     this.deps.db.run(
       "UPDATE approvals SET decision = 'expired' WHERE run_id = ? AND decision = 'pending'",
       [runId]

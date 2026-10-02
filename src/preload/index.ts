@@ -192,6 +192,7 @@ const api: RendererApi = {
   // evals(EVAL-05):取消 / 配置发现 / case 产物查询 / 人工审阅读写
   cancelEvalRun: invoke(Channels.EvalCancelRun),
   listEvalConfigs: invoke(Channels.EvalListConfigs),
+  freezeEvalExperiment: invoke(Channels.EvalFreeze),
   getEvalCaseArtifacts: invoke(Channels.EvalCaseArtifacts),
   saveEvalReview: invoke(Channels.EvalReviewSave),
   getEvalReviewOverview: invoke(Channels.EvalReviewList),

@@ -20,6 +20,7 @@ import {
   getApproval,
   getRun,
   listTraceEvents,
+  listApprovals,
   transitionRun
 } from '../../src/main/runs/repository'
 import { RunQueue } from '../../src/main/agent/runQueue'
@@ -31,12 +32,120 @@ import { ToolGateway } from '../../src/main/tools/gateway'
 import { ToolRegistry } from '../../src/main/tools/registry'
 import { registerOpsTools } from '../../src/main/tools/definitions'
 import type { StructuredCompleteRequest } from '../../src/main/agent/llm'
+import { fixedClock, type Clock } from '../../src/shared/clock'
+import { appError } from '../../src/shared/operations'
 
 const NOW = '2026-09-30T01:00:00.000Z'
+
+it('读取观察保存失败立即终止，第二个读取和后续规划均不执行', async () => {
+  const db = await makeTestDb()
+  initWorkspaceEpoch()
+  const registry = new ToolRegistry()
+  const reads = [vi.fn(() => ({ ok: true as const, data: [] })), vi.fn(() => ({ ok: true as const, data: [] }))]
+  for (let i = 0; i < 2; i++) registry.register({ name: `test.read${i}`, description: '合成读取', riskLevel: 'read', timeoutMs: 1000,
+    retryable: false, inputSchema: { fields: [] }, execute: reads[i]! })
+  const gateway = new ToolGateway({ db, registry, clock: fixedClock(NOW), persistCoordinator: createPersistenceCoordinator(db),
+    onObservation: record => { if (record.phase === 'tool') throw new Error('观察存储故障') } })
+  const queue = new RunQueue(db)
+  const scheduler = new RunScheduler(db, queue, { onDriverError: async () => { db.flush() } })
+  const completer = new FakeProvider({ responses: [planOf([{ tool: 'test.read0', arguments: {} }, { tool: 'test.read1', arguments: {} }], { continue_after_read: true })] })
+  const complete = vi.spyOn(completer, 'completeJson')
+  const orchestrator = new RunOrchestrator({ db, registry, gateway, queue, scheduler, clock: fixedClock(NOW), completer })
+  scheduler.register('personal_ops', orchestrator.asRunDriver())
+  const run = orchestrator.createQueuedRun({ mode: 'personal_ops', input: '两次读取' })
+  scheduler.request()
+  await vi.waitFor(() => expect(getRun(db, run.runId)?.status).toBe('failed'))
+  expect(getRun(db, run.runId)?.errorCode).toBe('OBSERVATION_FAILED')
+  expect(reads[0]).toHaveBeenCalledTimes(1)
+  expect(reads[1]).not.toHaveBeenCalled()
+  expect(complete).toHaveBeenCalledTimes(1)
+})
+
+it.each([[false, true], [true, false], [true, true], [false, false]])(
+  '分次审批结果 %s/%s 的终态保留全部历史业务结果', async (first, second) => {
+    const db = await makeTestDb()
+    initWorkspaceEpoch()
+    const registry = new ToolRegistry()
+    for (const [i, ok] of [first, second].entries()) registry.register({
+      name: `test.write${i}`, description: '合成审批结果', riskLevel: 'reversible_write', timeoutMs: 1000,
+      retryable: false, inputSchema: { fields: [] },
+      execute: () => ok ? { ok: true, data: null } : { ok: false, error: appError('VALIDATION', '业务拒绝') }
+    })
+    const gateway = new ToolGateway({ db, registry, clock: fixedClock(NOW), persistCoordinator: createPersistenceCoordinator(db) })
+    const queue = new RunQueue(db)
+    const scheduler = new RunScheduler(db, queue)
+    const orchestrator = new RunOrchestrator({ db, registry, gateway, queue, scheduler, clock: fixedClock(NOW),
+      completer: new FakeProvider({ responses: [planOf([{ tool: 'test.write0', arguments: {} }, { tool: 'test.write1', arguments: {} }])] }) })
+    scheduler.register('personal_ops', orchestrator.asRunDriver())
+    const run = orchestrator.createQueuedRun({ mode: 'personal_ops', input: '两次审批' })
+    scheduler.request()
+    await vi.waitFor(() => expect(getRun(db, run.runId)?.status).toBe('awaiting_confirmation'))
+    const approvals = listApprovals(db, run.runId)
+    await orchestrator.decide(approvals[0]!.approvalId, 'approved')
+    await vi.waitFor(() => expect(getRun(db, run.runId)?.status).toBe('awaiting_confirmation'))
+    await orchestrator.decide(approvals[1]!.approvalId, 'approved')
+    await vi.waitFor(() => expect(getRun(db, run.runId)?.status).toBe(first && second ? 'succeeded' : 'partial'))
+    expect(JSON.parse(getRun(db, run.runId)!.resultRef!)).toEqual({ failedSteps: Number(!first) + Number(!second) })
+    await orchestrator.decide(approvals[0]!.approvalId, 'approved')
+    expect(db.all('SELECT * FROM operation_receipts')).toHaveLength(2)
+  }
+)
+
+it('驱动抛错经错误收尾持久化后接力，收尾失败则暂停派发', async () => {
+  const db = await makeTestDb()
+  const queue = new RunQueue(db)
+  const finished = vi.fn(async (id: string) => { transitionRun(db, id, 'failed', { errorCode: 'DRIVER_FAILED' }); db.flush() })
+  const scheduler = new RunScheduler(db, queue, { onDriverError: finished })
+  const a = createRun(db, { mode: 'personal_ops', input: 'A', contextClock: NOW })
+  const b = createRun(db, { mode: 'personal_ops', input: 'B', contextClock: NOW })
+  pinOrder(db, a.runId, b.runId)
+  scheduler.register('personal_ops', async id => { queue.tryStart(id); if (id === a.runId) throw new Error('驱动异常'); transitionRun(db, id, 'succeeded') })
+  scheduler.request()
+  await vi.waitFor(() => expect(getRun(db, b.runId)?.status).toBe('succeeded'))
+  expect(finished).toHaveBeenCalledTimes(1)
+  expect(getRun(db, a.runId)?.errorCode).toBe('DRIVER_FAILED')
+})
+
+it('错误收尾自身失败时停止接力，即使重复 request 也不重新派发', async () => {
+  const db = await makeTestDb()
+  const queue = new RunQueue(db)
+  const scheduler = new RunScheduler(db, queue, { onDriverError: async () => { throw new Error('保存失败') } })
+  const a = createRun(db, { mode: 'personal_ops', input: 'A', contextClock: NOW })
+  const b = createRun(db, { mode: 'personal_ops', input: 'B', contextClock: NOW })
+  pinOrder(db, a.runId, b.runId)
+  const driver = vi.fn(async () => { throw new Error('领取前驱动异常') })
+  scheduler.register('personal_ops', driver)
+  scheduler.request()
+  await vi.waitFor(() => expect(scheduler.currentDriver()).toBeNull())
+  scheduler.request()
+  await new Promise<void>(resolve => queueMicrotask(resolve))
+  expect(driver).toHaveBeenCalledTimes(1)
+  expect(getRun(db, b.runId)?.status).toBe('queued')
+})
 
 function planOf(steps: unknown[], over: Record<string, unknown> = {}): unknown {
   return { goal: '测试目标', steps, assumptions: [], ...over }
 }
+
+it.each([-1, 0, 1])('批准的到期边界偏移 %dms，只有到期前允许业务写入', async offset => {
+  let now = Date.parse(NOW)
+  const clock: Clock = { now: () => new Date(now), monotonicMs: () => performance.now() }
+  const h = await makeOpsHarness([planOf([{ tool: 'todo.create', arguments: { title: '边界任务' } }])], clock)
+  const run = h.orchestrator.createQueuedRun({ mode: 'personal_ops', input: '创建边界任务' })
+  h.scheduler.request()
+  await vi.waitFor(() => expect(getRun(h.db, run.runId)?.status).toBe('awaiting_confirmation'))
+  const approval = listApprovals(h.db, run.runId)[0]!
+  const before = h.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM todos')!.n
+  now = Date.parse(approval.expiresAt) + offset
+  if (offset < 0) {
+    await h.orchestrator.decide(approval.approvalId, 'approved')
+    await vi.waitFor(() => expect(getRun(h.db, run.runId)?.status).toBe('succeeded'))
+  } else {
+    await expect(h.orchestrator.decide(approval.approvalId, 'approved')).rejects.toThrow('过有效期')
+    expect(getRun(h.db, run.runId)?.status).toBe('awaiting_confirmation')
+  }
+  expect(h.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM todos')!.n - before).toBe(offset < 0 ? 1 : 0)
+})
 
 /** 固定两个运行的 started_at 次序:消除同毫秒创建的就绪时间平局 */
 function pinOrder(db: Awaited<ReturnType<typeof makeTestDb>>, first: string, second: string): void {
@@ -48,7 +157,8 @@ function pinOrder(db: Awaited<ReturnType<typeof makeTestDb>>, first: string, sec
 async function makeOpsHarness(
   responsesOrScript:
     | readonly unknown[]
-    | ((callIndex: number, request: StructuredCompleteRequest) => unknown)
+    | ((callIndex: number, request: StructuredCompleteRequest) => unknown),
+  clock: Clock = fixedClock(NOW)
 ): Promise<{
   db: Awaited<ReturnType<typeof makeTestDb>>
   queue: RunQueue
@@ -63,7 +173,7 @@ async function makeOpsHarness(
   const gateway = new ToolGateway({
     db,
     registry,
-    clock: { now: () => new Date(NOW), monotonicMs: () => performance.now() },
+    clock,
     persistCoordinator: createPersistenceCoordinator(db)
   })
   const queue = new RunQueue(db)
@@ -79,8 +189,9 @@ async function makeOpsHarness(
     gateway,
     queue,
     completer: provider,
-    scheduler
-  } as unknown as OrchestratorDeps)
+    scheduler,
+    clock
+  })
   // 组合层接线:scheduler.register('personal_ops', orchestrator.asRunDriver())
   scheduler.register('personal_ops', orchestrator.asRunDriver())
   return { db, queue, scheduler, orchestrator, provider }
@@ -96,6 +207,7 @@ it('取消竞态:旧驱动 settle 前保留占用,不派发下一个;取消后�
   const blocked = new Promise<void>(resolve => { settle = resolve })
   const a = createRun(db, { mode: 'personal_ops', input: 'A', contextClock: '2026-09-30T01:00:00Z' })
   const b = createRun(db, { mode: 'research', input: 'B', contextClock: '2026-09-30T01:00:00Z' })
+  pinOrder(db, a.runId, b.runId)
   scheduler.register('personal_ops', async id => { queue.tryStart(id); await blocked })
   const research = vi.fn(async (id: string) => { queue.tryStart(id); transitionRun(db, id, 'succeeded') })
   scheduler.register('research', research); scheduler.request()

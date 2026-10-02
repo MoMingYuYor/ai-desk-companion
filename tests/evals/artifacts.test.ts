@@ -1,7 +1,7 @@
 // EVAL-03 产物模块测试(artifacts.test.ts):pathGuard 防穿越、原子导出、
 // manifest 完整性(complete 最后写)、hash 篡改检测(不继续评分)。
 import { describe, expect, it } from 'vitest'
-import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -89,6 +89,31 @@ describe('EVAL-03 pathGuard:ID 只允许安全字符,解析后必须在批次根
 })
 
 describe('EVAL-03 导出与完整性:manifest 最后写,hash 齐全才可回放', () => {
+  it.each(['empty', 'duplicate', 'outside', 'null'] as const)('T16 manifest 文件表 %s 不能绕过完整性校验', (attack) => {
+    const dir = exportOnce(mkdtempSync(join(tmpdir(), 't16-manifest-')))
+    const file = join(dir, 'manifest.json')
+    const manifest = JSON.parse(readFileSync(file, 'utf8'))
+    if (attack === 'empty') manifest.files = []
+    if (attack === 'duplicate') manifest.files[1] = manifest.files[0]
+    if (attack === 'outside') manifest.files[0].name = '../run.json'
+    if (attack === 'null') manifest.files = null
+    writeFileSync(file, JSON.stringify(manifest), 'utf8')
+    const verified = verifyCaseArtifacts(dir)
+    expect(verified.ok).toBe(false)
+    expect(verified.manifestError).toMatch(/文件表/)
+    expect(() => loadCaseArtifacts(dir)).toThrow(ArtifactIntegrityError)
+  })
+
+  it('T16 未 complete 与缺内容文件均给出诊断，不能回放', () => {
+    const dir = exportOnce(mkdtempSync(join(tmpdir(), 't16-incomplete-')))
+    const file = join(dir, 'manifest.json')
+    const manifest = JSON.parse(readFileSync(file, 'utf8'))
+    writeFileSync(file, JSON.stringify({ ...manifest, complete: false }), 'utf8')
+    expect(() => loadCaseArtifacts(dir)).toThrow(/未完成/)
+    writeFileSync(file, JSON.stringify(manifest), 'utf8')
+    unlinkSync(join(dir, 'evidence.json'))
+    expect(() => loadCaseArtifacts(dir)).toThrow(/文件缺失:evidence.json/)
+  })
   it('导出后 8 个文件齐全,manifest complete:true 且逐文件 hash 一致', () => {
     mkdirSync(ROOT, { recursive: true })
     const dir = exportOnce(ROOT)

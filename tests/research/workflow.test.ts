@@ -19,6 +19,7 @@ import type { AgentRunView, TraceEvent } from '../../src/shared/agent'
 import { FakeProvider } from '../../src/main/providers/fake'
 import { ModelCompleter } from '../../src/main/agent/completer'
 import { ModelRouter } from '../../src/main/services/modelRouter'
+import { ModelRequestError } from '../../src/main/services/modelRequest'
 import type { StructuredCompleteRequest } from '../../src/main/agent/llm'
 import { recoverInterruptedRuns } from '../../src/main/agent/recovery'
 import {
@@ -102,6 +103,7 @@ function successScript(ids: { snapshotId: string; chunkId: string }, subquestion
 
 interface Harness {
   db: SqliteDb
+  file: string
   clock: ReturnType<typeof makeManualClock>
   queue: RunQueue
   provider: FakeProvider
@@ -114,7 +116,8 @@ interface Harness {
 
 async function makeHarness(scriptFactory?: (ids: { snapshotId: string; chunkId: string }) => FakeScript): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'research-workflow-'))
-  const { db } = await openDatabase(join(dir, 'test.sqlite'), SQL_JS_DIST)
+  const file = join(dir, 'test.sqlite')
+  const { db } = await openDatabase(file, SQL_JS_DIST)
   initSchema(db)
   initWorkspaceEpoch()
 
@@ -146,7 +149,7 @@ async function makeHarness(scriptFactory?: (ids: { snapshotId: string; chunkId: 
     clock,
     events: { emit: (event, run) => emitted.push({ event, run }) }
   })
-  return { db, clock, queue, provider, workflow, emitted, snapshots, ids }
+  return { db, file, clock, queue, provider, workflow, emitted, snapshots, ids }
 }
 
 /** 创建运行并同步驱动到终态/等待点 */
@@ -762,6 +765,7 @@ describe('重启恢复', () => {
     const after = getRun(db, value.run.runId)
     expect(after?.status).toBe('failed')
     expect(after?.errorCode).toBe('WORKER_INTERRUPTED')
+    expect(getResearchTaskByRun(db, value.run.runId)?.phase).toBe('failed')
 
     // 账本恢复逻辑可测:restoreLedger 恢复后预算不复活——剩余额度 = 6 - 3(已扣)
     const restoredLedger = restoreLedger({
@@ -894,6 +898,7 @@ describe('RES-01 真实发送链:预算、单发送观测、动态时限与取�
     db: SqliteDb
     clock: ReturnType<typeof makeManualClock>
     workflow: ResearchWorkflow
+    completer: ModelCompleter
     fetchMock: ReturnType<typeof vi.fn>
     snapshots: ImportedResearchSource[]
     signals: Array<AbortSignal | null | undefined>
@@ -941,7 +946,7 @@ describe('RES-01 真实发送链:预算、单发送观测、动态时限与取�
     const completer = new ModelCompleter({ db, router })
     const clock = makeManualClock()
     const workflow = new ResearchWorkflow({ db, queue: new RunQueue(db), completer, clock, events: { emit: () => {} } })
-    return { db, clock, workflow, fetchMock, snapshots, signals }
+    return { db, clock, workflow, completer, fetchMock, snapshots, signals }
   }
 
   async function createAndDriveReal(h: RealHarness, requestOverrides: Record<string, unknown> = {}): Promise<string> {
@@ -990,6 +995,140 @@ describe('RES-01 真实发送链:预算、单发送观测、动态时限与取�
     }
     throw new Error('waitFor 超时')
   }
+
+  const observationPaths = [
+    { stage: 'planning', event: 'sent', send: 1 },
+    { stage: 'planning', event: 'settled', send: 1 },
+    { stage: 'extraction', event: 'sent', send: 2 },
+    { stage: 'extraction', event: 'settled', send: 2 },
+    { stage: 'review', event: 'sent', send: 3 },
+    { stage: 'review', event: 'settled', send: 3 },
+    { stage: 'synthesis', event: 'sent', send: 4 },
+    { stage: 'synthesis', event: 'settled', send: 4 }
+  ] as const
+
+  it.each(observationPaths)('T07 $stage/$event 保存仅失败一次后停止所有发送', async ({ event, send }) => {
+    const h = await makeRealHarness(standardResponder())
+    const realRun = h.db.run.bind(h.db)
+    let observations = 0
+    let sendsAtFailure = -1
+    const saveSpy = vi.spyOn(h.db, 'run').mockImplementation((sql, params) => {
+      const name = event === 'sent' ? 'research.model_sent' : 'research.model_attempt'
+      if (sql.includes('INSERT INTO trace_events') && Array.isArray(params) && String(params[4]).includes(name)) {
+        observations += 1
+        if (observations === send) {
+          sendsAtFailure = h.fetchMock.mock.calls.length
+          throw new Error('synthetic observation save failure once')
+        }
+      }
+      realRun(sql, params)
+    })
+    try {
+      const runId = await createAndDriveReal(h)
+      expect(sendsAtFailure).toBe(send)
+      expect(h.fetchMock.mock.calls.length - sendsAtFailure).toBe(0)
+      expect(getRun(h.db, runId)?.status).toBe('failed')
+      expect(getRun(h.db, runId)?.errorCode).toBe('MODEL_OUTPUT_INVALID')
+      expect(getResearchTaskByRun(h.db, runId)?.phase).toBe('failed')
+      expect(h.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM research_reports WHERE research_task_id = (SELECT research_task_id FROM research_tasks WHERE run_id = ?)', [runId])?.n).toBe(0)
+      const payloads = listTraceEvents(h.db, runId).map((e) => e.payload)
+      expect(payloads.some((p) => p.event === 'research.budget_exhausted' || p.event === 'research.report_saved')).toBe(false)
+      const diagnostic = payloads.find((p) => p.domain_code === 'OBSERVATION_FAILED')!
+      expect(diagnostic).toBeDefined()
+      expect(diagnostic.code).toBe('MODEL_OUTPUT_INVALID')
+      const attempts = diagnostic.attempts as ModelRequestError['attempts']
+      expect(attempts).toHaveLength(1)
+      expect(attempts[0]!.attemptId).toBe(checkpointLedger(h, runId).sentAttemptIds[send - 1])
+      if (event === 'settled') expect(attempts[0]!.usage.totalTokens).toBe(15)
+      expect(h.signals[send - 1]?.aborted).toBe(true)
+    } finally {
+      saveSpy.mockRestore()
+      h.db.close()
+    }
+  })
+
+  it('T07 观测失败闩锁拒绝再次 beforeSend,不占新发送预算', async () => {
+    const h = await makeRealHarness(standardResponder())
+    const realRun = h.db.run.bind(h.db)
+    const saveSpy = vi.spyOn(h.db, 'run').mockImplementation((sql, params) => {
+      if (sql.includes('INSERT INTO trace_events') && Array.isArray(params) && String(params[4]).includes('research.model_attempt')) {
+        saveSpy.mockRestore()
+        throw new Error('synthetic observation save failure once')
+      }
+      realRun(sql, params)
+    })
+    const complete = h.completer.completeJson.bind(h.completer)
+    let admissionError: unknown
+    const completeSpy = vi.spyOn(h.completer, 'completeJson').mockImplementation(async (request) => {
+      try {
+        return await complete(request)
+      } catch (err) {
+        if (err instanceof ModelRequestError && err.code === 'OBSERVATION_FAILED') {
+          try {
+            request.control!.beforeSend({ ...err.attempts[0]!, attemptId: 'forbidden-new-attempt' })
+          } catch (rejected) {
+            admissionError = rejected
+          }
+        }
+        throw err
+      }
+    })
+    try {
+      const runId = await createAndDriveReal(h)
+      expect(admissionError).toBeInstanceOf(ModelRequestError)
+      expect((admissionError as ModelRequestError).code).toBe('OBSERVATION_FAILED')
+      expect(checkpointLedger(h, runId).sentAttemptIds).toHaveLength(1)
+      expect(h.fetchMock).toHaveBeenCalledTimes(1)
+    } finally {
+      saveSpy.mockRestore()
+      completeSpy.mockRestore()
+      h.db.close()
+    }
+  })
+
+  it('T07 持续数据库故障向外报告原领域错误与终态保存失败,无后续发送', async () => {
+    const h = await makeRealHarness(standardResponder())
+    const realRun = h.db.run.bind(h.db)
+    const saveFailure = new Error('synthetic persistent database failure')
+    let failed = false
+    const saveSpy = vi.spyOn(h.db, 'run').mockImplementation((sql, params) => {
+      if (sql.includes('INSERT INTO trace_events') && Array.isArray(params) && String(params[4]).includes('research.model_attempt')) failed = true
+      if (failed) throw saveFailure
+      realRun(sql, params)
+    })
+    try {
+      const rejection = await createAndDriveReal(h).then(() => null, (err: unknown) => err)
+      expect(rejection).toBeInstanceOf(AggregateError)
+      const errors = (rejection as AggregateError).errors
+      expect(errors[0]).toBeInstanceOf(ModelRequestError)
+      expect(errors[0].code).toBe('OBSERVATION_FAILED')
+      expect(errors[0].attempts).toHaveLength(1)
+      expect(errors[1]).toBe(saveFailure)
+      expect(h.fetchMock).toHaveBeenCalledTimes(1)
+      expect(h.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM research_reports')?.n).toBe(0)
+    } finally {
+      saveSpy.mockRestore()
+      h.db.close()
+    }
+  })
+
+  it('T07 普通审核和组织传输失败保持候选与模板策略,无观测失败诊断', async () => {
+    const h = await makeRealHarness((system, prompt) => {
+      if (system.includes('证据审核员') || system.includes('报告组织员')) return new Response('synthetic unavailable', { status: 503 })
+      return standardResponder()(system, prompt)
+    })
+    try {
+      const runId = await createAndDriveReal(h)
+      expect(getRun(h.db, runId)?.status).toBe('succeeded')
+      expect(h.fetchMock).toHaveBeenCalledTimes(4)
+      const task = getResearchTaskByRun(h.db, runId)!
+      expect(listClaims(h.db, task.researchTaskId).map((c) => c.supportStatus)).toEqual(['candidate'])
+      expect(h.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM research_reports WHERE research_task_id = ?', [task.researchTaskId])?.n).toBe(1)
+      expect(listTraceEvents(h.db, runId).some((e) => e.payload.domain_code === 'OBSERVATION_FAILED')).toBe(false)
+    } finally {
+      h.db.close()
+    }
+  })
 
   it('预算 6 时规划/抽取/审核/组织实际发送总数 ≤6,fetch 次数等于 sent 唯一 ID 数', async () => {
     const h = await makeRealHarness((system, userPrompt) => standardResponder()(system, userPrompt))
@@ -1105,6 +1244,236 @@ describe('RES-01 真实发送链:预算、单发送观测、动态时限与取�
 })
 
 // ---------- RES-03:all_of 联合证据完整性(真实抽取落库回归) ----------
+
+describe('T10 抽取批次先验证后原子提交', () => {
+  function batchOf(ids: { snapshotId: string; chunkId: string }): unknown {
+    return {
+      evidence: [QUOTE_PYTHON, '地点:上海。'].map((quote) => ({ snapshot_id: ids.snapshotId, chunk_id: ids.chunkId, quote })),
+      claims: [0, 1].map((index) => ({
+        text: `合成批次命题 ${index}`, claim_type: 'fact', supports: [index], all_of: true,
+        subject: { entity: '数据工程师', attribute: `属性 ${index}` }
+      }))
+    }
+  }
+
+  function batchRows(db: SqliteDb): Record<string, unknown[]> {
+    return {
+      spans: db.all('SELECT * FROM research_evidence_spans ORDER BY rowid'),
+      claims: db.all('SELECT * FROM research_claims ORDER BY rowid'),
+      citations: db.all('SELECT * FROM research_citations ORDER BY rowid'),
+      requirements: db.all("SELECT claim_id, review_json FROM research_claims WHERE review_json IS NOT NULL ORDER BY rowid")
+    }
+  }
+
+  const writeFaults = ['span', 'claim', 'citation', 'requirement'] as const
+  for (const priorBatch of [false, true]) {
+    it.each(writeFaults)(`T10 %s 写入失败整批零残留,先前成功批次=${priorBatch}`, async (point) => {
+      let extractionCalls = 0
+      let h!: Harness
+      let before: Record<string, unknown[]> = {}
+      h = await makeHarness((ids) => (_index, request) => {
+        if (request.system.includes('证据抽取器')) {
+          extractionCalls += 1
+          if (extractionCalls === (priorBatch ? 2 : 1)) before = batchRows(h.db)
+          return batchOf(ids)
+        }
+        if (request.system.includes('研究规划器')) return planOf(priorBatch
+          ? [{ question: 'Python 要求第一批', query: 'Python' }, { question: 'Python 要求第二批', query: 'Python' }]
+          : [{ question: 'Python 要求', query: 'Python' }])
+        return successScript(ids)(_index, request)
+      })
+      const realRun = h.db.run.bind(h.db)
+      let writes = 0
+      const writeSpy = vi.spyOn(h.db, 'run').mockImplementation((sql, params) => {
+        const active = extractionCalls === (priorBatch ? 2 : 1)
+        const match = point === 'span' ? sql.includes('INSERT INTO research_evidence_spans')
+          : point === 'claim' ? sql.includes('INSERT INTO research_claims')
+          : point === 'citation' ? sql.includes('INSERT INTO research_citations')
+          : sql.includes('UPDATE research_claims SET review_json')
+        if (active && match && ++writes === 2) throw new Error(`synthetic ${point} write failure`)
+        realRun(sql, params)
+      })
+      try {
+        const runId = await createAndDrive(h)
+        expect(writes).toBe(2)
+        expect(batchRows(h.db)).toEqual(before)
+        expect(getRun(h.db, runId)?.status).toBe('failed')
+        expect(h.provider.callTotal).toBe(priorBatch ? 3 : 2)
+        const task = getResearchTaskByRun(h.db, runId)!
+        const ckpt = loadResearchCheckpoint(h.db, task.researchTaskId) as { determinedSubIds: string[] }
+        expect(ckpt.determinedSubIds).toHaveLength(priorBatch ? 1 : 0)
+        expect(researchEvents(h, runId, 'research.extraction_batch_failed')).toHaveLength(1)
+        expect(h.db.all('SELECT * FROM research_reports')).toHaveLength(0)
+      } finally { writeSpy.mockRestore(); h.db.close() }
+    })
+  }
+
+  it.each(['一员拒绝', '全部拒绝', '非 all_of 拒绝', '未交付 chunk'])('T10 $0 的下标/原因在提交后审计且重开保留', async (kind) => {
+    const h = await makeHarness((ids) => (index, request) => {
+      if (!request.system.includes('证据抽取器')) return successScript(ids)(index, request)
+      return {
+        evidence: [
+          { snapshot_id: ids.snapshotId, chunk_id: ids.chunkId, quote: kind === '全部拒绝' ? '不存在的证据零' : QUOTE_PYTHON },
+          { snapshot_id: ids.snapshotId, chunk_id: kind === '未交付 chunk' ? 'undelivered-chunk' : ids.chunkId, quote: '不存在的证据一' }
+        ],
+        claims: [{ text: '同时要求 Python 和不存在的 X', claim_type: 'fact', supports: [0, 1], all_of: kind !== '非 all_of 拒绝' }]
+      }
+    })
+    const realRun = h.db.run.bind(h.db)
+    const auditSpy = vi.spyOn(h.db, 'run').mockImplementation((sql, params) => {
+      if (sql.includes('INSERT INTO trace_events') && Array.isArray(params) && String(params[4]).includes('research.evidence_rejected')) {
+        // 审计发生时整个抽取批次必须已经提交。
+        expect(h.db.all('SELECT * FROM research_claims')).toHaveLength(1)
+        expect(h.db.all('SELECT * FROM research_evidence_spans')).toHaveLength(kind === '全部拒绝' ? 0 : 1)
+      }
+      realRun(sql, params)
+    })
+    let closed = false
+    try {
+      const runId = await createAndDrive(h)
+      expect(getRun(h.db, runId)?.status).toBe('succeeded')
+      const audits = researchEvents(h, runId, 'research.evidence_rejected')
+      expect(audits.map((p) => p.index)).toEqual(kind === '全部拒绝' ? [0, 1] : [1])
+      for (const audit of audits) {
+        expect(audit).toMatchObject({ ordinal: 1, code: 'CITATION_INVALID' })
+        expect(audit.subquestion_id).toBeTypeOf('string')
+        expect(audit.reason).toBeTypeOf('string')
+        expect(String(audit.reason).length).toBeGreaterThan(0)
+        expect(audit).not.toHaveProperty('quote')
+      }
+      if (kind !== '非 all_of 拒绝') {
+        const task = getResearchTaskByRun(h.db, runId)!
+        const claim = listClaims(h.db, task.researchTaskId)[0]!
+        const requirement = loadAllOfRequirements(h.db, claim.claimId)[0]!
+        expect(requirement.expectedIndices).toEqual([0, 1])
+        expect(requirement.members[1]).toMatchObject({ index: 1, evidenceId: null, citationId: null })
+        expect(requirement.members[1]!.rejectionReason).toBeTypeOf('string')
+        expect(claim.supportStatus).toBe('unsupported')
+      }
+      const beforeReopen = batchRows(h.db)
+      h.db.close()
+      closed = true
+      // 实际关闭并重开当前测试创建的临时库,核对成员下标和拒绝原因。
+      const reopened = await openDatabase(h.file, SQL_JS_DIST)
+      try { expect(batchRows(reopened.db)).toEqual(beforeReopen) }
+      finally { reopened.db.close() }
+    } finally { auditSpy.mockRestore(); if (!closed) h.db.close() }
+  })
+
+  it('T10 准备阶段数据库 I/O 失败整体上抛,不误作成员拒绝或模型重试', async () => {
+    let returned = false
+    const h = await makeHarness((ids) => (index, request) => {
+      if (request.system.includes('证据抽取器')) { returned = true; return batchOf(ids) }
+      return successScript(ids)(index, request)
+    })
+    const readError = new Error('synthetic snapshot read I/O failure')
+    const realGet = h.db.get.bind(h.db)
+    const readSpy = vi.spyOn(h.db, 'get').mockImplementation((sql, params) => {
+      if (returned && sql.includes('SELECT document_id, text_sha256, normalized_text FROM retrieval_documents')) throw readError
+      return realGet(sql, params)
+    })
+    try {
+      const runId = await createAndDrive(h)
+      expect(getRun(h.db, runId)?.status).toBe('failed')
+      expect(h.provider.callTotal).toBe(2)
+      expect(batchRows(h.db)).toEqual({ spans: [], claims: [], citations: [], requirements: [] })
+      expect(researchEvents(h, runId, 'research.extraction_batch_failed')[0]).toMatchObject({ message: readError.message, ordinal: 1 })
+      expect(researchEvents(h, runId, 'research.evidence_rejected')).toHaveLength(0)
+    } finally { readSpy.mockRestore(); h.db.close() }
+  })
+
+  it('T10 合法全文 quote 位于另一记录,只拒绝该成员并保存完整清单', async () => {
+    const h = await makeHarness()
+    const imported = importResearchSources(h.db, {
+      sources: [{ sourceName: 'scoped.json', sourceType: 'json', bytes: Buffer.from(JSON.stringify([
+        { title: '岗位 A', description: '要求 Python 熟练。' }, { title: '岗位 B', description: '要求 SQL 熟练。' }
+      ])), sample: true }], clock: FIXED_CLOCK
+    })
+    expect(imported.every((o) => o.ok)).toBe(true)
+    h.snapshots = [imported[0] as ImportedResearchSource]
+    const snapshotId = h.snapshots[0]!.documentId
+    const chunkId = h.db.get<{ chunk_id: string }>('SELECT chunk_id FROM retrieval_chunks WHERE document_id = ? LIMIT 1', [snapshotId])!.chunk_id
+    const text = h.db.get<{ normalized_text: string }>('SELECT normalized_text FROM retrieval_documents WHERE document_id = ?', [snapshotId])!.normalized_text
+    const evidence = ['要求 Python 熟练。', '要求 SQL 熟练。'].map((quote) => {
+      const start = Array.from(text.slice(0, text.indexOf(quote))).length
+      return { snapshot_id: snapshotId, chunk_id: chunkId, quote, start_offset: start, end_offset: start + Array.from(quote).length }
+    })
+    h.provider = new FakeProvider({ script: (index, request) => {
+      if (request.system.includes('证据抽取器')) return { evidence, claims: [{ text: '岗位 A 同时要求 Python 和 SQL', claim_type: 'fact', supports: [0, 1], all_of: true }] }
+      return successScript({ snapshotId, chunkId })(index, request)
+    } })
+    h.workflow = new ResearchWorkflow({ db: h.db, queue: h.queue, completer: h.provider, clock: h.clock })
+    try {
+      const runId = await createAndDrive(h)
+      expect(getRun(h.db, runId)?.status).toBe('succeeded')
+      expect(h.db.all('SELECT * FROM research_evidence_spans')).toHaveLength(1)
+      const task = getResearchTaskByRun(h.db, runId)!
+      const claim = listClaims(h.db, task.researchTaskId)[0]!
+      expect(loadAllOfRequirements(h.db, claim.claimId)[0]!.members[1]).toMatchObject({ index: 1, evidenceId: null, citationId: null, rejectionReason: expect.stringContaining('记录范围') })
+      expect(claim.supportStatus).toBe('unsupported')
+      expect(h.provider.callTotal).toBe(3) // 规划、一次抽取、组织;不重试或送审缺员命题。
+    } finally { h.db.close() }
+  })
+
+  it('T10 抽取返回后清单损坏拒绝整个批次,不吞成成员拒绝', async () => {
+    let returned = false
+    const h = await makeHarness((ids) => (index, request) => {
+      if (request.system.includes('证据抽取器')) { returned = true; return batchOf(ids) }
+      return successScript(ids)(index, request)
+    })
+    const realGet = h.db.get.bind(h.db)
+    const readSpy = vi.spyOn(h.db, 'get').mockImplementation((sql, params) => {
+      const row = realGet(sql, params)
+      if (returned && sql.includes('FROM research_snapshot_manifests')) return { ...row, entries_json: '{broken-json' }
+      return row
+    })
+    try {
+      const runId = await createAndDrive(h)
+      expect(getRun(h.db, runId)?.status).toBe('failed')
+      expect(h.provider.callTotal).toBe(2)
+      expect(batchRows(h.db)).toEqual({ spans: [], claims: [], citations: [], requirements: [] })
+      expect(researchEvents(h, runId, 'research.extraction_batch_failed')).toHaveLength(1)
+      expect(researchEvents(h, runId, 'research.evidence_rejected')).toHaveLength(0)
+    } finally { readSpy.mockRestore(); h.db.close() }
+  })
+
+  it('T10 批次回滚后失败审计自身异常遵循 T07 停止', async () => {
+    const h = await makeHarness((ids) => (index, request) => request.system.includes('证据抽取器')
+      ? batchOf(ids) : successScript(ids)(index, request))
+    const realRun = h.db.run.bind(h.db)
+    const saveSpy = vi.spyOn(h.db, 'run').mockImplementation((sql, params) => {
+      if (sql.includes('INSERT INTO research_citations')) throw new Error('synthetic citation write failure')
+      if (sql.includes('INSERT INTO trace_events') && Array.isArray(params) && String(params[4]).includes('research.extraction_batch_failed')) throw new Error('synthetic failure audit save failure')
+      realRun(sql, params)
+    })
+    try {
+      const runId = await createAndDrive(h)
+      expect(getRun(h.db, runId)?.status).toBe('failed')
+      expect(h.provider.callTotal).toBe(2)
+      expect(batchRows(h.db)).toEqual({ spans: [], claims: [], citations: [], requirements: [] })
+      expect(eventPayloads(h, runId).some((p) => p.domain_code === 'OBSERVATION_FAILED')).toBe(true)
+      expect(h.db.all('SELECT * FROM research_reports')).toHaveLength(0)
+    } finally { saveSpy.mockRestore(); h.db.close() }
+  })
+
+  it('T10 拒绝审计保存失败遵循 T07 停止,不得组织或模板成功收尾', async () => {
+    const h = await makeHarness((ids) => (index, request) => request.system.includes('证据抽取器')
+      ? { evidence: [{ snapshot_id: ids.snapshotId, chunk_id: ids.chunkId, quote: '不存在' }], claims: [] }
+      : successScript(ids)(index, request))
+    const realRun = h.db.run.bind(h.db)
+    const saveSpy = vi.spyOn(h.db, 'run').mockImplementation((sql, params) => {
+      if (sql.includes('INSERT INTO trace_events') && Array.isArray(params) && String(params[4]).includes('research.evidence_rejected')) throw new Error('synthetic audit save failure')
+      realRun(sql, params)
+    })
+    try {
+      const runId = await createAndDrive(h)
+      expect(getRun(h.db, runId)?.status).toBe('failed')
+      expect(h.provider.callTotal).toBe(2)
+      expect(eventPayloads(h, runId).some((p) => p.domain_code === 'OBSERVATION_FAILED')).toBe(true)
+      expect(h.db.all('SELECT * FROM research_reports')).toHaveLength(0)
+    } finally { saveSpy.mockRestore(); h.db.close() }
+  })
+})
 
 describe('RES-03 all_of 缺员回归', () => {
   it('一有效一拒绝:预期两成员全部落库(含拒绝原因),缺员整组不成立且审核不升级', async () => {

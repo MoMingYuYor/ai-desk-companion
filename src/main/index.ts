@@ -5,7 +5,7 @@ import { mkdirSync, writeFileSync, createReadStream } from 'node:fs'
 import { createInterface } from 'node:readline'
 import { openDatabase } from './db/connection'
 import { getProviderApiKey, initSchema } from './db/dao'
-import { createPersistenceCoordinator, initWorkspaceEpoch } from './db/operations'
+import { createPersistenceCoordinator, getWorkspaceEpoch, initWorkspaceEpoch } from './db/operations'
 import { decryptApiKey, migrateLegacyProviderKeys } from './keys'
 import { Engine } from './services/engine'
 import { sweepStalePdfTemp } from './services/materials'
@@ -28,14 +28,17 @@ import { RunScheduler } from './agent/runScheduler'
 import { createAgentGateway } from './agent/runtime'
 import { ModelCompleter } from './agent/completer'
 import { startPersonalOpsMcpStdio } from './mcp/server'
-import { appendTraceEvent, createRun, transitionRun } from './runs/repository'
+import { appendTraceEvent, createRun, expireUnexecutedApprovals, getRun, transitionRun } from './runs/repository'
 import { resolveEvalPaths } from './evals/resources'
 import { EvalsService } from './evals/api'
+import { createRealCompleterFor } from './evals/realAdapter'
+import { currentEvalVersions } from './evals/buildVersions'
 import { ToolRegistry } from './tools/registry'
 import { ToolGateway } from './tools/gateway'
 import { registerOpsTools } from './tools/definitions'
 import { seedDemoData } from './agent/seed'
 import { recoverInterruptedRuns } from './agent/recovery'
+import { getResearchTaskByRun, updateResearchTaskPhase } from './research/repository'
 import { ResearchWorkflow } from './research/workflow'
 import { createTray, destroyTray } from './tray'
 import { markPetBubble, markPetState } from './petBridge'
@@ -253,7 +256,28 @@ function bootstrap(): void {
     if (interrupted.length > 0) {
       console.warn(`[agent] 恢复:${interrupted.length} 个中断运行标记为失败`)
     }
-    const scheduler = new RunScheduler(db, agentQueue)
+    const scheduler = new RunScheduler(db, agentQueue, {
+      workspaceEpoch: getWorkspaceEpoch,
+      onDriverError: async (runId) => {
+        const run = getRun(db, runId)
+        if (!run) return
+        if (run.finishedAt) {
+          // 驱动可能已写入失败终态；保存失败仍须传回调度器以暂停派发。
+          db.flush()
+          return
+        }
+        if (run.status === 'queued') transitionRun(db, runId, 'planning')
+        transitionRun(db, runId, 'failed', { errorCode: 'DRIVER_FAILED' })
+        if (run.mode === 'research') {
+          const task = getResearchTaskByRun(db, runId)
+          if (task) updateResearchTaskPhase(db, task.researchTaskId, 'failed')
+        }
+        expireUnexecutedApprovals(db, runId)
+        const event = appendTraceEvent(db, { runId, eventType: 'error', payload: { code: 'DRIVER_FAILED' } })
+        db.flush()
+        agentEvents.emit(event, getRun(db, runId)!)
+      }
+    })
     const orchestrator = new RunOrchestrator({
       db,
       registry: agentRegistry,
@@ -378,13 +402,16 @@ function bootstrap(): void {
       sourceRoot: app.getAppPath(),
       userData: app.getPath('userData')
     })
+    const evalCredentialOf = (providerId: string): string | null => {
+      const enc = getProviderApiKey(db, providerId)
+      return enc ? decryptApiKey(enc) : null
+    }
     const evals = new EvalsService({
       paths: evalPaths,
       sqlJsDistDir,
-      credentialOf: (providerId) => {
-        const enc = getProviderApiKey(db, providerId)
-        return enc ? decryptApiKey(enc) : (process.env.AI_DESK_EVAL_API_KEY ?? null)
-      }
+      credentialOf: evalCredentialOf,
+      realCompleterFor: createRealCompleterFor({ credentialOf: evalCredentialOf }),
+      versionsOf: () => currentEvalVersions(app.getAppPath(), app.isPackaged ? process.resourcesPath : undefined)
     })
 
     registerIpcHandlers({
@@ -398,6 +425,10 @@ function bootstrap(): void {
       agentEvents,
       orchestrator,
       evals,
+      quiesceAgents: () => scheduler.quiesceForRestore(runId => {
+        if (getRun(db, runId)?.mode === 'research') researchWorkflow.requestCancel(runId)
+        else orchestrator.cancel(runId)
+      }),
       // IpcResearchWorkflow 适配:创建路径由 api.ts 自己落库,这里只出驱动方法
       researchWorkflow: {
         startDriver: (runId) => void researchWorkflow.driveResearch(runId),

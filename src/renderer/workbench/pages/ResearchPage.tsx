@@ -217,6 +217,7 @@ function ReportView({
 
   return (
     <div data-testid="research-report" style={{ marginTop: 10 }}>
+      {report.scope_warning && <p role="status">{report.scope_warning}</p>}
       <div className="row" style={{ justifyContent: 'space-between', marginBottom: 6 }}>
         <div style={{ fontWeight: 700 }}>
           报告 v{report.version}
@@ -282,7 +283,7 @@ function ReportView({
 /** 导出 Markdown:本地 Blob 下载,不自动上传(「导出成功」只表示本地生成文件) */
 function downloadMarkdown(report: ResearchReportResponse): void {
   const header = `# 研究报告 v${report.version}(run ${report.run_id})\n\nreport_state: ${report.report_state}\nmanifest_sha256: ${report.manifest_sha256}\n\n`
-  const blob = new Blob([header, report.markdown], { type: 'text/markdown;charset=utf-8' })
+  const blob = new Blob([header, report.scope_warning ? `${report.scope_warning}\n\n` : '', report.markdown], { type: 'text/markdown;charset=utf-8' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url

@@ -247,14 +247,16 @@ export class ModelRouter {
     else control.signal.addEventListener('abort', onExternalAbort, { once: true })
 
     const records: ModelAttemptRecord[] = []
-    let callbackFailed: unknown = null
+    let callbackFailed = false
+    let callbackError: unknown
     // 观测派发;回调持久化失败:abort 已派发请求、停止后续发送与观测
     const emit = (event: ModelAttemptEvent): void => {
-      if (callbackFailed !== null) return
+      if (callbackFailed) return
       try {
         control.onAttempt(event)
       } catch (err) {
-        callbackFailed = err
+        callbackFailed = true
+        callbackError = err
         controller.abort(new ModelRequestError('OBSERVATION_FAILED', '观测回调失败,已中止在途请求', records, false))
       }
     }
@@ -262,18 +264,20 @@ export class ModelRouter {
     const latency = (): number => Math.max(0, Date.now() - startedAt)
     const recordOf = (base: Omit<ModelAttemptRecord, keyof ModelAttemptInfo>): ModelAttemptRecord => ({ ...info, ...base })
     let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
-    const cleanup = (): void => {
-      // finally 清理定时器和监听器、取消中断中的 reader 并释放锁
-      timer.removeEventListener('abort', onTimeout)
-      control.signal.removeEventListener('abort', onExternalAbort)
-      if (reader !== null) void reader.cancel().catch(() => {})
+    let readCompleted = false
+    let responseModel: string | null = null
+    let usage = nullTokenUsage()
+    let httpStatus: number | null = null
+    const settle = (outcome: ModelAttemptRecord['outcome']): ModelAttemptRecord => {
+      // 先保存再观测；回调失败进入 catch 时仍复用同一条结算，不重复计费。
+      if (records.length > 0) return records[0]!
+      const record = recordOf({ outcome, latencyMs: latency(), httpStatus, responseModel, usage })
+      records.push(record)
+      emit({ type: 'settled', attempt: record })
+      return record
     }
     const observationFailure = (): ModelRequestError => {
-      // 保留已经派发的记录;没有 settled 记录时补一条 cancelled 结算
-      if (records.length === 0) {
-        records.push(recordOf({ outcome: 'cancelled', latencyMs: latency(), httpStatus: null, responseModel: null, usage: nullTokenUsage() }))
-      }
-      const reason = callbackFailed instanceof Error ? callbackFailed.message : String(callbackFailed)
+      const reason = callbackError instanceof Error ? callbackError.message : String(callbackError)
       return new ModelRequestError('OBSERVATION_FAILED', `观测回调持久化失败,已停止后续发送:${reason}`, records, false)
     }
 
@@ -302,46 +306,27 @@ export class ModelRouter {
       }
     }
 
-    let fetchPromise: Promise<Response>
     try {
-      fetchPromise = this.fetchImpl(joinUrl(provider.baseUrl, path), {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        signal: controller.signal
-      })
-    } catch (err) {
-      // fetch 同步抛错也记录一次 sent,再结算 failed
-      emit({ type: 'sent', attempt: info })
-      const record = recordOf({ outcome: 'failed', latencyMs: latency(), httpStatus: null, responseModel: null, usage: nullTokenUsage() })
-      records.push(record)
-      emit({ type: 'settled', attempt: record })
-      if (callbackFailed !== null) {
-        cleanup()
-        throw observationFailure()
+      let fetchPromise: Promise<Response>
+      try {
+        fetchPromise = this.fetchImpl(joinUrl(provider.baseUrl, path), {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          signal: controller.signal
+        })
+      } finally {
+        // 实际调用 fetch 后立即观测；同步抛错也只发一次 sent。
+        emit({ type: 'sent', attempt: info })
       }
-      cleanup()
-      throw new ModelRequestError('TRANSPORT', err instanceof Error ? err.message : String(err), records, true)
-    }
-    // 实际调用 fetchImpl 后,在同一同步段立即发 sent
-    emit({ type: 'sent', attempt: info })
-
-    try {
       const res = await fetchPromise
-      if (callbackFailed !== null) throw observationFailure()
+      httpStatus = res.status
+      if (callbackFailed) throw observationFailure()
       if (!res.ok) {
         const text = await res.text().catch(() => '')
-        const record = recordOf({ outcome: 'failed', latencyMs: latency(), httpStatus: res.status, responseModel: null, usage: nullTokenUsage() })
-        records.push(record)
-        emit({ type: 'settled', attempt: record })
-        if (callbackFailed !== null) throw observationFailure()
         throw new ModelRequestError('TRANSPORT', describeHttpError(res.status, text), records, isRetryableStatus(res.status))
       }
       if (!res.body) {
-        const record = recordOf({ outcome: 'failed', latencyMs: latency(), httpStatus: res.status, responseModel: null, usage: nullTokenUsage() })
-        records.push(record)
-        emit({ type: 'settled', attempt: record })
-        if (callbackFailed !== null) throw observationFailure()
         throw new ModelRequestError('TRANSPORT', '服务未返回流式响应体', records, true)
       }
 
@@ -350,11 +335,12 @@ export class ModelRouter {
       let buffer = ''
       let full = ''
       let sawDone = false
-      let responseModel: string | null = null
-      let usage: TokenUsage | null = null
       for (;;) {
         const { done, value } = await reader.read()
-        if (done) break
+        if (done) {
+          readCompleted = true
+          break
+        }
         buffer += decoder.decode(value, { stream: true })
         const lines = buffer.split(/\r?\n/)
         buffer = lines.pop() ?? ''
@@ -373,27 +359,31 @@ export class ModelRouter {
           } catch {
             continue
           }
+          // 先捕获供应商元数据，避免同一事件的消费回调抛错后丢失已观察字段。
+          const parsedUsage = extractUsage(json, provider.protocol)
+          if (parsedUsage) {
+            usage = {
+              inputTokens: parsedUsage.inputTokens ?? usage.inputTokens,
+              outputTokens: parsedUsage.outputTokens ?? usage.outputTokens,
+              totalTokens: parsedUsage.totalTokens ?? usage.totalTokens,
+              source: parsedUsage.source ?? usage.source
+            }
+          }
+          const parsedModel = extractResponseModel(json)
+          if (parsedModel) responseModel = parsedModel
           const delta = extractDelta(json, provider.protocol)
           if (delta) {
             full += delta
             options.onDelta?.(delta)
           }
-          // usage 与响应模型标识:流事件内逐块捕获,以最后出现的为准
-          const parsedUsage = extractUsage(json, provider.protocol)
-          if (parsedUsage) usage = parsedUsage
-          const parsedModel = extractResponseModel(json)
-          if (parsedModel) responseModel = parsedModel
         }
       }
       if (!sawDone && full.length === 0) {
         throw new Error('模型没有返回任何内容(连接提前中断)')
       }
 
-      const settledUsage = usage ?? nullTokenUsage()
-      const record = recordOf({ outcome: 'succeeded', latencyMs: latency(), httpStatus: res.status, responseModel, usage: settledUsage })
-      records.push(record)
-      emit({ type: 'settled', attempt: record })
-      if (callbackFailed !== null) throw observationFailure()
+      settle('succeeded')
+      if (callbackFailed) throw observationFailure()
       const actualProvider: ActualProvider = { providerId: attempt.provider.id, providerName: attempt.provider.name, model: attempt.model }
       return {
         text: full,
@@ -401,36 +391,31 @@ export class ModelRouter {
         actualProvider,
         actualAttempts: 1,
         attempts: records,
-        usage: settledUsage
+        usage
       }
     } catch (err) {
-      if (err instanceof ModelRequestError) {
-        cleanup()
-        throw err
-      }
-      if (callbackFailed !== null) {
-        cleanup()
-        throw observationFailure()
-      }
+      settle(callbackFailed ? 'cancelled' : timedOut ? 'timeout' : control.signal.aborted ? 'cancelled' : 'failed')
+      // settled 观测也可能失败；检查必须在结算后，且优先于传输错误分类。
+      if (callbackFailed) throw observationFailure()
+      if (err instanceof ModelRequestError) throw err
       if (timedOut) {
-        const record = recordOf({ outcome: 'timeout', latencyMs: latency(), httpStatus: null, responseModel: null, usage: nullTokenUsage() })
-        records.push(record)
-        emit({ type: 'settled', attempt: record })
-        cleanup()
         throw new ModelRequestError('TIMEOUT', `单次请求超时(${control.timeoutMs}ms)`, records, true)
       }
       if (control.signal.aborted) {
-        const record = recordOf({ outcome: 'cancelled', latencyMs: latency(), httpStatus: null, responseModel: null, usage: nullTokenUsage() })
-        records.push(record)
-        emit({ type: 'settled', attempt: record })
-        cleanup()
         throw new ModelRequestError('CANCELLED', '请求已取消', records, false)
       }
-      const record = recordOf({ outcome: 'failed', latencyMs: latency(), httpStatus: null, responseModel: null, usage: nullTokenUsage() })
-      records.push(record)
-      emit({ type: 'settled', attempt: record })
-      cleanup()
       throw new ModelRequestError('TRANSPORT', err instanceof Error ? err.message : String(err), records, true)
+    } finally {
+      timer.removeEventListener('abort', onTimeout)
+      control.signal.removeEventListener('abort', onExternalAbort)
+      if (reader !== null) {
+        try {
+          if (!readCompleted) await reader.cancel()
+        } catch { /* 取消清理失败不能覆盖传输或观测错误。 */ }
+        try {
+          reader.releaseLock()
+        } catch { /* 释放锁失败不能覆盖已经结算的结果。 */ }
+      }
     }
   }
 

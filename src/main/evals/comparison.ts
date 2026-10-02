@@ -12,7 +12,8 @@
 
 import type { EvalSplit } from './types'
 import type { ExecutionKind } from './runner'
-import { COMPARABLE_VARIABLES, frozenConfigSha256, type FrozenEvalConfig } from './configStore'
+import { COMPARABLE_VARIABLES, frozenConfigSha256, validateFrozenConfig, type FrozenEvalConfig } from './configStore'
+import type { ActualProvider } from '../services/modelRequest'
 
 /** 允许在对照两侧不同的变量清单(显式记录;其余冻结字段必须一致) */
 export const comparableVariables = COMPARABLE_VARIABLES
@@ -24,12 +25,24 @@ export interface ComparisonCandidate {
   splits: readonly EvalSplit[]
   executionKind: ExecutionKind
   /**
-   * EVAL-04:冻结配置(可选)。两侧都提供时接入冻结 hash 逐字段校验——
-   * 只允许 comparableVariables 内的变量不同。
+   * 缺失或不完整时拒绝比较；可选类型用于给历史结果返回可诊断的拒绝原因。
    */
   frozen?: FrozenEvalConfig
   /** 冻结配置实际内容 hash(configStore 单独保存的 <configId>.sha256) */
   configSha256?: string
+  /** real 必须列出全部实际路由（含发送尝试）；缺失或偏离冻结目标时不可比。 */
+  actualProviders?: readonly (ActualProvider | null)[]
+}
+
+export function actualRoutingReasons(config: FrozenEvalConfig, providers: readonly (ActualProvider | null)[] | undefined): string[] {
+  if (config.executionKind !== 'real') return []
+  if (!providers?.length) return ['实际 provider/model 缺观测，不可比']
+  return [...new Set(providers.flatMap((provider) => {
+    if (!provider?.providerId || !provider.model) return ['实际 provider/model 缺观测，不可比']
+    return provider.providerId === config.providerId && provider.model === config.model
+      ? []
+      : [`实际 provider/model 偏离冻结配置，不可比:${provider.providerId} / ${provider.model}（冻结 ${config.providerId} / ${config.model}）`]
+  }))]
 }
 
 export interface ComparisonVerdict {
@@ -52,7 +65,7 @@ export function frozenVariableDiff(a: FrozenEvalConfig, b: FrozenEvalConfig): Fr
   const fields: Array<keyof FrozenEvalConfig> = [
     'schemaVersion', 'executionKind', 'model', 'providerId', 'pipelineVariant', 'promptSha256',
     'toolsVersion', 'codeCommit', 'datasetSha256', 'fixtureSha256', 'budgetSha256',
-    'interactionScriptSha256', 'rubricVersion'
+    'interactionScriptSha256', 'rubricVersion', 'targetSha256'
   ]
   return fields.map((field) => {
     const va = String(a[field])
@@ -92,15 +105,26 @@ export function checkComparable(a: ComparisonCandidate, b: ComparisonCandidate):
   if (a.configId === b.configId) {
     reasons.push('配置与自身比较无可比性结论')
   }
-  // EVAL-04:冻结配置逐字段核对;只允许记录的流程变量不同
-  if (a.frozen && b.frozen) {
-    if (frozenConfigSha256(a.frozen) !== a.configSha256) {
-      reasons.push(`配置 A 的实际 hash 与冻结内容不一致:${a.configId}`)
+  const frozen = [a, b].map((candidate, index) => {
+    const label = index === 0 ? 'A' : 'B'
+    try {
+      const config = validateFrozenConfig(candidate.frozen)
+      if (config.configId !== candidate.configId || config.executionKind !== candidate.executionKind) {
+        reasons.push(`配置 ${label} 的标识或执行类型与冻结内容不一致`)
+      }
+      if (frozenConfigSha256(config) !== candidate.configSha256) {
+        reasons.push(`配置 ${label} 的实际 hash 与冻结内容不一致:${candidate.configId}`)
+      }
+      reasons.push(...actualRoutingReasons(config, candidate.actualProviders))
+      return config
+    } catch {
+      reasons.push(`配置 ${label} 缺完整冻结配置，不可比:${candidate.configId}`)
+      return null
     }
-    if (frozenConfigSha256(b.frozen) !== b.configSha256) {
-      reasons.push(`配置 B 的实际 hash 与冻结内容不一致:${b.configId}`)
-    }
-    for (const diff of frozenVariableDiff(a.frozen, b.frozen)) {
+  })
+  // 两侧均完整才可生成差异表；缺失对象本身就是拒绝原因。
+  if (frozen[0] && frozen[1]) {
+    for (const diff of frozenVariableDiff(frozen[0], frozen[1])) {
       if (!diff.equal && !diff.allowedToDiffer) {
         reasons.push(`冻结变量不可比:${diff.variable}:${diff.a} vs ${diff.b}(只允许 ${comparableVariables.join('/')} 不同)`)
       }

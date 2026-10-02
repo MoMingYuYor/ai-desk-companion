@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { createHash } from 'node:crypto'
+import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { calculateMetrics, latencyPercentiles } from '../../src/main/evals/metrics'
 import {
@@ -83,6 +84,26 @@ function stateOf(results: EvalCaseOutcome[]): Pick<EvalRunState, 'results'> {
 }
 
 describe('指标公式(手算核对)', () => {
+  it('T16 八类原始观察的独立手算：7启动3通过，回执重放只应用一次业务', () => {
+    const write = obsScore({})
+    const replay = obsScore({ callIndex: 1, replayed: true, businessApplied: false })
+    const rows = [
+      outcome({ caseId: 'success', durationMs: 10, toolObservations: [write], ruleChecks: [argsCheck('args:todo.create', true)] }),
+      outcome({ caseId: 'wrong-args', status: 'failed', durationMs: 20, toolObservations: [obsScore({ arguments: { title: 'wrong' } })], ruleChecks: [argsCheck('args:todo.create', false)] }),
+      outcome({ caseId: 'business-error', status: 'failed', durationMs: 30, toolObservations: [obsScore({ ok: false, errorCode: 'BUSINESS', businessApplied: false })], ruleChecks: [argsCheck('args:todo.create', true)] }),
+      outcome({ caseId: 'timeout', status: 'failed', terminalStatus: 'timeout', durationMs: 1000, toolObservations: [], executedTools: [] }),
+      outcome({ caseId: 'cancelled', status: 'failed', terminalStatus: 'cancelled', durationMs: 40, toolObservations: [], executedTools: [] }),
+      outcome({ caseId: 'not-run', status: 'not_run', terminalStatus: null, runId: null }),
+      outcome({ caseId: 'replay', durationMs: 50, toolObservations: [write, replay, { ...replay, callIndex: 2 }], ruleChecks: [argsCheck('args:todo.create', true)] }),
+      outcome({ caseId: 'missing-usage', durationMs: 60, toolObservations: [], modelAttempts: [] })
+    ]
+    // 期望值直接按表计数，不能由被测函数生成。
+    const expected = { completion: { value: 3 / 7, n: 3, denominator: 7 }, coverage: { value: 7 / 8, n: 7, denominator: 8 }, argumentAccuracy: { value: 3 / 4, n: 3, denominator: 4 }, toolErrorRate: { value: 1 / 6, n: 1, denominator: 6 }, confirmationBypass: { count: 0, attemptedWrites: 6 }, latency: { p50Ms: 40, p95Ms: 1000, n: 7, smallSample: true, timeouts: 1 } }
+    const actual = calculateMetrics(stateOf(rows), [])
+    expect(actual).toMatchObject(expected)
+    expect(rows[6]!.toolObservations!.filter(o => o.businessApplied)).toHaveLength(1)
+    if (process.env.T16_EVIDENCE_DIR) writeFileSync(join(process.env.T16_EVIDENCE_DIR, 'hand-calculation.json'), JSON.stringify({ rows, expected, actual }, null, 2))
+  })
   it('完成率:4 启动中 3 通过 = 0.75;not_run 不进分母', () => {
     const results = [
       outcome({ caseId: 'a', status: 'passed' }),
@@ -262,6 +283,28 @@ describe('可比性守卫(E-05 + EVAL-04 冻结 hash)', () => {
     }
   }
 
+  it.each(['A', 'B', 'both', 'partial'] as const)('T16 缺少%s完整冻结对象必须拒绝', (side) => {
+    const a = candidateOf(pair.baseline)
+    const b = candidateOf(pair.candidate)
+    if (side === 'A' || side === 'both') a.frozen = undefined
+    if (side === 'B' || side === 'both') b.frozen = undefined
+    if (side === 'partial') a.frozen = { configId: a.configId } as FrozenEvalConfig
+    if (a.frozen) a.configSha256 = frozenConfigSha256(a.frozen)
+    expect(checkComparable(a, b).comparable).toBe(false)
+  })
+
+  it('T16 real 实际provider/model缺失或备用偏离均拒绝；同冻结路由可比', () => {
+    const frozenA = { ...pair.baseline, executionKind: 'real' as const }
+    const frozenB = { ...pair.candidate, executionKind: 'real' as const }
+    const matching = { providerId: frozenA.providerId, providerName: 'Synthetic', model: frozenA.model }
+    const a = { ...candidateOf(frozenA), actualProviders: [matching] }
+    const b = { ...candidateOf(frozenB), actualProviders: [{ ...matching, model: 'backup-model' }] }
+    expect(checkComparable(a, b).reasons.join(';')).toMatch(/实际.*偏离/)
+    expect(checkComparable(a, { ...b, actualProviders: undefined }).comparable).toBe(false)
+    expect(checkComparable(a, { ...b, actualProviders: [null] }).comparable).toBe(false)
+    expect(checkComparable(a, { ...b, actualProviders: [matching] }).comparable).toBe(true)
+  })
+
   it('baseline/candidate 只差记录的流程变量:可比;允许变量清单显式记录', () => {
     const verdict = checkComparable(candidateOf(pair.baseline), candidateOf(pair.candidate))
     expect(verdict.comparable).toBe(true)
@@ -362,6 +405,24 @@ describe('人工复核(E-06)', () => {
 })
 
 describe('报告生成(E-07 报告部分)', () => {
+  it('T16 real报告明确程序终态不等于案例正确，并列出实际路由偏离与未知费用', () => {
+    const sha = (text: string): string => createHash('sha256').update(text).digest('hex')
+    const config = { schemaVersion: 1, configId: 'cfg', executionKind: 'real', model: 'frozen-model', providerId: 'frozen-provider', pipelineVariant: 'baseline', promptSha256: sha('p'), toolsVersion: 'v1', codeCommit: 'c0ffee', datasetSha256: sha('d'), fixtureSha256: sha('f'), budgetSha256: sha('b'), interactionScriptSha256: sha('i'), rubricVersion: 'v1' } as FrozenEvalConfig
+    const dataset = { manifest: { dataset_version: 'personal_ops_v1', schema_version: 1, cases_sha256: 'x', categories: {}, total: 1, provenance: '合成' }, cases: [caseDef('c1')], dev: [], holdout: [], casesSha256: 'x' }
+    const results = [outcome({ caseId: 'c1', status: 'failed', actualProvider: { providerId: 'backup-provider', providerName: 'Synthetic', model: 'backup-model' }, modelAttempts: [] })]
+    const state: EvalRunState = { evalRunId: 'eval-report-route', datasetVersion: 'personal_ops_v1', casesSha256: 'x', splits: ['dev'], configIds: ['cfg'], executionKind: 'real', repeats: 1, maxCases: 1, status: 'completed', startedAt: NOW, finishedAt: NOW, results }
+    const report = renderEvalReport({ state, dataset, metrics: calculateMetrics(state, dataset.cases), reproduceCommand: 'synthetic-only', frozenConfigs: { cfg: { config, sha256: frozenConfigSha256(config) } } })
+    expect(report).toContain('程序终态不代表案例正确')
+    expect(report).toContain('backup-provider / backup-model')
+    expect(report).toContain('frozen-provider / frozen-model')
+    expect(report).toContain('偏离冻结配置，不可比')
+    expect(report).toContain('待人工审阅')
+    expect(report).toContain('费用 | null')
+    expect(report).toContain('第二人未复核')
+    const missing = renderEvalReport({ state, dataset, metrics: calculateMetrics(state, dataset.cases), reproduceCommand: 'synthetic-only' })
+    expect(missing).toContain('缺完整冻结配置，不可比')
+    if (process.env.T16_EVIDENCE_DIR) writeFileSync(join(process.env.T16_EVIDENCE_DIR, 'actual-routing-report.md'), report, 'utf8')
+  })
   it('报告注明评测结果 schema 版本;Fake 标示;not_run 单列;缺观测标未测', () => {
     const dataset = {
       manifest: { dataset_version: 'personal_ops_v1', schema_version: 1, cases_sha256: 'x', categories: {}, total: 1, provenance: '测试' },

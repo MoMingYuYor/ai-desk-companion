@@ -13,10 +13,10 @@
 //   coverage 不足 100% 时 holdout 未完成,不以少量已审高分判通过;
 //   unreviewed 对象在结果中显式可见。
 
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { safeSegment } from './artifacts'
+import { safeSegment, caseArtifactDir, loadCaseArtifacts } from './artifacts'
 import { VERIFIABLE_CLAIM_TYPES } from './researchRules'
 import {
   assertAnnotationInput,
@@ -103,10 +103,13 @@ export function validateReviewRecord(raw: unknown): ReviewAnnotation {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new ReviewStoreError('审阅记录必须是对象')
   }
-  const allowed = new Set(['reviewId', 'subjectKey', 'decision', 'reason', 'reviewer', 'rubricVersion', 'reviewedAt'])
+  const allowed = new Set(['reviewId', 'subjectKey', 'decision', 'reason', 'reviewer', 'rubricVersion', 'reviewedAt', 'contentSha256'])
   const record = raw as Record<string, unknown>
   for (const key of Object.keys(record)) {
     if (!allowed.has(key)) throw new ReviewStoreError(`审阅记录含未知字段:${key}`)
+  }
+  if (record.contentSha256 !== undefined && (typeof record.contentSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(record.contentSha256))) {
+    throw new ReviewStoreError('审阅内容 hash 非法')
   }
   for (const field of ['reviewId', 'subjectKey', 'reason', 'reviewer', 'rubricVersion', 'reviewedAt']) {
     if (typeof record[field] !== 'string' || (record[field] as string).trim() === '') {
@@ -136,9 +139,24 @@ export class FileReviewStore implements ReviewSource {
   private readonly records: ReviewAnnotation[] = []
   readonly file: string
 
-  constructor(readonly reviewRoot: string, fileName: string = 'reviews.jsonl') {
+  constructor(readonly reviewRoot: string, fileName: string = 'reviews.jsonl', private readonly artifactRoot?: string) {
     this.file = join(reviewRoot, fileName)
     if (existsSync(this.file)) this.load(this.file)
+  }
+
+  private contentHash(subjectKey: string): string {
+    const ref = parseReviewSubjectKey(subjectKey)
+    const data = loadCaseArtifacts(caseArtifactDir(this.artifactRoot!, ref.evalRunId, ref.configId, ref.caseId, ref.repeatIndex))
+    if (data.manifest.evalRunId !== ref.evalRunId || data.manifest.configId !== ref.configId || data.manifest.caseId !== ref.caseId || data.manifest.repeatIndex !== ref.repeatIndex) {
+      throw new ReviewStoreError('审阅对象与产物标识不一致')
+    }
+    const evidence = data.evidence as unknown as ReviewableCaseEvidence
+    if (!Array.isArray(evidence.claims) || !Array.isArray(evidence.citations) ||
+        !enumerateClaimEvidenceSubjects({ ...evidence, ...ref }).includes(subjectKey)) {
+      throw new ReviewStoreError('审阅 claim/evidence 对象不存在')
+    }
+    const files = [...data.manifest.files].sort((a, b) => a.name.localeCompare(b.name))
+    return createHash('sha256').update(JSON.stringify({ subjectKey, files })).digest('hex')
   }
 
   private load(file: string): void {
@@ -175,7 +193,8 @@ export class FileReviewStore implements ReviewSource {
     assertAnnotationInput(annotation)
     const record: ReviewAnnotation = {
       reviewId: randomUUID(),
-      ...annotation
+      ...annotation,
+      ...(this.artifactRoot ? { contentSha256: this.contentHash(annotation.subjectKey) } : {})
     }
     mkdirSync(this.reviewRoot, { recursive: true })
     // 先持久写成功再返回:同步追加,写失败抛错且不进内存
@@ -187,7 +206,9 @@ export class FileReviewStore implements ReviewSource {
   /** 对象的最新审阅(无则 null;最后一条有效记录为当前判断) */
   latestFor(subjectKey: string): ReviewAnnotation | null {
     const all = this.historyFor(subjectKey)
-    return all.length > 0 ? all[all.length - 1]! : null
+    const latest = all.length > 0 ? all[all.length - 1]! : null
+    if (!latest || !this.artifactRoot) return latest
+    try { return latest.contentSha256 === this.contentHash(subjectKey) ? latest : null } catch { return null }
   }
 
   historyFor(subjectKey: string): ReviewAnnotation[] {
@@ -195,7 +216,14 @@ export class FileReviewStore implements ReviewSource {
   }
 
   all(): readonly ReviewAnnotation[] {
-    return this.records
+    if (!this.artifactRoot) return this.records
+    const current = new Map<string, string | null>()
+    for (const record of this.records) {
+      if (!current.has(record.subjectKey)) {
+        try { current.set(record.subjectKey, this.contentHash(record.subjectKey)) } catch { current.set(record.subjectKey, null) }
+      }
+    }
+    return this.records.filter(record => !!record.contentSha256 && record.contentSha256 === current.get(record.subjectKey))
   }
 }
 

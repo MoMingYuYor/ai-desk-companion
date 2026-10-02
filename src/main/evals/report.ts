@@ -11,6 +11,9 @@ import type { EvalRunState } from './runner'
 import type { EvalMetrics } from './metrics'
 import type { LoadedDataset } from './dataset'
 import type { ResearchScoreResult } from './researchRules'
+import type { FrozenEvalConfig } from './configStore'
+import { frozenConfigSha256 } from './configStore'
+import { actualRoutingReasons } from './comparison'
 
 /** 评测结果 schema 版本:报告与产物按此版本解读(规范 EVAL-01 验收要求) */
 export const EVAL_RESULT_SCHEMA_VERSION = 1
@@ -21,6 +24,7 @@ export interface ReportInput {
   dataset: LoadedDataset
   /** 复现命令(按实现核对后的形式) */
   reproduceCommand: string
+  frozenConfigs?: Record<string, { config: FrozenEvalConfig; sha256: string }>
 }
 
 function fmtMetric(label: string, value: { value: number | null; n: number; denominator: number; untested?: boolean }): string {
@@ -49,6 +53,7 @@ export function renderEvalReport(input: ReportInput): string {
   lines.push(`- 数据集:${state.datasetVersion}(cases sha256 \`${state.casesSha256.slice(0, 16)}…\`,共 ${dataset.cases.length} 条)`)
   lines.push(`- split:${state.splits.join(' / ')};重复:${state.repeats};配置:${state.configIds.join(', ')}`)
   lines.push(`- 状态:${state.status};起止:${state.startedAt} ~ ${state.finishedAt ?? '进行中'}`)
+  lines.push('- 程序终态不代表案例正确；失败和未启动分别保留。')
   if (state.stopReason) lines.push(`- 终止原因:${state.stopReason}`)
   if (state.originEvalRunId) lines.push(`- 来源运行(显式重新试验):${state.originEvalRunId}`)
   if (state.lastInterruption && state.lastInterruption.combos.length > 0) {
@@ -56,6 +61,24 @@ export function renderEvalReport(input: ReportInput): string {
   }
   lines.push(`- 复现:\`${input.reproduceCommand}\``)
   lines.push('')
+
+  if (!fake) {
+    lines.push('## 实际路由与可比性', '')
+    for (const configId of state.configIds) {
+      const frozen = input.frozenConfigs?.[configId]
+      if (!frozen || frozen.sha256 !== frozenConfigSha256(frozen.config)) {
+        lines.push(`- ${configId}：缺完整冻结配置，不可比`)
+        continue
+      }
+      const rows = state.results.filter(row => row.configId === configId && row.status !== 'not_run')
+      const providers = rows.flatMap(row => [row.actualProvider ?? null, ...(row.modelAttempts ?? []).map(attempt => ({ providerId: attempt.providerId, providerName: attempt.providerName, model: attempt.model }))])
+      lines.push(`- ${configId} 冻结：${frozen.config.providerId} / ${frozen.config.model}`)
+      for (const provider of providers) lines.push(`  - 实际：${provider ? `${provider.providerId} / ${provider.model}` : '缺观测'}`)
+      const reasons = actualRoutingReasons(frozen.config, providers)
+      lines.push(`- ${configId}：${reasons.length ? reasons.join('；') : '实际 provider/model 与冻结目标一致；跨配置可比性仍需完整差异校验'}`)
+    }
+    lines.push('', '| 费用 | null（缺少已核验价格/账单） |', '', '- 语义支持待人工审阅，第二人未复核；本报告不自动认证支持精度。', '')
+  }
 
   const started = state.results.filter((r) => r.status !== 'not_run').length
   const notRun = state.results.filter((r) => r.status === 'not_run').length

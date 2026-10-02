@@ -15,6 +15,7 @@ import { initSchema } from '../../src/main/db/dao'
 import { initWorkspaceEpoch, OperationError } from '../../src/main/db/operations'
 import { fixedClock } from '../../src/shared/clock'
 import { FakeProvider } from '../../src/main/providers/fake'
+import { ModelRequestError } from '../../src/main/services/modelRequest'
 import {
   createClaim,
   createCitation,
@@ -26,6 +27,7 @@ import {
   getEvidenceSpan,
   getSubQuestion,
   listClaims,
+  listFrozenClaimIds,
   saveAllOfRequirement
 } from '../../src/main/research/repository'
 import {
@@ -172,6 +174,15 @@ function chainOf(
 
 const SAMPLE_JD = '岗位:数据工程师。\n要求:Python 熟练。\n加分项:SQL。\n地点:上海。\n'
 const QUOTE_PYTHON = '要求:Python 熟练。'
+
+function observationFailure(): ModelRequestError {
+  return new ModelRequestError('OBSERVATION_FAILED', 'synthetic observation save failure', [{
+    requestId: 'synthetic-request', attemptId: 'synthetic-attempt', ordinal: 1,
+    providerId: 'fake', providerName: 'FakeProvider', model: 'fake-model',
+    outcome: 'succeeded', latencyMs: 1, httpStatus: 200, responseModel: 'fake-model',
+    usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15, source: 'provider' }
+  }], false)
+}
 
 // ---------- 引用闭包:URL 正常但原文不支持 / 跨运行 / hash ----------
 
@@ -515,6 +526,24 @@ describe('detectConflicts 冲突分组', () => {
 // ---------- 语义审核:错误岗位 / 条件被删 / 降级路径 ----------
 
 describe('reviewClaims 语义审核', () => {
+  it('T07 独立审核原样抛出 OBSERVATION_FAILED 并保留 attempts', async () => {
+    const db = await makeTestDb()
+    const snap = importOne(db, { sourceName: 'jd-a.md', bytes: bytesOf(SAMPLE_JD), sample: true })
+    const { runId, subquestionId } = seedRun(db, [snap.documentId])
+    const start = codePointOffsetOf(db, snap.documentId, QUOTE_PYTHON)
+    const chain = chainOf(db, runId, subquestionId, snap.documentId, {
+      quote: QUOTE_PYTHON, start, end: start + Array.from(QUOTE_PYTHON).length,
+      claimText: '岗位A 明确要求 Python 熟练'
+    })
+    validateCitations(db, runId)
+    const failure = observationFailure()
+    const provider = new FakeProvider({ script: () => { throw failure } })
+    await expect(reviewClaims(db, runId, provider, { contextBudget: 100000 })).rejects.toBe(failure)
+    expect(failure.attempts[0]!.usage.totalTokens).toBe(15)
+    expect(getClaim(db, chain.claimId)?.supportStatus).toBe('candidate')
+    db.close()
+  })
+
   it('正确 quote 配错误岗位:结构通过,模型审核判 unsupported', async () => {
     const db = await makeTestDb()
     const snap = importOne(db, { sourceName: 'jd-a.md', bytes: bytesOf(SAMPLE_JD), sample: true })
@@ -759,6 +788,20 @@ describe('三分不足表达', () => {
 // ---------- 版本化报告:白名单、模板、版本唯一与不可变 ----------
 
 describe('buildReport 版本化报告', () => {
+  it('T07 独立报告原样抛出 OBSERVATION_FAILED,不得新增模板版本或冻结命题', async () => {
+    const db = await makeTestDb()
+    const { runId, claimId } = await seedSupportedRun(db)
+    const failure = observationFailure()
+    const provider = new FakeProvider({ script: () => { throw failure } })
+    await expect(buildReport(db, runId, { version: 1, completer: provider })).rejects.toBe(failure)
+    expect(db.get<{ n: number }>('SELECT COUNT(*) AS n FROM research_reports')?.n).toBe(0)
+    expect(getClaim(db, claimId)?.supportStatus).toBe('supported')
+    // OBSERVATION_FAILED 不能借模板路径冻结本次命题。
+    const task = db.get<{ research_task_id: string }>('SELECT research_task_id FROM research_tasks WHERE run_id = ?', [runId])!
+    expect(listFrozenClaimIds(db, task.research_task_id).has(claimId)).toBe(false)
+    db.close()
+  })
+
   /** 造一条 supported 链并返回 runId/claimId */
   async function seedSupportedRun(db: SqliteDb): Promise<{ runId: string; claimId: string; snapshotId: string }> {
     const snap = importOne(db, { sourceName: 'jd-a.md', bytes: bytesOf(SAMPLE_JD), sample: true })

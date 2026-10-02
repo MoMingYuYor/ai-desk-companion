@@ -115,6 +115,30 @@ describe('R-07 集成:research_v1 数据集装载与 fixture 材料', () => {
   })
 })
 
+describe('T13 research_v1 全量 fake 业务预期', () => {
+  it('40 条逐条符合 expected，注入被隔离、无 artifact_failed 和审批绕过', async () => {
+    const dataset = loadDatasetFromDir(DATA_DIR)
+    registerResearchFixtures(dataset.cases.map((item) => item.fixture_id))
+    const { runner, artifactRoot } = runnerFor(dataset, ['dev', 'holdout'], dataset.cases.map((item) => item.case_id))
+    const state = await runner.run()
+    console.info(JSON.stringify({ suite: 'research40-full', artifactRoot, evalRunId: state.evalRunId }))
+    expect(state.status).toBe('completed')
+    expect(state.results).toHaveLength(40)
+    expect(state.results.filter((result) => result.status === 'not_run')).toEqual([])
+    expect(state.results.filter((result) => result.failureReasons.length > 0)).toEqual([])
+    expect(state.results.filter((result) => result.confirmedBypass)).toEqual([])
+    for (const item of dataset.cases) {
+      const result = state.results.find((row) => row.caseId === item.case_id)!
+      expect(result.status, item.case_id).toBe('passed')
+      expect(result.terminalStatus, item.case_id).toBe(item.expected.terminal_status)
+      expect(result.artifactStatus, item.case_id).toBe('ok')
+      expect(result.modelAttempts, item.case_id).toEqual([])
+      expect(result.researchScoring?.applicable, item.case_id).toBe(true)
+      for (const tool of item.expected.forbidden_tools ?? []) expect(result.executedTools, item.case_id).not.toContain(tool)
+    }
+  }, 10_000)
+})
+
 describe('R-07 集成:3 条代表性 case 端到端(fake 隔离执行)', () => {
   const dataset = loadDatasetFromDir(DATA_DIR)
   registerResearchFixtures(dataset.cases.map((c) => c.fixture_id))

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { makeTestDb } from '../helpers'
 import { initWorkspaceEpoch } from '../../src/main/db/operations'
 import { ToolGateway } from '../../src/main/tools/gateway'
@@ -28,6 +28,23 @@ async function call(deps: McpDeps, method: string, params?: unknown, id: unknown
 }
 
 describe('MCP 协议', () => {
+  it.each([{ method: 'tools/list' }, { jsonrpc: '1.0', method: 'tools/list' }, { jsonrpc: '2.0', method: 1 }, { jsonrpc: '2.0', method: 'tools/list', id: null }, { jsonrpc: '2.0', method: 'tools/list', id: {} }])('非法信封不执行请求 %#', async raw => {
+    const { deps } = await makeMcp()
+    expect(await handleMcpMessage(deps, raw)).toMatchObject({ error: { code: -32600 } })
+  })
+  it('tools/call 通知不创建提案且不响应，协议版本不匹配拒绝初始化', async () => {
+    const { db, deps } = await makeMcp()
+    expect(await handleMcpMessage(deps, { jsonrpc: '2.0', method: 'tools/call', params: { name: 'create_todo', arguments: { title: '通知提案' } } })).toBeNull()
+    expect(db.all('SELECT * FROM approvals')).toHaveLength(0)
+    expect(await call(deps, 'initialize', { protocolVersion: '2099-01-01' })).toMatchObject({ error: { code: -32602 } })
+  })
+  it('提案保存失败不返回可用 approvalId', async () => {
+    const { db, deps } = await makeMcp()
+    vi.spyOn(db, 'flush').mockImplementation(() => { throw new Error('保存失败') })
+    const response = await call(deps, 'tools/call', { name: 'create_todo', arguments: { title: '未保存' } })
+    expect(response).toMatchObject({ result: { isError: true } })
+    expect(JSON.stringify(response)).not.toContain('approvalId')
+  })
   it('initialize 返回协议版本与服务器信息', async () => {
     const { deps } = await makeMcp()
     const res = await call(deps, 'initialize') as { result: { protocolVersion: string; serverInfo: typeof MCP_SERVER_INFO } }

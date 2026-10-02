@@ -8,6 +8,7 @@
 // - Fake/real 分列:执行类型单选 + 配置行按 executionKind 打标签,
 //   fake 结果不代表模型能力(报告侧同样显著标示)。
 import { useCallback, useEffect, useRef, useState } from 'react'
+import type { ProviderInfo } from '../../../shared/types'
 import type {
   EvalCaseArtifactsView,
   EvalCaseOutcomeView,
@@ -55,6 +56,10 @@ export function EvalsPage({ refreshKey }: { refreshKey: number }): JSX.Element {
   const [reviewer, setReviewer] = useState('人工')
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [experimentId, setExperimentId] = useState('adc-rc1')
+  const [providers, setProviders] = useState<ProviderInfo[]>([])
+  const [providerId, setProviderId] = useState('')
+  const [model, setModel] = useState('')
   const nonceRef = useRef(0)
 
   const loadMeta = useCallback(async (): Promise<void> => {
@@ -71,6 +76,35 @@ export function EvalsPage({ refreshKey }: { refreshKey: number }): JSX.Element {
   }, [])
 
   useEffect(() => { void loadMeta() }, [loadMeta, refreshKey])
+
+  useEffect(() => {
+    if (executionKind !== 'real') return
+    let stopped = false
+    void (async () => {
+      try {
+        const items = await window.api.listProviders()
+        if (stopped) return
+        setProviders(items)
+        if (!providerId && items[0]) { setProviderId(items[0].id); setModel(items[0].defaultModel) }
+      } catch (err) { if (!stopped) setError(err instanceof Error ? err.message : String(err)) }
+    })()
+    return () => { stopped = true }
+  }, [executionKind, providerId])
+
+  const freezeConfigs = async (): Promise<void> => {
+    if (!datasetVersion) { setError('请选择数据集'); return }
+    const provider = providers.find(p => p.id === providerId)
+    if (executionKind === 'real' && (!provider || !model)) { setError('请选择已配置服务商和模型'); return }
+    setBusy(true); setError(null)
+    try {
+      const result = await window.api.freezeEvalExperiment({ experimentId, datasetVersion,
+        stage: datasetVersion.startsWith('personal_ops_') ? 'ops-planning' : 'research-extraction', executionKind,
+        target: executionKind === 'real' && provider ? { providerId: provider.id, protocol: provider.protocol, baseUrl: provider.baseUrl, model } : null })
+      await loadMeta()
+      setSelectedConfigs(result.configIds)
+    } catch (err) { setError(err instanceof Error ? err.message : String(err)) }
+    finally { setBusy(false) }
+  }
 
   // 进度轮询:activeRun 变化(启动/取消/重开)即重新绑定;终态后拉报告与审阅总览
   useEffect(() => {
@@ -288,6 +322,18 @@ export function EvalsPage({ refreshKey }: { refreshKey: number }): JSX.Element {
           </label>
         </div>
         <div style={{ marginTop: 8, fontWeight: 600 }}>冻结配置</div>
+        <div className="row" style={{ gap: 8, flexWrap: 'wrap', marginTop: 6 }}>
+          <label>实验名称 <input data-testid="evals-experiment" value={experimentId} onChange={e => setExperimentId(e.target.value)} /></label>
+          {executionKind === 'real' && <>
+            <select aria-label="评测服务商" value={providerId} onChange={e => { setProviderId(e.target.value); setModel(providers.find(p => p.id === e.target.value)?.defaultModel ?? '') }}>
+              {providers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+            <select aria-label="评测模型" value={model} onChange={e => setModel(e.target.value)}>
+              {(providers.find(p => p.id === providerId)?.models ?? []).map(m => <option key={m} value={m}>{m}</option>)}
+            </select>
+          </>}
+          <button data-testid="evals-freeze" disabled={busy || !datasetVersion} onClick={() => void freezeConfigs()}>创建对照配置</button>
+        </div>
         {configs.length === 0 && <div className="muted">暂无冻结配置(fake-flow-v1 会在启动时自动注册)</div>}
         {configs.map((c) => (
           <label key={c.configId} className="row" style={{ justifyContent: 'flex-start', gap: 8, padding: '2px 0' }}>

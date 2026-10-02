@@ -32,6 +32,13 @@ interface BusinessSnapshot {
   tables: Record<string, Row[]>
 }
 
+/** 原快照也无法保存时，保留恢复窗口和外部暂停，需重启后核查磁盘状态。 */
+class RestoreRollbackError extends OperationError {
+  constructor() {
+    super(appError('PERSIST_FAILED', '恢复失败且原快照无法确认落盘，已暂停写入，请重启后核查数据'))
+  }
+}
+
 // ---------- 导出 ----------
 
 export function exportBackup(db: SqliteDb, filePath: string): void {
@@ -122,7 +129,7 @@ function expireApprovalsWithoutParams(db: SqliteDb): void {
   }
 }
 
-function replaceBusinessTables(db: SqliteDb, backup: ValidatedBackup): Record<string, number> {
+function replaceBusinessTables(db: SqliteDb, backup: ValidatedBackup, afterReplace?: () => void): Record<string, number> {
   const spec = getBackupVersionSpec(backup.schemaVersion)
   const imported: Record<string, number> = {}
   db.transaction(() => {
@@ -144,6 +151,7 @@ function replaceBusinessTables(db: SqliteDb, backup: ValidatedBackup): Record<st
     // C-05:chunks 行被整体替换,rowid 可能变化,FTS 索引必须重建对齐。
     // 旧版本备份不含检索表时,恢复即清空检索语料(语料可由原始文件重新导入)。
     rebuildSearchIndex(db)
+    afterReplace?.()
   })
   return imported
 }
@@ -179,9 +187,9 @@ function restoreSnapshot(db: SqliteDb, snapshot: BusinessSnapshot): void {
  * 落盘失败回滚到前快照并再次尝试落盘(仍失败交给保存调度器重试),然后以
  * PERSIST_FAILED 拒绝,保证内存、磁盘与"原库"一致,不会停在半恢复状态。
  */
-function replaceWithRollback(db: SqliteDb, backup: ValidatedBackup): { imported: Record<string, number> } {
+function replaceWithRollback(db: SqliteDb, backup: ValidatedBackup, afterReplace?: () => void): { imported: Record<string, number> } {
   const snapshot = captureSnapshot(db)
-  const imported = replaceBusinessTables(db, backup)
+  const imported = replaceBusinessTables(db, backup, afterReplace)
   try {
     db.flush()
   } catch {
@@ -189,7 +197,7 @@ function replaceWithRollback(db: SqliteDb, backup: ValidatedBackup): { imported:
     try {
       db.flush()
     } catch {
-      // 恢复前快照也暂时无法落盘:保存调度器按 1/5/30/30 秒继续重试,内存已是前快照
+      throw new RestoreRollbackError()
     }
     throw new OperationError(
       appError('PERSIST_FAILED', '备份恢复已回滚:替换后的数据未能确认落盘', { retryable: true })
@@ -225,6 +233,8 @@ export function ensureNotRestoring(): void {
 export interface RestoreBackupOptions {
   /** 取消外部请求并等待在途任务结束,返回解除暂停函数(生产接线:mail.quiesceForBackup) */
   quiesceExternal?: () => Promise<() => void> | (() => void)
+  /** 替换事务内、首次恢复落盘前修复导入状态；异常随替换整体回滚。 */
+  afterReplace?: () => void
   /** 恢复成功结束后的广播:通知各窗口刷新 revision/workspaceEpoch(任务 12 接线) */
   onRestored?: () => void
 }
@@ -252,6 +262,7 @@ export async function restoreBackup(
   const backup = readBackupFile(filePath) // 先验:坏文件不值得开窗,也不产生任何写入
   restoreWindowOpen = true
   let resume: (() => void) | undefined
+  let faultLocked = false
   try {
     resume = await opts.quiesceExternal?.()
     try {
@@ -263,13 +274,16 @@ export async function restoreBackup(
           appError('PERSIST_FAILED', '恢复中止:当前数据未能确认落盘,未发生替换', { retryable: true })
         )
       }
-      const { imported } = replaceWithRollback(db, backup)
+      const { imported } = replaceWithRollback(db, backup, opts.afterReplace)
       opts.onRestored?.()
       return { imported, schemaVersion: backup.schemaVersion }
+    } catch (error) {
+      faultLocked = error instanceof RestoreRollbackError
+      throw error
     } finally {
-      resume?.()
+      if (!faultLocked) resume?.()
     }
   } finally {
-    restoreWindowOpen = false
+    if (!faultLocked) restoreWindowOpen = false
   }
 }

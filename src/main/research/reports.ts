@@ -34,6 +34,8 @@ import {
   type RunCitationRow
 } from './repository'
 import type { Claim, Report, SubQuestion } from './schemas'
+import { getResearchSourceRecord } from './snapshots'
+import { validateRecordScope } from './recordScope'
 
 // ---------- 章节契约(固定八段;顺序即规格第 6 节) ----------
 
@@ -109,6 +111,8 @@ export interface ReportResponse {
   report_state: Report['reportState']
   run_status: string
   manifest_sha256: string
+  scope_verification: 'verified' | 'legacy_unverified'
+  scope_warning: string | null
   sections: ReportSectionContent[]
   claims: ReportClaimView[]
   citations: ReportCitationView[]
@@ -370,10 +374,11 @@ export async function buildReport(db: SqliteDb, runId: string, options: BuildRep
       })
       plan = parseSynthesisPlan(result.data, allowed)
     } catch (err) {
-      // RES-01:取消与预算/时限耗尽必须穿过组织兜底重新抛出;
+      // 取消、观测失败与预算/时限耗尽必须原样传播,阻止模板成功收尾。
       // 其余输出/网络错误回退确定性模板
       if (isBudgetExhaustedError(err)) throw err
       if (err instanceof ModelRequestError && err.code === 'CANCELLED') throw err
+      if (err instanceof ModelRequestError && err.code === 'OBSERVATION_FAILED') throw err
       if (options.control?.signal.aborted) throw err // beforeSend 内的协作取消
       plan = null
     }
@@ -521,6 +526,23 @@ export function assembleReportResponse(
   const task = getResearchTaskByRun(db, runId)
   if (!task) throw new OperationError(appError('TARGET_UNAVAILABLE', `运行缺少研究任务:${runId}`, { retryable: false }))
   const manifest = getSnapshotManifest(db, task.snapshotManifestId)
+  // 历史展示只做验证，不补写旧范围，也不改变冻结正文、hash 或审核结果。
+  let scopeVerified = !!manifest && manifest.entries.length > 0
+  if (scopeVerified && manifest) {
+    try {
+      verifySnapshotManifest(db, task.snapshotManifestId)
+      for (const entry of manifest.entries) {
+        const source = getResearchSourceRecord(db, entry.snapshot_id)
+        if (!source?.recordScope || entry.record_scope === undefined) { scopeVerified = false; break }
+        const scope = validateRecordScope(entry.record_scope, source.codePointLength)
+        if (scope.sourceLocator !== source.recordScope.sourceLocator || scope.startOffset !== source.recordScope.startOffset ||
+          scope.endOffset !== source.recordScope.endOffset) { scopeVerified = false; break }
+      }
+    } catch (error) {
+      if (error instanceof SyntaxError || error instanceof OperationError) scopeVerified = false
+      else throw error
+    }
+  }
   const subquestions = listSubQuestions(db, task.researchTaskId)
   const claims = listClaims(db, task.researchTaskId)
   const spans = listEvidenceSpansForRun(db, runId)
@@ -573,6 +595,8 @@ export function assembleReportResponse(
     report_state: report.reportState,
     run_status: context.runStatus,
     manifest_sha256: report.manifestSha256,
+    scope_verification: scopeVerified ? 'verified' : 'legacy_unverified',
+    scope_warning: scopeVerified ? null : '历史报告的记录范围未验证，请从原始资料重新导入后创建新运行',
     sections,
     claims: claimViews,
     citations: citationViews,

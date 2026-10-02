@@ -1,4 +1,5 @@
 // IPC 通道名与渲染进程可见的 API 契约
+import type { FreezeInput } from './evals'
 import type {
   Analysis,
   AppInfo,
@@ -163,6 +164,7 @@ export const Channels = {
   // 桌宠与面板按 ipcPolicy 能力表拒绝)
   EvalCancelRun: 'eval:cancel-run',
   EvalListConfigs: 'eval:list-configs',
+  EvalFreeze: 'eval:freeze',
   EvalCaseArtifacts: 'eval:case-artifacts',
   EvalReviewSave: 'eval:review-save',
   EvalReviewList: 'eval:review-list',
@@ -310,6 +312,7 @@ export interface EvalConfigView {
  * interaction_script,且仅由隔离 runner 读取。
  */
 export interface EvalStartParams {
+  caseIds?: string[]
   datasetVersion: string
   split: 'dev' | 'holdout'
   executionKind: 'fake' | 'real'
@@ -568,6 +571,7 @@ export interface RendererApi {
   cancelEvalRun(evalRunId: string): Promise<{ cancelled: boolean }>
   /** 配置发现:冻结配置清单(fake/real 标签来自 executionKind) */
   listEvalConfigs(): Promise<EvalConfigView[]>
+  freezeEvalExperiment(input: FreezeInput): Promise<{ configIds: string[]; manifestSha256: string }>
   /** case 产物查询(完整性校验失败 ok=false,不抛异常) */
   getEvalCaseArtifacts(
     evalRunId: string,

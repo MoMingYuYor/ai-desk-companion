@@ -210,7 +210,11 @@ export class ToolGateway {
         ...patch
       }
       // 观察写库失败由注入方抛出并向上传播,停止后续动作
-      this.deps.onObservation?.(record)
+      try {
+        this.deps.onObservation?.(record)
+      } catch {
+        throw new OperationError(appError('OBSERVATION_FAILED', '工具观察记录无法写入，运行已停止', { operationId }))
+      }
     }
 
     // 信封契约:出现 approved 键(无论值)一律拒绝,拒绝本身也被观测
@@ -282,6 +286,7 @@ export class ToolGateway {
       )
     } catch (err) {
       // apply 抛错:事务(含 apply 内观察)整体回滚,在外层记录真实失败
+      if (err instanceof OperationError && err.appError.code === 'OBSERVATION_FAILED') throw err
       emit('tool', { outcome: 'gateway_error', error: asAppError(err) })
       throw err
     }
@@ -309,16 +314,19 @@ export class ToolGateway {
           committed: true,
           durationMs: Math.max(0, this.deps.clock.monotonicMs() - persistStartedMs)
         })
+        // 最终观察在首轮保存之后生成，必须再次保存才可返回；不重复运行业务。
+        await this.deps.persistCoordinator.commitCritical(operationId, value)
         return value
       } catch (err) {
+        if (err instanceof OperationError && err.appError.code === 'OBSERVATION_FAILED') throw err
         // PERSIST_FAILED 单列 outcome 且 committed=true:事务已提交,仅落盘未确认
-        emit('persistence', {
+        try { emit('persistence', {
           outcome: 'persist_error',
           replayed: outcome.replayed,
           committed: true,
           error: asAppError(err),
           durationMs: Math.max(0, this.deps.clock.monotonicMs() - persistStartedMs)
-        })
+        }) } catch { console.error('[tool-gateway] 保存失败留痕未确认') }
         throw err
       }
     }

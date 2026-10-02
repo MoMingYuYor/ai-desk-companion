@@ -34,10 +34,12 @@ import {
   caseArtifactDir,
   defaultCodeVersion,
   loadCaseArtifacts,
-  verifyCaseArtifacts
+  verifyCaseArtifacts,
+  safeSegment
 } from './artifacts'
 import {
   findFrozenConfig,
+  frozenConfigSha256,
   listFrozenConfigIds,
   loadFrozenConfig,
   saveFrozenConfig,
@@ -58,7 +60,10 @@ import {
   reviewHoldoutStatus
 } from './reviewStore'
 import type { ReviewAnnotation, ReviewDecision } from './reviews'
-import type { StructuredCompleter } from '../agent/llm'
+import type { EvalFreezeVersions, FreezeInput } from '../../shared/evals'
+import type { RealCompleterFor } from './realAdapter'
+import { freezeExperiment, validateFrozenExperiment, type FrozenExperimentPair } from './freeze'
+import { selectExplicitSmokeCases } from './experiment'
 
 // ---------- 依赖契约 ----------
 
@@ -71,7 +76,8 @@ export interface EvalsDeps {
    * real 执行的底层补全适配器(RES-01 组合入口注入);缺省时服务端拒绝 real 启动
    * (fake 离线运行不受影响)。
    */
-  realCompleter?: StructuredCompleter
+  realCompleterFor?: RealCompleterFor
+  versionsOf?: () => EvalFreezeVersions
   /**
    * 运行时凭据解析门(providerId → 凭据是否可解析):desktop 查凭据库,
    * CLI 只认环境变量 AI_DESK_EVAL_API_KEY。凭据绝不落盘。
@@ -87,6 +93,7 @@ export interface EvalStartRequest {
   configIds: string[]
   repeats: number
   maxCases: number
+  caseIds?: string[]
 }
 
 /** 服务端启动上限(渲染层输入不可信,预算与数量在此收口) */
@@ -136,6 +143,7 @@ function sha256OfText(text: string): string {
  * 数据或 manifest 改动后自然失效。缺资源抛出带具体路径的错误,不静默返回空。
  */
 export function loadEvalsDataset(datasetRoot: string, version: string): LoadedDataset {
+  safeSegment('datasetVersion', version)
   const dir = join(datasetRoot, version)
   const casesFile = join(dir, 'cases.jsonl')
   const manifestFile = join(dir, 'manifest.json')
@@ -160,15 +168,15 @@ export function loadEvalsDataset(datasetRoot: string, version: string): LoadedDa
   if (typeof declaredHash !== 'string') {
     throw validationError(`评测数据集 manifest 缺少 cases_sha256:${manifestFile}`)
   }
-  const key = `${datasetRoot}|${version}|${declaredHash}|${sha256OfText(manifestRaw)}`
-  const cached = datasetCache.get(key)
-  if (cached) return cached
   let jsonl: string
   try {
     jsonl = readFileSync(casesFile, 'utf-8')
   } catch (err) {
     throw validationError(`评测数据集 cases 不可读:${casesFile}:${err instanceof Error ? err.message : String(err)}`)
   }
+  const key = `${datasetRoot}|${version}|${declaredHash}|${sha256OfText(manifestRaw)}|${sha256OfText(jsonl)}`
+  const cached = datasetCache.get(key)
+  if (cached) return cached
   let dataset: LoadedDataset
   try {
     dataset = loadDatasetFromText(jsonl, manifest)
@@ -189,7 +197,6 @@ function stableSha256(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value), 'utf-8').digest('hex')
 }
 
-const fixtureCorpusShaCache = new Map<string, string>()
 
 /**
  * fixture 冻结 hash:引用的 fixture_id 全集 + 磁盘语料内容 hash 的稳定序列化。
@@ -198,8 +205,6 @@ const fixtureCorpusShaCache = new Map<string, string>()
  * toolsVersion/codeCommit 冻结字段承载)。研究语料目录缺失仍显式报错。
  */
 function fixtureCorpusSha256(fixtureRoot: string, fixtureIds: readonly string[]): string {
-  const cached = fixtureCorpusShaCache.get(fixtureRoot)
-  if (cached) return cached
   const entries: Array<{ fixture: string; corpus: Array<{ name: string; sha256: string }> | null }> = []
   for (const fixtureId of [...fixtureIds].sort()) {
     const dir = join(fixtureRoot, fixtureId)
@@ -218,7 +223,6 @@ function fixtureCorpusSha256(fixtureRoot: string, fixtureIds: readonly string[])
     entries.push({ fixture: fixtureId, corpus: files })
   }
   const hash = stableSha256(entries)
-  fixtureCorpusShaCache.set(fixtureRoot, hash)
   return hash
 }
 
@@ -391,6 +395,18 @@ export class EvalsService {
     })
   }
 
+  freeze(input: FreezeInput): FrozenExperimentPair {
+    const versions = this.deps.versionsOf?.()
+    if (!versions) throw validationError('冻结需要明确的当前代码版本')
+    return freezeExperiment(this.deps.paths, input, versions)
+  }
+
+  private validateExperiment(configId: string) {
+    const versions = this.deps.versionsOf?.()
+    if (!versions) throw validationError('新实验启动需要明确的当前代码版本')
+    return validateFrozenExperiment(this.deps.paths, configId, versions)
+  }
+
   // ---- 批次启动与取消 ----
 
   /**
@@ -421,6 +437,10 @@ export class EvalsService {
     }
     // 2) 数据集:缺失/损坏给出具体路径
     const dataset = loadEvalsDataset(datasetRoot, params.datasetVersion)
+    if (params.caseIds !== undefined) {
+      if (params.split !== 'dev') throw validationError('显式 smoke 清单仅允许 dev')
+      selectExplicitSmokeCases(dataset.cases, params.caseIds)
+    }
     // 3) 配置冻结校验
     if (!Array.isArray(params.configIds) || params.configIds.length === 0) {
       throw validationError('至少选择一个冻结配置')
@@ -451,7 +471,7 @@ export class EvalsService {
     })
     // 3) real:底层适配器与运行时凭据门(凭据只在运行时解析,绝不落盘)
     if (params.executionKind === 'real') {
-      if (!this.deps.realCompleter) {
+      if (!this.deps.realCompleterFor) {
         throw validationError('real 执行需要注入真实补全适配器(RES-01);当前服务仅支持 fake 离线运行')
       }
       for (const config of configs) {
@@ -462,6 +482,10 @@ export class EvalsService {
           )
         }
       }
+    }
+    for (const config of configs) {
+      if (config.schemaVersion === 2) this.validateExperiment(config.configId)
+      else if (params.executionKind === 'real') throw validationError('real 新实验需要 schema 2 和冻结 target')
     }
     // 4) fixture 语料根注入:case 执行器不再从 cwd 推导(打包/CLI 关键)
     setResearchFixtureRoot(fixtureRoot)
@@ -486,6 +510,7 @@ export class EvalsService {
         executionKind: params.executionKind,
         repeats: params.repeats,
         maxCases: params.maxCases,
+        ...(params.caseIds === undefined ? {} : { caseIds: [...params.caseIds] }),
         status: 'running',
         startedAt: new Date().toISOString(),
         finishedAt: null,
@@ -514,7 +539,8 @@ export class EvalsService {
     return createEvalCompleterFactory({
       configRoot: this.deps.paths.configRoot,
       templateRoot: join(this.deps.paths.configRoot, 'templates'),
-      realCompleter: this.deps.realCompleter,
+      realCompleterFor: this.deps.realCompleterFor,
+      targetOf: configId => this.validateExperiment(configId).target,
       credentialOf: this.deps.credentialOf
     })
   }
@@ -593,6 +619,13 @@ export class EvalsService {
       state,
       metrics,
       dataset,
+      frozenConfigs: Object.fromEntries(state.configIds.flatMap(configId => {
+        try {
+          const config = findFrozenConfig(this.deps.paths.configRoot, configId)
+          if (!config) return []
+          return [[configId, { config, sha256: frozenConfigSha256(config) }]]
+        } catch { return [] }
+      })),
       reproduceCommand: `npm run eval:run -- --dataset ${state.datasetVersion} --split ${state.splits.join(',')} --execution ${state.executionKind} --config ${state.configIds.join(',')} --repeats ${state.repeats} --max-cases ${state.maxCases}`
     })
   }
@@ -600,7 +633,7 @@ export class EvalsService {
   // ---- 人工审阅读写(FileReviewStore:追加式 JSONL,先持久写成功再返回) ----
 
   private reviews(): FileReviewStore {
-    this.reviewStore ??= new FileReviewStore(this.deps.paths.reviewRoot)
+    this.reviewStore ??= new FileReviewStore(this.deps.paths.reviewRoot, 'reviews.jsonl', this.deps.paths.artifactRoot)
     return this.reviewStore
   }
 

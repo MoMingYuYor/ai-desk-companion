@@ -86,6 +86,8 @@ requireDirWithFiles(join(root, 'node_modules', 'pdfjs-dist', 'cmaps'), 'pdf.js c
 
 // 评测只读资源(源根形态)与 build-info
 requireDirWithFiles(join(root, 'evals', 'datasets', 'personal_ops_v1'), '数据集 personal_ops_v1')
+requireFile(join(root, 'evals', 'datasets', 'personal_ops_v2', 'manifest.json'), '数据集 personal_ops_v2 manifest')
+requireFile(join(root, 'evals', 'datasets', 'personal_ops_v2', 'cases.jsonl'), '数据集 personal_ops_v2 cases')
 requireDirWithFiles(join(root, 'evals', 'datasets', 'research_v1'), '数据集 research_v1')
 requireDirWithFiles(join(root, 'fixtures', 'research'), '研究 fixtures')
 requireFile(join(root, 'evals', 'prompts', 'manifest.json'), '冻结提示词 manifest')
@@ -104,6 +106,8 @@ if (packagedDir != null) {
   requireDirWithFiles(join(res, 'cmaps'), '打包 pdf.js cmaps')
   // 打包态资源契约与 src/main/evals/resources.ts 的 resolveEvalPaths 一一对应
   requireDirWithFiles(join(res, 'evals', 'datasets', 'personal_ops_v1'), '打包数据集 personal_ops_v1')
+  requireFile(join(res, 'evals', 'datasets', 'personal_ops_v2', 'manifest.json'), '打包数据集 personal_ops_v2 manifest')
+  requireFile(join(res, 'evals', 'datasets', 'personal_ops_v2', 'cases.jsonl'), '打包数据集 personal_ops_v2 cases')
   requireDirWithFiles(join(res, 'evals', 'datasets', 'research_v1'), '打包数据集 research_v1')
   requireDirWithFiles(join(res, 'evals', 'fixtures', 'research'), '打包研究 fixtures')
   requireFile(join(res, 'evals', 'prompts', 'manifest.json'), '打包冻结提示词 manifest')

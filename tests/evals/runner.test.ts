@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -13,6 +13,8 @@ import { registerFixtureById } from '../../src/main/evals/isolation'
 import type { LoadedDataset } from '../../src/main/evals/dataset'
 import type { EvalCase } from '../../src/main/evals/types'
 import { fixedClock } from '../../src/shared/clock'
+import { loadCaseArtifacts } from '../../src/main/evals/artifacts'
+import { calculateMetrics } from '../../src/main/evals/metrics'
 import {
   createEvalCompleterFactory,
   loadTemplateFor,
@@ -88,6 +90,7 @@ function sha(text: string): string {
 }
 
 interface RunnerForOpts {
+  caseIds?: string[]
   repeats?: number
   maxCases?: number
   splits?: ('dev' | 'holdout')[]
@@ -114,6 +117,7 @@ function runnerFor(
       datasetVersion: dataset.manifest.dataset_version,
       casesSha256: dataset.casesSha256,
       splits: over.splits ?? ['dev'],
+      ...(over.caseIds ? { caseIds: over.caseIds } : {}),
       configIds: ['fake_flow'],
       executionKind: 'fake',
       repeats: over.repeats ?? 1,
@@ -160,6 +164,39 @@ function digestDb(db: import('../../src/main/db/connection').SqliteDb): string {
 }
 
 describe('EvalRunner 基本执行', () => {
+  it('系统日期变化不改变案例冻结时间、审批与执行结果', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const results = []
+      for (const systemDate of ['2027-02-01T00:00:00Z', '2028-02-01T00:00:00Z']) {
+        vi.setSystemTime(new Date(systemDate))
+        const { runner, artifactRoot } = runnerFor([caseLine('frozen-clock', {
+          expected: {
+            terminal_status: 'succeeded', tool_sequence: ['todo.create', 'mail.create_draft'],
+            required_arguments: {
+              'todo.create': { title: '任务 frozen-clock' },
+              'mail.create_draft': { body: '冻结时钟草稿' }
+            },
+            requires_confirmation: true
+          },
+          interaction_script: [
+            { on: 'confirmation', decision: 'approved' },
+            { on: 'confirmation', decision: 'approved' }
+          ]
+        })])
+        const state = await runner.run()
+        const outcome = state.results[0]!
+        const artifact = JSON.parse(readFileSync(join(artifactRoot, outcome.artifactDir!, 'run.json'), 'utf8'))
+        expect(artifact.run.contextClock).toBe(NOW)
+        expect(outcome.status, JSON.stringify(outcome.failureReasons)).toBe('passed')
+        results.push({ status: outcome.terminalStatus, tools: outcome.executedTools })
+      }
+      expect(results[0]).toEqual(results[1])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('写案例经批准后通过;轨迹与审批可追溯;记录真实耗时', async () => {
     const { runner } = runnerFor([caseLine('w1')])
     const state = await runner.run()
@@ -257,6 +294,17 @@ describe('EVAL-02 取消控制(F-10)', () => {
 })
 
 describe('EVAL-10 重启续跑', () => {
+  it('指定用例按清单顺序运行，重启时不能换清单或扩大为全量', async () => {
+    const lines = [caseLine('w1'), caseLine('w2'), caseLine('w3')]
+    const { runner, artifactRoot } = runnerFor(lines, { caseIds: ['w3', 'w1'] })
+    const state = await runner.run()
+    expect(state.results.map(row => row.caseId)).toEqual(['w3', 'w1'])
+    const deps = { artifactRoot, sqlJsDistDir: SQL_JS, dataset: makeDataset(lines) }
+    expect(() => new EvalRunner(deps, { ...state, caseIds: ['w1', 'w3'] })).toThrow()
+    expect(() => new EvalRunner(deps, { ...state, caseIds: undefined })).toThrow()
+    const resumed = await new EvalRunner(deps, state).run()
+    expect(resumed.results).toEqual(state.results)
+  })
   it('同 evalRunId 重建 runner:跳过已完成组合,不覆盖', async () => {
     const lines = [caseLine('w1'), caseLine('w2')]
     const dataset = makeDataset(lines)
@@ -546,6 +594,39 @@ function stateFor(dataset: LoadedDataset, over: Partial<EvalRunState> = {}): Eva
 }
 
 describe('EVAL-04 配置冻结工厂与路由透传', () => {
+  it('T16 参数规则失败必须使案例失败，不能被succeeded终态覆盖', async () => {
+    const dataset = makeDataset([caseLine('wrong-args')])
+    const factory: EvalCompleterFactory = {
+      create: () => ({ async completeJson<T>(): Promise<StructuredCompleteResult<T>> {
+        return { data: { goal: '合成反例', steps: [{ tool: 'todo.create', arguments: { title: 'wrong-title' } }], assumptions: [], clarifications: [] } as T, model: 'fake', latencyMs: 0, usage: { inputTokens: null, outputTokens: null, totalTokens: null, source: null }, actualProvider: null, actualAttempts: 0, attempts: [] }
+      } })
+    }
+    const runner = new EvalRunner({ artifactRoot: mkdtempSync(join(tmpdir(), 't16-wrong-args-')), sqlJsDistDir: SQL_JS, dataset, completerFactory: factory }, stateFor(dataset))
+    const state = await runner.run()
+    expect(state.results[0]!.terminalStatus).toBe('succeeded')
+    expect(state.results[0]!.ruleChecks!.some(c => !c.passed)).toBe(true)
+    expect(state.results[0]!.status).toBe('failed')
+    expect(state.results[0]!.failureReasons.join(';')).toMatch(/参数/)
+  })
+
+  it('T16 隔离库关闭移除后仅用case产物重建关键记录与全部指标', async () => {
+    const lines = [caseLine('replay-ok'), caseLine('replay-failed', { expected: { ...JSON.parse(caseLine('replay-failed')).expected, terminal_status: 'failed' } })]
+    const { runner, artifactRoot } = runnerFor(lines)
+    const state = await runner.run()
+    const temporary = join(artifactRoot, state.evalRunId, 'temporary')
+    expect(readdirSync(temporary)).toEqual([])
+    const replayed = state.results.map(result => {
+      const loaded = loadCaseArtifacts(join(artifactRoot, result.artifactDir!))
+      expect(loaded.run.outcome).toEqual(result)
+      expect(loaded.observations).toEqual(result.toolObservations)
+      expect(loaded.ruleChecks).toEqual(result.ruleChecks)
+      return loaded.run.outcome as typeof result
+    })
+    const actual = calculateMetrics({ results: replayed }, makeDataset(lines).cases)
+    const original = calculateMetrics(state, makeDataset(lines).cases)
+    expect(actual).toEqual(original)
+    if (process.env.T16_EVIDENCE_DIR) writeFileSync(join(process.env.T16_EVIDENCE_DIR, 'database-free-replay.json'), JSON.stringify({ temporary, remainingDatabases: readdirSync(temporary), originalResults: state.results, replayed, originalMetrics: original, replayedMetrics: actual }, null, 2))
+  })
   function freezePair(configRoot: string): ReturnType<typeof roundOneConfigs> {
     const pair = roundOneConfigs('ops-planning', roundOneInput, TEMPLATE_ROOT)
     saveFrozenConfig(configRoot, pair.baseline)

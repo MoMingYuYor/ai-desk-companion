@@ -20,6 +20,8 @@ import {
 import { loadTemplateFor, roundOneConfigs } from '../../src/main/evals/completerFactory'
 import { PLAN_SYSTEM_PROMPT } from '../../src/main/agent/planner'
 import { RESEARCH_EXTRACTION_SYSTEM_PROMPT } from '../../src/main/research/workflow'
+import { checkComparable, frozenVariableDiff } from '../../src/main/evals/comparison'
+import * as configStore from '../../src/main/evals/configStore'
 
 const sha = (text: string): string => createHash('sha256').update(text).digest('hex')
 
@@ -44,6 +46,62 @@ function sampleConfig(over: Partial<FrozenEvalConfig> = {}): FrozenEvalConfig {
 }
 
 describe('configStore:不可变冻结配置目录', () => {
+  it('T14 schema 2 必须绑定 targetSha256，v1 历史配置仍可读取', () => {
+    const v2 = { ...sampleConfig(), schemaVersion: 2, target: null, targetSha256: sha('{"executionKind":"fake"}') }
+    expect(validateFrozenConfig(v2)).toEqual(v2)
+    expect(() => validateFrozenConfig({ ...v2, targetSha256: undefined })).toThrow(/targetSha256/)
+    expect(() => validateFrozenConfig({ ...v2, targetSha256: 'bad' })).toThrow(/targetSha256/)
+    expect(validateFrozenConfig(sampleConfig()).schemaVersion).toBe(1)
+  })
+
+  it('T15 中央 target 契约：规范化、无密钥 hash、config.target 与路由一致', () => {
+    expect(configStore.normalizeEvalTarget).toBeTypeOf('function')
+    expect(configStore.evalTargetSha256).toBeTypeOf('function')
+    const target = { providerId: 'p1', protocol: 'responses', model: 'm1', baseUrl: 'https://model.example.invalid/v1' }
+    expect(configStore.normalizeEvalTarget({ ...target, baseUrl: 'https://MODEL.example.invalid:443/v1/' })).toEqual(target)
+    const hash = sha('{"baseUrl":"https://model.example.invalid/v1","model":"m1","protocol":"responses","providerId":"p1"}')
+    expect(configStore.evalTargetSha256(target)).toBe(hash)
+    expect(configStore.evalTargetSha256(null)).toBe(sha('{"executionKind":"fake"}'))
+    const config = { ...sampleConfig(), schemaVersion: 2, executionKind: 'real', providerId: 'p1', model: 'm1', target, targetSha256: hash }
+    expect(validateFrozenConfig(config)).toEqual(config)
+    expect(() => validateFrozenConfig({ ...config, target: undefined })).toThrow(/target/)
+    expect(() => validateFrozenConfig({ ...config, model: 'forged' })).toThrow(/target/)
+    expect(() => validateFrozenConfig({ ...config, providerId: 'forged' })).toThrow(/target/)
+    expect(() => validateFrozenConfig({ ...config, targetSha256: sha('forged') })).toThrow(/target/)
+    expect(() => validateFrozenConfig({ ...config, executionKind: 'fake' })).toThrow(/target/)
+    const root = mkdtempSync(join(tmpdir(), 'eval-target-'))
+    saveFrozenConfig(root, config as FrozenEvalConfig)
+    expect(loadFrozenConfig(root, config.configId).target).toEqual(target)
+  })
+
+  it('T14 同内容重存也必须验证 sidecar，不能把缺 hash 的对象当幂等成功', () => {
+    const root = mkdtempSync(join(tmpdir(), 'eval-config-'))
+    const config = sampleConfig()
+    saveFrozenConfig(root, config)
+    unlinkSync(join(root, `${config.configId}.sha256`))
+    expect(() => saveFrozenConfig(root, config)).toThrow(/hash 文件缺失/)
+  })
+
+  it('T14 文件名与内含 configId 不同即拒绝，即使 sidecar 与内容一致', () => {
+    const root = mkdtempSync(join(tmpdir(), 'eval-config-'))
+    const config = sampleConfig({ configId: 'inner-id' })
+    writeFileSync(join(root, 'outer-id.json'), JSON.stringify(config), 'utf8')
+    writeFileSync(join(root, 'outer-id.sha256'), frozenConfigSha256(config), 'utf8')
+    expect(() => loadFrozenConfig(root, 'outer-id')).toThrow(/configId/)
+  })
+
+  it('T14 对照差异包含无密钥 target hash', () => {
+    const target = { providerId: 'p', model: 'm', protocol: 'responses', baseUrl: 'https://a.example.invalid/v1' }
+    const second = { ...target, baseUrl: 'https://b.example.invalid/v1' }
+    const a = validateFrozenConfig({ ...sampleConfig(), configId: 'a', schemaVersion: 2, executionKind: 'real', providerId: 'p', model: 'm', target, targetSha256: configStore.evalTargetSha256(target) })
+    const b = validateFrozenConfig({ ...a, configId: 'b', target: second, targetSha256: configStore.evalTargetSha256(second) })
+    expect(frozenVariableDiff(a, b)).toContainEqual({ variable: 'targetSha256', a: a.targetSha256, b: b.targetSha256, allowedToDiffer: false, equal: false })
+    const base = { datasetVersion: 'synthetic', casesSha256: sha('dataset'), splits: ['dev'] as const, executionKind: 'real' as const, actualProviders: [{ providerId: 'p', providerName: 'p', model: 'm' }] }
+    const verdict = checkComparable({ ...base, configId: 'a', frozen: a, configSha256: frozenConfigSha256(a) }, { ...base, configId: 'b', frozen: b, configSha256: frozenConfigSha256(b) })
+    expect(verdict.comparable).toBe(false)
+    expect(verdict.reasons.join(' ')).toContain('targetSha256')
+  })
+
   it('写入后重启读回同一 hash;实际配置 hash 单独保存为 sidecar', () => {
     const root = mkdtempSync(join(tmpdir(), 'eval-config-'))
     const config = sampleConfig()
@@ -102,7 +160,7 @@ describe('configStore:不可变冻结配置目录', () => {
     expect(() => validateFrozenConfig({ ...sampleConfig(), executionKind: 'both' })).toThrow(/executionKind/)
     expect(() => validateFrozenConfig({ ...sampleConfig(), pipelineVariant: 'control' })).toThrow(/pipelineVariant/)
     expect(() => validateFrozenConfig({ ...sampleConfig(), rubricVersion: '' })).toThrow(/rubricVersion/)
-    expect(() => validateFrozenConfig({ ...sampleConfig(), schemaVersion: 2 })).toThrow(/schemaVersion/)
+    expect(() => validateFrozenConfig({ ...sampleConfig(), schemaVersion: 3 })).toThrow(/schemaVersion/)
     expect(() => validateFrozenConfig(null)).toThrow(FrozenConfigError)
     expect(validateFrozenConfig(sampleConfig())).toEqual(sampleConfig())
   })

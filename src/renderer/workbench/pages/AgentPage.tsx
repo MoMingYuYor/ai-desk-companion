@@ -10,12 +10,12 @@
 //
 // OPS-04(F-03):澄清回答改为按 questionId 的受控字段,一次提交全部当前问题,
 // 每条上限 1000 码点(与服务端 acceptAnswers 同一规则);异步刷新统一用
-// runId+递增请求代号守卫——旧响应不覆盖新运行或较新 seq;seq 缺口先补齐再前进
-// lastSeq;等待人工状态触发一次合并刷新(run+approvals),input 事件触发补发。
+// runId/openToken/请求代号/视图版本共同守卫快照;lastSeq 仅表示连续补齐进度,
+// snapshotSeq 表示接纳的事件快照版本;等待人工状态触发合并刷新(run+approvals)。
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Channels, type AgentApprovalView, type AgentRunListItem, type AgentRunView, type AgentRunEventsResult } from '../../../shared/api'
-import type { TraceEvent } from '../../../shared/agent'
+import { isTerminalRunStatus, type TraceEvent } from '../../../shared/agent'
 import { useSubscribe } from '../../shared/util'
 
 type RunStatus = AgentRunView['status']
@@ -119,59 +119,111 @@ export function AgentPage({ refreshKey }: { refreshKey: number }): JSX.Element {
   const [answerBusy, setAnswerBusy] = useState(false)
   // 只关注当前查看的运行;ref 用于事件回调内拿到最新 runId
   const runIdRef = useRef<string | null>(null)
+  const runRef = useRef<AgentRunView | null>(null)
   const lastSeqRef = useRef(0)
+  const receivedSeqRef = useRef(new Set<number>())
+  const snapshotSeqRef = useRef(0)
+  const viewRevisionRef = useRef(0)
   // OPS-04 刷新竞态守卫:openToken 为当前打开代(切换运行即失效旧响应),
   // refreshSeq/backfillSeq 为递增请求代号(同代内仅最新请求的响应可应用)
   const openTokenRef = useRef(0)
   const refreshSeqRef = useRef(0)
   const backfillSeqRef = useRef(0)
+  const refreshQueuedRef = useRef<{ id: string; openToken: number } | null>(null)
+
+  /** 同一批事件合并一次刷新;切换或卸载后排队任务也失效。 */
+  const queueRefresh = useCallback((id: string, refresh: (id: string) => Promise<void>): void => {
+    const openToken = openTokenRef.current
+    if (runIdRef.current !== id || refreshQueuedRef.current?.openToken === openToken) return
+    const queued = { id, openToken }
+    refreshQueuedRef.current = queued
+    queueMicrotask(() => {
+      if (refreshQueuedRef.current !== queued) return
+      refreshQueuedRef.current = null
+      if (openTokenRef.current === openToken && runIdRef.current === id) void refresh(id)
+    })
+  }, [])
 
   const refreshRun = useCallback(
-    async (id: string) => {
+    async (id: string): Promise<void> => {
+      if (runIdRef.current !== id) return
       const openToken = openTokenRef.current
       const req = ++refreshSeqRef.current
+      const revision = viewRevisionRef.current
+      const ownsRequest = () => openTokenRef.current === openToken &&
+        runIdRef.current === id && refreshSeqRef.current === req
       try {
         const [view, approvalList] = await Promise.all([
           window.api.getAgentRun(id),
           window.api.getAgentRunApprovals(id)
         ])
-        // 守卫:旧代、已切换运行或非最新请求的响应一律丢弃,不覆盖新状态
-        if (openTokenRef.current !== openToken || runIdRef.current !== id || refreshSeqRef.current !== req) return
+        if (!ownsRequest()) return
+        if (viewRevisionRef.current !== revision) {
+          // 事件接纳的新快照淘汰了本次读取，补拉审批，避免等待卡永久为空。
+          queueRefresh(id, refreshRun)
+          return
+        }
+        if (view && view.runId !== id) return
+        // 同一打开代内终态不可被无 seq 的读取回退;epoch 重开会重置 runRef。
+        if (runRef.current && isTerminalRunStatus(runRef.current.status) &&
+            (!view || !isTerminalRunStatus(view.status))) return
+        runRef.current = view
+        viewRevisionRef.current += 1
         setRun(view)
-        setApprovals(approvalList)
+        setApprovals(view?.status === 'awaiting_confirmation' ? approvalList : [])
+        setError(null)
       } catch (err) {
-        if (openTokenRef.current !== openToken || runIdRef.current !== id) return
+        if (!ownsRequest()) return
+        if (viewRevisionRef.current !== revision) {
+          queueRefresh(id, refreshRun)
+          return
+        }
         setError(err instanceof Error ? err.message : String(err))
       }
     },
-    []
+    [queueRefresh]
   )
 
+  /** 收到高 seq 只记入集合，连续区间确实补齐后才推进补拉游标。 */
+  const appendEvents = useCallback((incoming: TraceEvent[]): boolean => {
+    const fresh = incoming.filter((event) => event.runId === runIdRef.current &&
+      event.seq > lastSeqRef.current && !receivedSeqRef.current.has(event.seq))
+    if (fresh.length === 0) return false
+    for (const event of fresh) receivedSeqRef.current.add(event.seq)
+    while (receivedSeqRef.current.delete(lastSeqRef.current + 1)) lastSeqRef.current += 1
+    setEvents((prev) => mergeEvents(prev, fresh))
+    return true
+  }, [])
+
   const backfillEvents = useCallback(async (id: string) => {
+    if (runIdRef.current !== id) return
     const openToken = openTokenRef.current
     const req = ++backfillSeqRef.current
+    const revision = viewRevisionRef.current
     const after = lastSeqRef.current
     try {
       const result: AgentRunEventsResult = await window.api.getAgentRunEvents(id, after)
       if (openTokenRef.current !== openToken || runIdRef.current !== id || backfillSeqRef.current !== req) return
-      if (result.events.length > 0) {
-        // lastSeq 只前进到实际拿到的最大 seq:缺口补齐前不跳过遗漏事件
-        const maxSeq = result.events[result.events.length - 1]!.seq
-        lastSeqRef.current = Math.max(lastSeqRef.current, maxSeq)
-        setEvents((prev) => mergeEvents(prev, result.events))
-      }
+      appendEvents(result.events)
     } catch (err) {
       // 读取失败显示可识别错误并保留已有内容;下次有效事件重新触发补发
-      if (openTokenRef.current !== openToken || runIdRef.current !== id) return
+      if (openTokenRef.current !== openToken || runIdRef.current !== id ||
+          backfillSeqRef.current !== req || viewRevisionRef.current !== revision) return
       setError(err instanceof Error ? err.message : String(err))
     }
-  }, [])
+  }, [appendEvents])
 
   const openRun = useCallback(
     async (id: string) => {
       openTokenRef.current += 1
       runIdRef.current = id
+      runRef.current = null
       lastSeqRef.current = 0
+      receivedSeqRef.current.clear()
+      snapshotSeqRef.current = 0
+      viewRevisionRef.current = 0
+      refreshQueuedRef.current = null
+      setRun(null)
       setEvents([])
       setApprovals([])
       // 运行切换重置回答表单:答案不泄漏到另一个 run
@@ -181,6 +233,12 @@ export function AgentPage({ refreshKey }: { refreshKey: number }): JSX.Element {
     },
     [refreshRun, backfillEvents]
   )
+
+  useEffect(() => () => {
+    openTokenRef.current += 1
+    runIdRef.current = null
+    refreshQueuedRef.current = null
+  }, [])
 
   const loadHistory = useCallback(async (): Promise<AgentRunListItem[]> => {
     try {
@@ -203,34 +261,43 @@ export function AgentPage({ refreshKey }: { refreshKey: number }): JSX.Element {
   // 事件订阅:updated 合并事件并刷新运行状态;finished 刷新 + 历史
   useSubscribe(Channels.EventAgentRunUpdated, (...args: unknown[]) => {
     const payload = args[0] as { run: AgentRunView; event: TraceEvent } | undefined
-    if (!payload || payload.run.runId !== runIdRef.current) return
-    setRun(payload.run)
+    if (!payload || payload.run.runId !== runIdRef.current || payload.event.runId !== runIdRef.current) return
     const event = payload.event
     const last = lastSeqRef.current
-    // 重复/滞后 seq:不重复渲染、不重复触发刷新
-    if (event.seq <= last) return
-    setEvents((prev) => mergeEvents(prev, [event]))
-    if (event.seq === last + 1) {
-      lastSeqRef.current = event.seq
-    } else {
-      // seq 缺口:先补齐遗漏区间再前进 lastSeq(缺补前不跳过)
-      void backfillEvents(payload.run.runId)
+    const added = appendEvents([event])
+    // 旧快照仍可补时间线，但必须在 setRun 前拒绝重复/滞后快照及终态回退。
+    if (event.seq > snapshotSeqRef.current &&
+        !(runRef.current && isTerminalRunStatus(runRef.current.status) && !isTerminalRunStatus(payload.run.status))) {
+      snapshotSeqRef.current = event.seq
+      viewRevisionRef.current += 1
+      runRef.current = payload.run
+      setRun(payload.run)
+      if (payload.run.status !== 'awaiting_confirmation') setApprovals([])
+      if (
+        event.eventType === 'confirmation' ||
+        payload.run.status === 'awaiting_confirmation' ||
+        payload.run.status === 'awaiting_input'
+      ) {
+        // 等待人工的状态:一次合并刷新,同时读取 run+approvals
+        queueRefresh(payload.run.runId, refreshRun)
+      }
     }
-    if (event.eventType === 'input') void backfillEvents(payload.run.runId)
-    if (
-      event.eventType === 'confirmation' ||
-      payload.run.status === 'awaiting_confirmation' ||
-      payload.run.status === 'awaiting_input'
-    ) {
-      // 等待人工的状态:一次合并刷新,同时读取 run+approvals
-      void refreshRun(payload.run.runId)
+    // 在快照接纳后捕获版本，当前补拉的失败才不会被自身事件误判为旧错误。
+    if (added && (event.seq > last + 1 || event.eventType === 'input')) {
+      void backfillEvents(payload.run.runId)
     }
   })
   useSubscribe(Channels.EventAgentRunFinished, (...args: unknown[]) => {
     const payload = args[0] as { run: AgentRunView } | undefined
     if (!payload || payload.run.runId !== runIdRef.current) return
-    setRun(payload.run)
-    void refreshRun(payload.run.runId)
+    // finished 没有 seq，作为失效通知触发权威读取，不直接应用其快照。
+    viewRevisionRef.current += 1
+    queueRefresh(payload.run.runId, refreshRun)
+    void loadHistory()
+  })
+  useSubscribe('evt:workspace-epoch-changed', () => {
+    const id = runIdRef.current
+    if (id) void openRun(id)
     void loadHistory()
   })
 

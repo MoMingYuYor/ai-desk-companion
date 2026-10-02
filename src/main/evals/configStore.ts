@@ -1,6 +1,6 @@
 // 冻结实验配置存储(EVAL-04,F-13 评测部分):配置从进程内 Map 迁移为目录中的
 // 不可变 config JSON。纪律(完成计划 eval.md EVAL-04):
-// - 配置文件只记录 providerId(credential reference),绝不写 API Key;凭据只在
+// - 配置文件记录无密钥 target 与 providerId(credential reference),绝不写 API Key;凭据只在
 //   运行时由工厂经 credentialOf(providerId) 解析;
 // - 同一 configId 不同内容拒绝覆盖:先写先冻结,重跑不漂移;
 // - 实际配置 hash 单独保存(<configId>.sha256),重启读回同一 hash,内容被篡改
@@ -9,30 +9,15 @@
 //   pipelineVariant/promptSha256 不同),其余冻结字段必须逐字段一致;
 // - 全部写入前做 schema 校验与路径 ID 校验;损坏文件保留并报错,不静默重置。
 
-import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, linkSync } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
 import { safeSegment } from './artifacts'
+import type { EvalTargetProfile, FrozenEvalConfig } from '../../shared/evals'
+export type { EvalTargetProfile, FrozenEvalConfig, Schema2FrozenEvalConfig } from '../../shared/evals'
 
-/** 冻结实验配置(完成计划 eval.md EVAL-04 接口原样) */
-export interface FrozenEvalConfig {
-  schemaVersion: 1
-  configId: string
-  executionKind: 'fake' | 'real'
-  model: string
-  providerId: string
-  pipelineVariant: 'baseline' | 'candidate'
-  promptSha256: string
-  toolsVersion: string
-  codeCommit: string
-  datasetSha256: string
-  fixtureSha256: string
-  budgetSha256: string
-  interactionScriptSha256: string
-  rubricVersion: string
-}
-
-export const CONFIG_SCHEMA_VERSION = 1 as const
+/** 新实验使用 schema 2；schema 1 历史对象仅按原内容读取。 */
+export const CONFIG_SCHEMA_VERSION = 2 as const
 
 /**
  * 允许在对照两侧不同的变量清单(显式记录):每次对照只改变记录的流程变量——
@@ -41,7 +26,7 @@ export const CONFIG_SCHEMA_VERSION = 1 as const
  */
 export const COMPARABLE_VARIABLES: readonly string[] = ['pipelineVariant', 'promptSha256']
 
-/** 冻结字段清单(除 configId 与 schemaVersion 外全部参与可比性校验) */
+/** 历史字符串字段；schema 2 的 target/hash 由专门分支校验。 */
 const FROZEN_FIELDS: readonly (keyof Omit<FrozenEvalConfig, 'schemaVersion' | 'configId'>)[] = [
   'executionKind',
   'model',
@@ -69,16 +54,40 @@ export class FrozenConfigError extends Error {
 
 /** 稳定序列化(键排序)后的 sha256:实际配置 hash 的唯一来源 */
 export function frozenConfigSha256(config: FrozenEvalConfig): string {
-  return createHash('sha256')
-    .update(stableStringify(config))
-    .digest('hex')
+  return stableValueSha256(config)
+}
+
+export function stableValueSha256(value: unknown): string {
+  return createHash('sha256').update(stableStringify(value)).digest('hex')
+}
+
+/** 规范化无密钥目标；错误只说明结构问题，不回显可能含密钥的 URL。 */
+export function normalizeEvalTarget(raw: unknown): EvalTargetProfile {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new FrozenConfigError('real 必须提供无密钥 target 对象')
+  const record = raw as Record<string, unknown>
+  if (Object.keys(record).some((key) => !['providerId', 'protocol', 'baseUrl', 'model'].includes(key))) throw new FrozenConfigError('target 含未知字段，禁止凭据落盘')
+  for (const field of ['providerId', 'protocol', 'baseUrl', 'model']) {
+    if (typeof record[field] !== 'string' || (record[field] as string).trim() !== record[field] || !record[field]) throw new FrozenConfigError(`target ${field} 必须是非空且无边缘空白的字符串`)
+  }
+  if (record.protocol !== 'chat-completions' && record.protocol !== 'responses') throw new FrozenConfigError('target protocol 不受支持')
+  let url: URL
+  try { url = new URL(record.baseUrl as string) } catch { throw new FrozenConfigError('target baseUrl 非法') }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new FrozenConfigError('target URL 必须使用 HTTP(S) 且不得包含凭据、query 或 fragment')
+  }
+  return { providerId: record.providerId as string, protocol: record.protocol, baseUrl: url.toString().replace(/\/+$/, ''), model: record.model as string }
+}
+
+/** null 对应固定 fake 档案；real 仅对规范化的四字段目标计算 hash。 */
+export function evalTargetSha256(target: EvalTargetProfile | null): string {
+  return stableValueSha256(target === null ? { executionKind: 'fake' } : normalizeEvalTarget(target))
 }
 
 /** 键排序的稳定 JSON 序列化(与 JSON.stringify 的插入序无关) */
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value)
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
-  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : 1))
+  const entries = Object.entries(value as Record<string, unknown>).filter(([, v]) => v !== undefined).sort(([a], [b]) => (a < b ? -1 : 1))
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(',')}}`
 }
 
@@ -87,15 +96,18 @@ export function validateFrozenConfig(raw: unknown): FrozenEvalConfig {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new FrozenConfigError('冻结配置必须是对象')
   }
-  const allowed = new Set(['schemaVersion', 'configId', ...FROZEN_FIELDS])
+  const record = raw as Record<string, unknown>
+  const allowed = new Set(['schemaVersion', 'configId', ...FROZEN_FIELDS, ...(record.schemaVersion === 2 ? ['targetSha256', 'target'] : [])])
   for (const key of Object.keys(raw as Record<string, unknown>)) {
     if (!allowed.has(key)) {
       throw new FrozenConfigError(`冻结配置含未知字段:${key}(schema 漂移早失败)`)
     }
   }
-  const record = raw as Record<string, unknown>
-  if (record.schemaVersion !== CONFIG_SCHEMA_VERSION) {
-    throw new FrozenConfigError(`schemaVersion 必须是 ${CONFIG_SCHEMA_VERSION},收到 ${String(record.schemaVersion)}`)
+  if (record.schemaVersion !== 1 && record.schemaVersion !== CONFIG_SCHEMA_VERSION) {
+    throw new FrozenConfigError('schemaVersion 必须是 1 或 2')
+  }
+  if (record.schemaVersion === 2 && (typeof record.targetSha256 !== 'string' || !SHA256_HEX.test(record.targetSha256))) {
+    throw new FrozenConfigError('targetSha256 必须是 64 位十六进制 sha256')
   }
   if (typeof record.configId !== 'string' || record.configId.trim() === '') {
     throw new FrozenConfigError('缺少 configId')
@@ -125,6 +137,12 @@ export function validateFrozenConfig(raw: unknown): FrozenEvalConfig {
   if (record.pipelineVariant !== 'baseline' && record.pipelineVariant !== 'candidate') {
     throw new FrozenConfigError(`pipelineVariant 非法:${String(record.pipelineVariant)}`)
   }
+  if (record.schemaVersion === 2) {
+    const target = record.target === null ? null : normalizeEvalTarget(record.target)
+    if ((record.executionKind === 'fake') !== (target === null)) throw new FrozenConfigError('executionKind 与 config.target 不一致')
+    if (evalTargetSha256(target) !== record.targetSha256 || stableValueSha256(target) !== stableValueSha256(record.target)) throw new FrozenConfigError('config.target 未规范化或 targetSha256 不一致')
+    if (record.providerId !== (target?.providerId ?? 'eval-fake') || record.model !== (target?.model ?? 'fake-model')) throw new FrozenConfigError('config.target 与 providerId/model 不一致')
+  }
   return raw as FrozenEvalConfig
 }
 
@@ -136,12 +154,15 @@ function configFile(root: string, configId: string): string {
   if (!file.startsWith(base + sep)) {
     throw new FrozenConfigError(`配置文件解析后越出配置根目录:${file}`)
   }
-  return file
+  const prefix = configId.replace(/-(baseline|candidate)$/, '')
+  const bundled = join(base, 'freezes', prefix, `${configId}.json`)
+  if (existsSync(file) && existsSync(bundled)) throw new FrozenConfigError(`配置 ID 同时存在于历史目录和冻结 bundle:${configId}`)
+  return existsSync(join(base, 'freezes', prefix)) ? bundled : file
 }
 
 function hashFile(root: string, configId: string): string {
   safeSegment('configId', configId)
-  return resolve(root, `${configId}.sha256`)
+  return configFile(root, configId).replace(/\.json$/, '.sha256')
 }
 
 /**
@@ -158,7 +179,7 @@ export function saveFrozenConfig(
   mkdirSync(configRoot, { recursive: true })
   if (existsSync(file)) {
     // 同 ID 已冻结:同内容幂等返回;不同内容拒绝覆盖(重跑不得漂移配置)
-    const existing = readFrozenConfigRaw(file)
+    const existing = loadFrozenConfig(configRoot, config.configId)
     if (stableStringify(existing) !== stableStringify(config)) {
       throw new FrozenConfigError(
         `配置 ${config.configId} 已冻结且内容不同,拒绝覆盖(同 ID 不同内容):${file}`,
@@ -167,13 +188,16 @@ export function saveFrozenConfig(
     }
     return { file, sha256: hash }
   }
-  const tmp = `${file}.tmp`
+  const hashPath = hashFile(configRoot, config.configId)
+  if (existsSync(hashPath)) throw new FrozenConfigError(`配置发布不完整，存在孤立 hash:${config.configId}`)
+  const tmp = `${file}.${randomUUID()}.tmp`
   writeFileSync(tmp, JSON.stringify(config, null, 2) + '\n', 'utf-8')
-  renameSync(tmp, file)
   // 实际配置 hash 单独保存:重启读回时逐字节核对内容未被篡改
-  const hashTmp = `${hashFile(configRoot, config.configId)}.tmp`
+  const hashTmp = `${hashPath}.${randomUUID()}.tmp`
   writeFileSync(hashTmp, `${hash}\n`, 'utf-8')
-  renameSync(hashTmp, hashFile(configRoot, config.configId))
+  // 排他发布，避免检查与写入之间的竞态覆盖旧配置；中断残留供诊断，不隐式修复。
+  linkSync(hashTmp, hashPath)
+  linkSync(tmp, file)
   return { file, sha256: hash }
 }
 
@@ -205,6 +229,7 @@ export function loadFrozenConfig(configRoot: string, configId: string): FrozenEv
     throw new FrozenConfigError(`冻结配置不存在:${configId}(期望 ${file})`, file)
   }
   const config = readFrozenConfigRaw(file)
+  if (config.configId !== configId) throw new FrozenConfigError(`文件名与内容 configId 不一致:${configId}`, file)
   const hashPath = hashFile(configRoot, configId)
   if (!existsSync(hashPath)) {
     throw new FrozenConfigError(`配置 hash 文件缺失(内容不可信):${hashPath}`, hashPath)
@@ -215,6 +240,28 @@ export function loadFrozenConfig(configRoot: string, configId: string): FrozenEv
       `配置内容 hash 与单独保存的 hash 不一致(配置被篡改):${file}`,
       file
     )
+  }
+  const prefix = configId.replace(/-(baseline|candidate)$/, '')
+  const bundle = join(resolve(configRoot), 'freezes', prefix)
+  if (existsSync(bundle)) {
+    const manifestFile = join(bundle, 'manifest.json')
+    const manifestHash = join(bundle, 'manifest.sha256')
+    if (!existsSync(manifestFile) || !existsSync(manifestHash)) throw new FrozenConfigError(`冻结 bundle manifest 或 hash 文件缺失:${prefix}`)
+    let manifest: { schemaVersion: number; configs: Record<string, string> }
+    try { manifest = JSON.parse(readFileSync(manifestFile, 'utf8')) } catch { throw new FrozenConfigError(`冻结 bundle manifest 损坏:${prefix}`) }
+    if (manifest.schemaVersion !== 2 || stableValueSha256(manifest) !== readFileSync(manifestHash, 'utf8').trim()) {
+      throw new FrozenConfigError(`冻结 bundle manifest hash 不一致:${prefix}`)
+    }
+    for (const variant of ['baseline', 'candidate']) {
+      const id = `${prefix}-${variant}`
+      const memberFile = join(bundle, `${id}.json`)
+      const memberHash = join(bundle, `${id}.sha256`)
+      if (!existsSync(memberFile) || !existsSync(memberHash)) throw new FrozenConfigError(`冻结配置对发布不完整:${id}`)
+      const member = readFrozenConfigRaw(memberFile)
+      if (member.configId !== id || manifest.configs?.[id] !== frozenConfigSha256(member) || readFileSync(memberHash, 'utf8').trim() !== manifest.configs[id]) {
+        throw new FrozenConfigError(`冻结配置对 hash 不一致:${id}`)
+      }
+    }
   }
   return config
 }
@@ -232,9 +279,17 @@ export function findFrozenConfig(configRoot: string, configId: string): FrozenEv
 /** 目录内全部配置 ID(排序);目录不存在返回空 */
 export function listFrozenConfigIds(configRoot: string): string[] {
   if (!existsSync(configRoot)) return []
-  return readdirSorted(configRoot)
+  const legacy = readdirSorted(configRoot)
     .filter((name) => name.endsWith('.json'))
     .map((name) => name.slice(0, -'.json'.length))
+  const bundles = join(configRoot, 'freezes')
+  const frozen = existsSync(bundles) ? readdirSorted(bundles).flatMap((prefix) => {
+    safeSegment('freeze prefix', prefix)
+    const ids = [`${prefix}-baseline`, `${prefix}-candidate`]
+    ids.forEach((id) => loadFrozenConfig(configRoot, id))
+    return ids
+  }) : []
+  return [...legacy, ...frozen].sort()
 }
 
 function readdirSorted(dir: string): string[] {

@@ -293,11 +293,22 @@ export function verifyCaseArtifacts(dir: string): ArtifactVerifyResult {
   } catch (err) {
     return { ok: false, manifest: null, mismatched: [], missing: [], manifestError: `manifest.json 解析失败:${err instanceof Error ? err.message : String(err)}` }
   }
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    return { ok: false, manifest: null, mismatched: [], missing: [], manifestError: 'manifest 必须是对象' }
+  }
   if (manifest.schemaVersion !== CASE_ARTIFACT_SCHEMA_VERSION) {
     return { ok: false, manifest, mismatched: [], missing: [], manifestError: `manifest schema 版本不支持:${String(manifest.schemaVersion)}` }
   }
   if (manifest.complete !== true) {
     return { ok: false, manifest, mismatched: [], missing: [], manifestError: 'manifest.complete !== true(导出未完成)' }
+  }
+  // 必须核对固定文件全集；空表、重复条目或路径穿越不能缩小校验范围。
+  if (!Array.isArray(manifest.files) || manifest.files.length !== CASE_ARTIFACT_FILES.length ||
+    manifest.files.some((entry) => !entry || typeof entry !== 'object' ||
+      !CASE_ARTIFACT_FILES.includes(entry.name as typeof CASE_ARTIFACT_FILES[number]) ||
+      typeof entry.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(entry.sha256)) ||
+    new Set(manifest.files.map((entry) => entry.name)).size !== CASE_ARTIFACT_FILES.length) {
+    return { ok: false, manifest, mismatched: [], missing: [], manifestError: 'manifest 文件表不完整或非法（固定文件全集、唯一名称及 sha256 必须齐全）' }
   }
   const mismatched: string[] = []
   const missing: string[] = []
@@ -361,6 +372,20 @@ export function loadCaseArtifacts(dir: string): LoadedCaseArtifacts {
     evidence: JSON.parse(readFileSync(join(dir, 'evidence.json'), 'utf-8')) as Record<string, unknown>,
     snapshots: JSON.parse(readFileSync(join(dir, 'snapshots-manifest.json'), 'utf-8')) as Record<string, unknown>
   }
+}
+
+/** 隔离库关闭后的最终评分投影；耗时确定后刷新 run 与 manifest，回放无需状态文件或数据库。 */
+export function finalizeCaseArtifactOutcome(dir: string, outcome: Record<string, unknown>): void {
+  const loaded = loadCaseArtifacts(dir)
+  const manifest = loaded.manifest
+  if (outcome.configId !== manifest.configId || outcome.caseId !== manifest.caseId || outcome.repeatIndex !== manifest.repeatIndex) {
+    throw new ArtifactIntegrityError('最终评分对象与案例产物标识不一致', ['run.json'], [])
+  }
+  const run = { ...loaded.run, outcome, actualProvider: outcome.actualProvider ?? null, modelAttempts: outcome.modelAttempts ?? [], durationMs: outcome.durationMs ?? null }
+  const contents = JSON.stringify(run, null, 2)
+  atomicWrite(join(dir, 'run.json'), contents)
+  const updated = { ...manifest, files: manifest.files.map(entry => entry.name === 'run.json' ? { ...entry, sha256: sha256OfText(contents) } : entry) }
+  atomicWrite(join(dir, 'manifest.json'), JSON.stringify(updated, null, 2))
 }
 
 /** 代码版本默认值:进程内由 npm 注入,缺失时如实标 unknown */

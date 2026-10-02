@@ -311,26 +311,79 @@ export function checkAllOfCompleteness(
   requirement: AllOfRequirement,
   validCitationIds: ReadonlySet<string>
 ): AllOfCompleteness {
-  const expected = Array.isArray(requirement.expectedIndices) ? requirement.expectedIndices : []
-  const members = Array.isArray(requirement.members) ? requirement.members : []
-  if (expected.length === 0 || new Set(expected).size !== expected.length) {
-    // 预期清单非法(空组/重复成员):整组不成立,不能用剩余引用数推测原始成员数
-    return { satisfied: false, missingIndices: [...expected].sort((a, b) => a - b) }
+  const expected = Array.isArray(requirement?.expectedIndices) ? requirement.expectedIndices : []
+  const members = Array.isArray(requirement?.members) ? requirement.members : []
+  const validIndex = (index: number): boolean => Number.isInteger(index) && index >= 0
+  const nonemptyId = (id: unknown): id is string => typeof id === 'string' && id.length > 0
+  const expectedSet = new Set(expected.filter(validIndex))
+  const usable = members.filter((m) => m !== null && typeof m === 'object' &&
+    validIndex(m.index) && m.rejectionReason === null && nonemptyId(m.evidenceId) &&
+    nonemptyId(m.citationId) && validCitationIds.has(m.citationId))
+  const usableIndices = new Set(usable.map((m) => m.index))
+  // 重复/额外成员会使 satisfied=false,但不能凭空制造缺失下标。
+  const missingIndices = [...expectedSet].filter((index) => !usableIndices.has(index)).sort((a, b) => a - b)
+  const exact = requirement?.version === 1 && nonemptyId(requirement.groupId) &&
+    expected.length > 0 && expectedSet.size === expected.length &&
+    members.length === expectedSet.size && usable.length === members.length &&
+    usableIndices.size === members.length && usable.every((m) => expectedSet.has(m.index)) &&
+    new Set(usable.map((m) => m.evidenceId)).size === members.length &&
+    new Set(usable.map((m) => m.citationId)).size === members.length
+  return { satisfied: exact && missingIndices.length === 0, missingIndices }
+}
+
+/** 清单必须与该命题同组的真实 supports 引用精确闭合,有效 ID 不能跨组借用。 */
+export function checkAllOfRelation(
+  requirement: AllOfRequirement,
+  rows: readonly RunCitationRow[],
+  validCitationIds: ReadonlySet<string>
+): AllOfCompleteness {
+  const completeness = checkAllOfCompleteness(requirement, validCitationIds)
+  if (!completeness.satisfied) return completeness
+  const supports = rows.filter((r) => r.citation.evidenceGroupId === requirement.groupId && r.citation.relation === 'supports')
+  const byCitation = new Map(supports.map((r) => [r.citation.citationId, r]))
+  const sameClaim = new Set(supports.map((r) => r.claim.claimId)).size === 1
+  const exact = sameClaim && supports.length === requirement.members.length && byCitation.size === supports.length &&
+    requirement.members.every((member) => {
+      const row = byCitation.get(member.citationId!)
+      return row !== undefined && row.citation.claimId === row.claim.claimId &&
+        row.citation.groupOperator === 'all_of' && row.citation.evidenceId === member.evidenceId &&
+        row.span.evidenceId === member.evidenceId && row.span.validationStatus === 'valid' &&
+        validCitationIds.has(row.citation.citationId)
+    })
+  return { satisfied: exact, missingIndices: completeness.missingIndices }
+}
+
+/** 清单组与引用组取并集:缺清单、引用全失、损坏/重复清单都朝拒绝方向判定。 */
+function allOfFailureReason(
+  claim: Claim, rows: readonly RunCitationRow[], validIds: ReadonlySet<string>, requirements: readonly AllOfRequirement[]
+): string | null {
+  const raw = claim.review?.evidence_requirements
+  if (raw !== undefined && (!Array.isArray(raw) || raw.length !== requirements.length)) {
+    return 'all_of 预期成员清单损坏 [ALL_OF_EXPECTATION_MISSING],整组不成立'
   }
-  const missing: number[] = []
-  for (const index of expected) {
-    const member = members.find((m) => m.index === index)
-    if (
-      member === undefined ||
-      member.rejectionReason !== null ||
-      member.evidenceId === null ||
-      member.citationId === null ||
-      !validCitationIds.has(member.citationId)
-    ) {
-      missing.push(index)
+  const byGroup = new Map<string, AllOfRequirement[]>()
+  for (const requirement of requirements) {
+    if (typeof requirement.groupId !== 'string' || requirement.groupId === '') {
+      return 'all_of 清单缺少有效 groupId [ALL_OF_EXPECTATION_MISSING],整组不成立'
     }
+    const group = byGroup.get(requirement.groupId) ?? []
+    group.push(requirement)
+    byGroup.set(requirement.groupId, group)
   }
-  return { satisfied: missing.length === 0, missingIndices: missing.sort((a, b) => a - b) }
+  const groupIds = new Set(byGroup.keys())
+  for (const row of rows) {
+    if (row.citation.groupOperator !== 'all_of') continue
+    if (!row.citation.evidenceGroupId) return 'all_of 引用缺少 groupId,整组不成立'
+    groupIds.add(row.citation.evidenceGroupId)
+  }
+  for (const groupId of groupIds) {
+    const group = byGroup.get(groupId) ?? []
+    if (group.length === 0) return `all_of 证据组 ${groupId} 缺少预期成员清单 [ALL_OF_EXPECTATION_MISSING],整组不成立`
+    if (group.length !== 1) return `all_of 证据组 ${groupId} 存在重复清单,整组不成立`
+    const result = checkAllOfRelation(group[0]!, rows, validIds)
+    if (!result.satisfied) return `all_of 证据组 ${groupId} 清单成员与真实 supports 引用未精确闭合(缺员下标 ${result.missingIndices.join(', ')}),整组不成立`
+  }
+  return null
 }
 
 /**
@@ -342,25 +395,13 @@ export function allOfIncompleteClaimIds(db: SqliteDb, claims: readonly Claim[]):
   const blocked = new Set<string>()
   for (const claim of claims) {
     const requirements = loadAllOfRequirements(db, claim.claimId)
-    if (requirements.length === 0) continue
     const rows = listRunCitationsForClaim(db, claim)
     const validIds = new Set(
       rows
         .filter((row) => row.citation.relation === 'supports' && row.span.validationStatus === 'valid')
         .map((row) => row.citation.citationId)
     )
-    const groupIds = new Set(
-      rows
-        .filter((row) => row.citation.evidenceGroupId !== null && row.citation.groupOperator === 'all_of')
-        .map((row) => row.citation.evidenceGroupId as string)
-    )
-    for (const groupId of groupIds) {
-      const requirement = requirements.find((r) => r.groupId === groupId)
-      if (!requirement || !checkAllOfCompleteness(requirement, validIds).satisfied) {
-        blocked.add(claim.claimId)
-        break
-      }
-    }
+    if (allOfFailureReason(claim, rows, validIds, requirements) !== null) blocked.add(claim.claimId)
   }
   return blocked
 }
@@ -450,21 +491,9 @@ export function validateCitations(db: SqliteDb, runId: string): CitationValidati
     // RES-03:all_of 组先按结构结果,再按持久化预期清单判定完整性——
     // 缺任一预期成员、缺清单([ALL_OF_EXPECTATION_MISSING])整组不成立
     const requirements = loadAllOfRequirements(db, claim.claimId)
-    const groupComplete = (group: EvidenceGroupCheck): boolean => {
-      if (!group.satisfied) return false
-      const requirement = requirements.find((r) => r.groupId === group.groupId)
-      if (!requirement) return false // [ALL_OF_EXPECTATION_MISSING]
-      const validIds = new Set(
-        claimRows
-          .filter((row) => row.citation.relation === 'supports' && row.citation.evidenceGroupId === group.groupId)
-          .filter((row) => claimStructure.get(row.citation.citationId)?.ok === true)
-          .map((row) => row.citation.citationId)
-      )
-      return checkAllOfCompleteness(requirement, validIds).satisfied
-    }
-    const allOfGroups = evaluateAllOfGroups(claimRows, claimStructure)
-    const missingGroup = allOfGroups.find((g) => !groupComplete(g))
-    const groupMissing = missingGroup !== undefined
+    const validIds = new Set(claimRows.filter((row) => claimStructure.get(row.citation.citationId)?.ok === true).map((row) => row.citation.citationId))
+    const groupReason = allOfFailureReason(claim, claimRows, validIds, requirements)
+    const groupMissing = groupReason !== null
     const hasSupport = hasUngroupedSupport(claimRows, claimStructure)
     const contradicted = validContradictsEvidenceIds(claimRows, claimStructure).length > 0
 
@@ -478,11 +507,8 @@ export function validateCitations(db: SqliteDb, runId: string): CitationValidati
         // 原因判定:all_of 缺员/缺清单优先于单项失败(整组不成立是更准确的语义结论;
         // 无组且无支持引用次之;单项引用失败兜底)
         let reason: string
-        if (missingGroup !== undefined) {
-          const requirement = requirements.find((r) => r.groupId === missingGroup.groupId)
-          reason = requirement
-            ? `all_of 证据组 ${missingGroup.groupId} 缺少有效成员(缺员下标 ${checkAllOfCompleteness(requirement, validIdsOfGroup(claimRows, claimStructure, missingGroup.groupId)).missingIndices.join(', ')}),整组不成立`
-            : `all_of 证据组 ${missingGroup.groupId} 缺少预期成员清单 [ALL_OF_EXPECTATION_MISSING],整组不成立`
+        if (groupReason !== null) {
+          reason = groupReason
         } else if (anyFailed) {
           reason = failed.find((f) => f.claimId === claim.claimId)?.reason ?? '引用结构检查失败'
         } else {
@@ -500,18 +526,4 @@ export function validateCitations(db: SqliteDb, runId: string): CitationValidati
   }
 
   return report
-}
-
-/** 组内结构通过的引用 ID 集合(缺员原因展示用) */
-function validIdsOfGroup(
-  rows: readonly RunCitationRow[],
-  structure: ReadonlyMap<string, CitationCheckResult>,
-  groupId: string
-): Set<string> {
-  return new Set(
-    rows
-      .filter((row) => row.citation.relation === 'supports' && row.citation.evidenceGroupId === groupId)
-      .filter((row) => structure.get(row.citation.citationId)?.ok === true)
-      .map((row) => row.citation.citationId)
-  )
 }

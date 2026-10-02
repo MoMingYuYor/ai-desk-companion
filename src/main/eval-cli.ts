@@ -19,8 +19,12 @@
 //   node out/main/eval-cli.js report --run-id <evalRunId> --artifact-root artifacts/eval-smoke
 
 import { join, resolve } from 'node:path'
+import { readFileSync } from 'node:fs'
 import { resolveEvalPaths } from './evals/resources'
 import { EvalsService, EVAL_START_LIMITS, type EvalStartRequest } from './evals/api'
+import { currentEvalVersions } from './evals/buildVersions'
+import { createRealCompleterFor } from './evals/realAdapter'
+import type { FreezeInput } from '../shared/evals'
 
 interface ParsedArgs {
   command: string
@@ -47,9 +51,12 @@ function parseArgs(argv: readonly string[]): ParsedArgs | null {
 function usage(): string {
   return [
     '评测最小复现 CLI(EVAL-05):',
+    '  eval-cli freeze --experiment <ID> --dataset <版本> --stage <ops-planning|research-extraction>',
+    '        --execution <fake|real> --user-data <目录> [--target-file <无密钥JSON>]',
     '  eval-cli run --dataset <版本> --split <dev|holdout> --execution <fake|real>',
     '        --config <configId>[,<configId>…] [--repeats 1] [--max-cases 20]',
     '        [--artifact-root <目录>] [--user-data <目录>]',
+    '        [--case-ids-file <dev冒烟ID数组JSON>]',
     '  eval-cli report --run-id <evalRunId> [--artifact-root <目录>] [--user-data <目录>]',
     '',
     '退出码:成功 0;缺参 2;运行/资源错误 1。',
@@ -69,13 +76,35 @@ function buildService(flags: Record<string, string>): { service: EvalsService; a
   const paths = resolveEvalPaths({ packaged: false, resourceRoot: sourceRoot, sourceRoot, userData })
   // --artifact-root 覆盖产物根(相对路径按调用时 cwd 解析);其余可写目录仍在 userData
   const artifactRoot = flags['artifact-root'] ? resolve(cwd, flags['artifact-root']) : paths.artifactRoot
+  const credentialOf = (providerId: string): string | null =>
+    process.env.AI_DESK_EVAL_PROVIDER_ID === providerId ? process.env.AI_DESK_EVAL_API_KEY ?? null : null
   const service = new EvalsService({
     paths: { ...paths, artifactRoot },
     sqlJsDistDir: join(sourceRoot, 'node_modules', 'sql.js', 'dist'),
     // real 凭据:仅显式环境变量;不读取业务库/凭据库
-    credentialOf: () => process.env.AI_DESK_EVAL_API_KEY ?? null
+    credentialOf,
+    realCompleterFor: createRealCompleterFor({ credentialOf }),
+    versionsOf: () => currentEvalVersions(sourceRoot)
   })
   return { service, artifactRoot }
+}
+
+async function cmdFreeze(flags: Record<string, string>): Promise<number> {
+  if (['experiment', 'dataset', 'stage', 'execution', 'user-data'].some(key => !flags[key]) ||
+    !['fake', 'real'].includes(flags.execution!) || !['ops-planning', 'research-extraction'].includes(flags.stage!) ||
+    (flags.execution === 'real' && !flags['target-file'])) {
+    console.error(`[eval-cli] freeze 参数缺失或非法\n${usage()}`)
+    return 2
+  }
+  const input: FreezeInput = {
+    experimentId: flags.experiment!, datasetVersion: flags.dataset!, stage: flags.stage as FreezeInput['stage'],
+    executionKind: flags.execution as FreezeInput['executionKind'],
+    target: flags.execution === 'real' ? JSON.parse(readFileSync(resolve(flags['target-file']!), 'utf8')) : null
+  }
+  const { service } = buildService(flags)
+  const result = service.freeze(input)
+  console.log(JSON.stringify({ baseline: { configId: result.baseline.config.configId, sha256: result.baseline.sha256 }, candidate: { configId: result.candidate.config.configId, sha256: result.candidate.sha256 }, manifestSha256: result.manifestSha256 }))
+  return 0
 }
 
 async function waitTerminal(service: EvalsService, evalRunId: string): Promise<NonNullable<ReturnType<EvalsService['getRun']>>> {
@@ -111,7 +140,8 @@ async function cmdRun(flags: Record<string, string>): Promise<number> {
     executionKind: execution,
     configIds,
     repeats,
-    maxCases
+    maxCases,
+    ...(flags['case-ids-file'] ? { caseIds: JSON.parse(readFileSync(resolve(flags['case-ids-file']), 'utf8')) } : {})
   }
   if (execution === 'real' && !process.env.AI_DESK_EVAL_API_KEY) {
     console.error('[eval-cli] real 执行需要环境变量 AI_DESK_EVAL_API_KEY(凭据仅从显式 config 与该变量解析,不读取业务库)')
@@ -168,6 +198,7 @@ async function main(): Promise<number> {
     return 2
   }
   switch (parsed.command) {
+    case 'freeze': return cmdFreeze(parsed.flags)
     case 'run':
       return cmdRun(parsed.flags)
     case 'report':

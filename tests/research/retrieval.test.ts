@@ -12,11 +12,11 @@
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { openDatabase, type SqliteDb } from '../../src/main/db/connection'
 import { initSchema } from '../../src/main/db/dao'
 import { fixedClock } from '../../src/shared/clock'
-import { rebuildSearchIndex } from '../../src/main/retrieval/search'
+import { rebuildSearchIndex, searchDocuments } from '../../src/main/retrieval/search'
 import {
   MAX_CHUNKS_PER_SUBQUERY,
   expandAdjacent,
@@ -31,6 +31,28 @@ import {
 
 const SQL_JS_DIST = join(process.cwd(), 'node_modules', 'sql.js', 'dist')
 const FIXED_CLOCK = fixedClock('2026-09-27T12:00:00.000Z')
+
+it('801 个冻结来源的 SQL 总返回不超过 500，重复和打乱清单不改变命中', async () => {
+  const db = await makeTestDb()
+  const ids: string[] = []
+  db.transaction(() => {
+    for (let i = 0; i < 1302; i++) {
+      const id = `bounded-${String(i).padStart(4, '0')}`
+      if (i < 801) ids.push(id)
+      db.run(`INSERT INTO retrieval_documents (document_id, source_name, source_type, raw_sha256, text_sha256, normalized_text, size_bytes, created_at) VALUES (?, ?, 'txt', ?, ?, 'rag', 3, ?)`, [id, id, 'hash', 'hash', '2026-09-30'])
+      for (let chunk = 0; chunk < 2; chunk++) db.run(`INSERT INTO retrieval_chunks (chunk_id, document_id, chunk_index, start_offset, end_offset, content, search_text, search_version) VALUES (?, ?, ?, 0, 3, 'rag', 'rag', 1)`, [`${id}-${chunk}`, id, chunk])
+    }
+  })
+  rebuildSearchIndex(db)
+  const all = vi.spyOn(db, 'all')
+  const hits = searchDocuments(db, 'rag', 8, { frozenSnapshotIds: [...ids].reverse().concat(ids.slice(0, 5)) })
+  const rows = all.mock.calls.reduce((total, call, index) => total + (call[0].includes('MATCH ? AND c.document_id IN') ? (all.mock.results[index]?.value as unknown[])?.length ?? 0 : 0), 0)
+  expect(rows).toBeLessThanOrEqual(500)
+  expect(hits.map(hit => hit.chunkId)).toEqual(ids.slice(0, 4).flatMap(id => [`${id}-0`, `${id}-1`]))
+  expect(searchDocuments(db, 'rag', 8, { frozenSnapshotIds: ids })).toEqual(hits)
+  expect(searchDocuments(db, 'rag', 8, { frozenSnapshotIds: ids, candidateLimit: 0 })).toEqual([])
+  for (const candidateLimit of [-1, 1.5, 501, NaN]) expect(() => searchDocuments(db, 'rag', 8, { frozenSnapshotIds: ids, candidateLimit })).toThrow('candidateLimit')
+})
 
 async function makeTestDb(): Promise<SqliteDb> {
   const dir = mkdtempSync(join(tmpdir(), 'research-retrieval-'))

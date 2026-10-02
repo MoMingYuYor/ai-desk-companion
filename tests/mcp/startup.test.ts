@@ -6,9 +6,7 @@
 // 未批准写提案(approvalId + 库中 pending 行)/ 伪造 approved(任意值)拒绝 /
 // EOF 干净退出(退出码 0)/ 退出重开(同一 userData 重启,提案仍在)。
 //
-// 已知接线差距(整合者范围,见交付报告):index.ts 启动日志
-// "[startup] 使用隔离用户目录:..." 用 console.log 写到 stdout,
-// 属协议流污染;本测试仅容忍该一行,其余 stdout 噪声一律失败。
+// stdout 仅允许有对应请求的 JSON-RPC 响应，任何日志或重复响应均为协议污染。
 
 import { describe, expect, it } from 'vitest'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
@@ -78,7 +76,8 @@ class StdioMcp {
     }
     const msg = parsed as JsonRpcResponse
     const isResponse =
-      msg !== null && typeof msg === 'object' && msg.jsonrpc === '2.0' && ('result' in msg || 'error' in msg)
+      msg !== null && typeof msg === 'object' && msg.jsonrpc === '2.0' &&
+      (('result' in msg) !== ('error' in msg)) && 'id' in msg
     if (!isResponse) {
       this.stdoutNoise.push(line)
       return
@@ -89,7 +88,7 @@ class StdioMcp {
       clearTimeout(w.timer)
       w.resolve(msg)
     }
-    // 无等待者的响应(不应发生)静默丢弃:本测试全部串行请求
+    else this.stdoutNoise.push(line)
   }
 
   request(method: string, params?: unknown, timeoutMs = 20000): Promise<JsonRpcResponse> {
@@ -267,10 +266,7 @@ describe('MCP-01 进程级:--mcp 模式与相同审批边界', () => {
         const exitCode = await mcp.closeStdinAndExit()
         expect(exitCode).toBe(0)
 
-        // stdout 协议纯度:唯一容忍的噪声是整合者接线的启动目录日志(差距,待改 stderr)
-        for (const line of mcp.stdoutNoise) {
-          expect(line).toMatch(/^\[startup\] 使用隔离用户目录:/)
-        }
+        expect(mcp.stdoutNoise).toEqual([])
         // stderr 只允许日志,不允许任何 JSON-RPC 响应
         for (const line of mcp.stderrLines) {
           let parsed: unknown = null

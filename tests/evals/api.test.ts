@@ -13,11 +13,42 @@ import { saveFrozenConfig, type FrozenEvalConfig } from '../../src/main/evals/co
 import type { EvalRunState } from '../../src/main/evals/runner'
 import { authorizeIpc, type IpcPolicyEvent, type IpcPolicyWindow } from '../../src/main/security/ipcPolicy'
 import { Channels } from '../../src/shared/api'
+import { createRealCompleterFor } from '../../src/main/evals/realAdapter'
+import { exportCaseArtifacts } from '../../src/main/evals/artifacts'
 
 const REPO_ROOT = resolve(__dirname, '..', '..')
 const REPO_DATASETS = join(REPO_ROOT, 'evals', 'datasets')
 const REPO_FIXTURES = join(REPO_ROOT, 'fixtures', 'research')
 const SQL_JS_DIST = join(REPO_ROOT, 'node_modules', 'sql.js', 'dist')
+
+it('schema 2 冻结配置经真实适配器执行指定 dev 用例，两模板共享固定路由且不发送标注', async () => {
+  const userData = mkdtempSync(join(tmpdir(), 'eval-fixed-route-'))
+  const paths = resolveEvalPaths({ packaged: false, sourceRoot: REPO_ROOT, resourceRoot: REPO_ROOT, userData })
+  const sent: Array<{ url: string; body: any }> = []
+  const fetchImpl = vi.fn(async (url, init) => {
+    sent.push({ url: String(url), body: JSON.parse(String(init?.body)) })
+    const plan = { goal: '列出任务', steps: [{ tool: 'todo.list', arguments: {} }], assumptions: [], clarifications: [] }
+    return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content: JSON.stringify(plan) } }] })}\n\ndata: [DONE]\n\n`, { status: 200 })
+  })
+  const credentialOf = (id: string) => id === 'frozen-a' ? 'synthetic-key' : null
+  const service = new EvalsService({ paths, sqlJsDistDir: SQL_JS_DIST, credentialOf,
+    versionsOf: () => ({ codeCommit: 'b'.repeat(40), toolsVersion: 'ops-tools-v1', rubricVersion: 'rubric-v1' }),
+    realCompleterFor: createRealCompleterFor({ credentialOf, fetchImpl }) })
+  const pair = service.freeze({ experimentId: 'integration', datasetVersion: 'personal_ops_v2', stage: 'ops-planning', executionKind: 'real',
+    target: { providerId: 'frozen-a', protocol: 'chat-completions', baseUrl: 'https://a.example.invalid/v1', model: 'model-a' } })
+  const configIds = [pair.baseline.config.configId, pair.candidate.config.configId]
+  const { evalRunId } = service.startBatch({ datasetVersion: 'personal_ops_v2', split: 'dev', executionKind: 'real', configIds,
+    repeats: 1, maxCases: 2, caseIds: ['ops-read-01'] })
+  const state = await waitTerminal(service, evalRunId)
+  expect(state.status).toBe('completed')
+  expect(state.caseIds).toEqual(['ops-read-01'])
+  expect(state.results).toHaveLength(2)
+  expect(state.results.every(row => row.caseId === 'ops-read-01' && row.status === 'passed')).toBe(true)
+  expect(sent).toHaveLength(2)
+  expect(sent.every(row => row.url === 'https://a.example.invalid/v1/chat/completions' && row.body.model === 'model-a')).toBe(true)
+  expect(sent[0]!.body.messages[0].content).not.toBe(sent[1]!.body.messages[0].content)
+  expect(JSON.stringify(sent)).not.toMatch(/required_arguments|terminal_status|cases_sha256|synthetic-key/)
+})
 
 // ---------- 工具 ----------
 
@@ -136,7 +167,7 @@ describe('EVAL-05 资源发现(改变 cwd 仍可发现;缺资源不静默)', () 
     try {
       process.chdir(foreign)
       const datasets = service.listDatasets()
-      expect(datasets.map((d) => d.version).sort()).toEqual(['personal_ops_v1', 'research_v1'])
+      expect(datasets.map((d) => d.version).sort()).toEqual(['personal_ops_v1', 'personal_ops_v2', 'research_v1'])
       // 两套 cases/manifest 经加载校验(含 hash 一致性)
       const ops = loadEvalsDataset(paths.datasetRoot, 'personal_ops_v1')
       const research = loadEvalsDataset(paths.datasetRoot, 'research_v1')
@@ -273,7 +304,7 @@ describe('EVAL-05 start 服务端校验', () => {
     const wired = new EvalsService({
       paths,
       sqlJsDistDir: SQL_JS_DIST,
-      realCompleter: { completeJson: vi.fn() } as never,
+      realCompleterFor: () => ({ completeJson: vi.fn() } as never),
       credentialOf: () => null
     })
     expect(() => wired.startBatch(startRequest({ executionKind: 'real', configIds: ['real-x'] }))).toThrow(/凭据引用无法/)
@@ -281,23 +312,10 @@ describe('EVAL-05 start 服务端校验', () => {
     const ok = new EvalsService({
       paths,
       sqlJsDistDir: SQL_JS_DIST,
-      realCompleter: { completeJson: vi.fn() } as never,
+      realCompleterFor: () => ({ completeJson: vi.fn() } as never),
       credentialOf: () => 'env-key'
     })
-    // 校验通过即放行启动;第二个组合领取前取消,不推进更多案例
-    let claims = 0
-    const holder: { id: string } = { id: '' }
-    const { evalRunId } = ok.startBatch(startRequest({ executionKind: 'real', configIds: ['real-x'] }), {
-      beforeClaim: () => {
-        claims += 1
-        if (holder.id) ok.cancelRun(holder.id)
-      }
-    })
-    holder.id = evalRunId
-    const state = await waitTerminal(ok, evalRunId, 30000)
-    expect(claims).toBeGreaterThanOrEqual(2)
-    expect(state.status).toBe('cancelled')
-    expect(state.stopReason).toBe('user_cancelled')
+    expect(() => ok.startBatch(startRequest({ executionKind: 'real', configIds: ['real-x'] }))).toThrow(/schema 2/)
   }, 45000)
 })
 
@@ -375,6 +393,12 @@ describe('EVAL-05 EvalsService fake 批次(离线端到端)', () => {
 describe('EVAL-05 人工审阅读写', () => {
   it('审阅持久写成功后可读回;按 evalRunId 过滤;空理由拒绝', async () => {
     const { service, paths } = makeService()
+    exportCaseArtifacts(paths.artifactRoot, { evalRunId: 'eval-r1', configId: 'cfg', caseId: 'case-1', repeatIndex: 0 }, {
+      run: { runId: 'synthetic' }, traceEvents: [], observations: [], ruleChecks: [], report: {}, snapshots: {},
+      evidence: { claims: [{ claim_id: 'claim-1', claim_type: 'fact' }, { claim_id: 'claim-2', claim_type: 'fact' }], citations: [{ claim_id: 'claim-1', evidence_id: 'ev-1', relation: 'supports' }] }, meta: { executionKind: 'fake' }
+    })
+    expect(() => service.saveReview({ evalRunId: 'missing', configId: 'cfg', caseId: 'case-1', repeatIndex: 0,
+      claimId: 'claim-1', evidenceId: 'ev-1', decision: 'supported', reason: '不存在的产物', reviewer: '测试' })).toThrow()
     const saved = service.saveReview({
       evalRunId: 'eval-r1',
       configId: 'cfg',

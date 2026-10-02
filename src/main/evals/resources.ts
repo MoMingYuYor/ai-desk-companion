@@ -2,7 +2,7 @@
 // 消除对 process.cwd() 的隐式依赖。
 //
 // 纪律(完成计划 eval.md EVAL-05):
-// - 只读资源:开发模式定位仓库源根(sourceRoot)——evals/datasets 与 fixtures/research;
+// - 只读资源:开发模式定位仓库源根(sourceRoot)——evals/datasets、fixtures/research 与 evals/prompts;
 //   打包模式定位 process.resourcesPath(resourceRoot)下的 evals/ 副本——
 //   resourceRoot/evals/datasets 与 resourceRoot/evals/fixtures/research;
 // - 可写三项(产物/冻结配置/人工审阅)一律位于 userData/evals 之下,与业务数据
@@ -14,12 +14,14 @@
 
 import { join } from 'node:path'
 
-/** 评测资源路径契约(EVAL-05 接口原样):只读两项 + 可写三项 */
+/** 评测资源路径契约：只读三项 + 可写三项。 */
 export interface EvalResourcePaths {
   /** 数据集根:其下每个子目录是一个版本(cases.jsonl + manifest.json + annotations) */
   datasetRoot: string
   /** 研究 fixture 语料根:其下每个子目录是一个 fixture_id */
   fixtureRoot: string
+  /** 只读模板源；运行时使用 configRoot/templates 中的冻结副本。 */
+  templateRoot: string
   /** 评测产物根:<evalRunId>/<configId>/<caseId>/<repeatIndex>/ */
   artifactRoot: string
   /** 冻结实验配置根(configStore 管辖);冻结 prompt 模板在其 templates/ 子目录 */
@@ -59,6 +61,7 @@ export function resolveEvalPaths(input: ResolveEvalPathsInput): EvalResourcePath
   return {
     datasetRoot,
     fixtureRoot,
+    templateRoot: join(input.packaged ? input.resourceRoot : input.sourceRoot, 'evals', 'prompts'),
     artifactRoot: join(writableBase, 'artifacts'),
     configRoot: join(writableBase, 'configs'),
     reviewRoot: join(writableBase, 'reviews')

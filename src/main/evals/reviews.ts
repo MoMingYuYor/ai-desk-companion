@@ -18,10 +18,16 @@ export interface ReviewAnnotation {
   reviewer: string
   rubricVersion: string
   reviewedAt: string
+  /** 由服务端从完整产物计算；历史未绑定记录不能用于当前证据判分。 */
+  contentSha256?: string
 }
 
 /** 校验审阅输入:空理由(有效判定)、rubric 版本与审阅人必填;内存/持久存储共用 */
 export function assertAnnotationInput(annotation: Omit<ReviewAnnotation, 'reviewId'>): void {
+  if (typeof annotation.reviewedAt !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(annotation.reviewedAt) ||
+      !Number.isFinite(Date.parse(annotation.reviewedAt)) || new Date(annotation.reviewedAt).toISOString() !== annotation.reviewedAt) {
+    throw new Error('审阅 reviewedAt 必须是有效 UTC ISO 时间')
+  }
   if (annotation.decision !== 'unreviewed' && annotation.reason.trim() === '') {
     throw new Error('人工复核必须给出理由')
   }

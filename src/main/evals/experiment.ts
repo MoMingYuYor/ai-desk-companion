@@ -14,6 +14,20 @@ import { DEFAULT_AGENT_BUDGET } from '../agent/config'
 import { DEFAULT_RESEARCH_BUDGET } from '../research/schemas'
 import type { EvalCase } from './types'
 
+/** 显式冒烟只接受 dev，绑定选择顺序；不通过重写数据集或 split 取例。 */
+export function selectExplicitSmokeCases(cases: readonly EvalCase[], ids: readonly string[]): EvalCase[] {
+  if (!Array.isArray(ids) || ids.length === 0 || ids.some(id => typeof id !== 'string') || new Set(ids).size !== ids.length) {
+    throw new Error('smoke caseIds 必须是非空且无重复的 ID 清单')
+  }
+  const byId = new Map(cases.map(c => [c.case_id, c]))
+  return ids.map(id => {
+    const item = byId.get(id)
+    if (!item) throw new Error(`未知 smoke caseId:${id}`)
+    if (item.split !== 'dev') throw new Error(`smoke 禁止选择 holdout:${id}`)
+    return item
+  })
+}
+
 /** 实验任务项:一项对应一个 case/config/repeat 三元组(规范逐字) */
 export interface ExperimentItem {
   caseId: string

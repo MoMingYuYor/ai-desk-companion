@@ -69,6 +69,17 @@ function approval(over: Partial<AgentApprovalView> = {}): AgentApprovalView {
   }
 }
 
+/** 显式控制 IPC 返回顺序，避免用真实网络或 sleep 制造竞态。 */
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: Error) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
 type Listener = (...args: unknown[]) => void
 
 interface Harness {
@@ -129,9 +140,10 @@ function installApi(
 }
 
 describe('AgentPage 输入区', () => {
-  it('空输入禁止提交;纯空白同样禁止', () => {
+  it('空输入禁止提交;纯空白同样禁止', async () => {
     installApi({ run: runView(), events: [] })
     render(<AgentPage refreshKey={0} />)
+    await screen.findByTestId('agent-run')
     // 挂载自动打开历史运行后,输入框仍为空:禁止提交
     const submit = screen.getByTestId('agent-submit') as HTMLButtonElement
     expect(submit.disabled).toBe(true)
@@ -147,7 +159,8 @@ describe('AgentPage 输入区', () => {
           resolveCreate = resolve
         })
     )
-    installApi({ create })
+    installApi({ create, run: runView({ runId: 'run-2' }) })
+    vi.mocked(window.api.listAgentRuns).mockResolvedValue([])
     render(<AgentPage refreshKey={0} />)
     // 历史为空:无自动打开,手动输入并提交
     fireEvent.change(screen.getByTestId('agent-input'), { target: { value: '整理任务' } })
@@ -220,12 +233,14 @@ describe('AgentPage 事件流', () => {
     await screen.findByTestId('agent-run')
     await waitFor(() => expect(h.listeners.has('evt:agent-run-updated')).toBe(true))
 
-    h.emit('evt:agent-run-updated', { run: runView(), event: traceEvent(1, 'plan', { goal: '目标G' }) })
-    h.emit('evt:agent-run-updated', { run: runView(), event: traceEvent(2, 'tool_call', { tool: 'todo.list', ok: true }) })
-    // 重复 seq:去重
-    h.emit('evt:agent-run-updated', { run: runView(), event: traceEvent(2, 'tool_call', { tool: 'todo.list', ok: true }) })
-    // 其他运行:忽略
-    h.emit('evt:agent-run-updated', { run: { ...runView(), runId: 'other' }, event: traceEvent(9, 'plan', {}) })
+    await act(async () => {
+      h.emit('evt:agent-run-updated', { run: runView(), event: traceEvent(1, 'plan', { goal: '目标G' }) })
+      h.emit('evt:agent-run-updated', { run: runView(), event: traceEvent(2, 'tool_call', { tool: 'todo.list', ok: true }) })
+      // 重复 seq:去重
+      h.emit('evt:agent-run-updated', { run: runView(), event: traceEvent(2, 'tool_call', { tool: 'todo.list', ok: true }) })
+      // 其他运行:忽略
+      h.emit('evt:agent-run-updated', { run: { ...runView(), runId: 'other' }, event: traceEvent(9, 'plan', {}) })
+    })
 
     const timeline = await screen.findByTestId('agent-timeline')
     await waitFor(() => expect(timeline.textContent).toContain('#2'))
@@ -250,7 +265,7 @@ describe('AgentPage 事件流', () => {
     render(<AgentPage refreshKey={0} />)
     await screen.findByTestId('agent-run')
     await waitFor(() => expect(h.listeners.has('evt:agent-run-finished')).toBe(true))
-    h.emit('evt:agent-run-finished', { run: runView({ status: 'succeeded' }) })
+    await act(async () => h.emit('evt:agent-run-finished', { run: runView({ status: 'succeeded' }) }))
     await waitFor(() => expect(screen.getByTestId('agent-run-status').textContent).toBe('已完成'))
   })
 })
@@ -682,5 +697,285 @@ describe('AgentPage 刷新竞态(OPS-04)', () => {
     unmount()
     expect(h.listeners.get('evt:agent-run-updated')).toHaveLength(0)
     expect(h.listeners.get('evt:agent-run-finished')).toHaveLength(0)
+    expect(h.listeners.get('evt:workspace-epoch-changed') ?? []).toHaveLength(0)
+  })
+})
+
+describe('AgentPage T05 事件与刷新版本', () => {
+  const question = traceEvent(1, 'input', {
+    questions: [{ questionId: 'q-old', question: '旧运行的问题?' }]
+  })
+
+  it.each(['awaiting_confirmation', 'awaiting_input'] as const)(
+    'seq=3 终态后 seq=2 的 %s 只补时间线，不恢复人工操作卡',
+    async (oldStatus) => {
+      const h = installApi({ run: runView({ status: oldStatus }), events: [question], approvals: [approval()] })
+      render(<AgentPage refreshKey={0} />)
+      await screen.findByTestId('agent-run')
+      await act(async () => {
+        h.emit('evt:agent-run-updated', { run: runView({ status: 'succeeded' }), event: traceEvent(3, 'output') })
+      })
+      await act(async () => {
+        h.emit('evt:agent-run-updated', {
+          run: runView({ status: oldStatus }), event: traceEvent(2, 'confirmation', { approvalId: 'ap-1' })
+        })
+      })
+      expect(screen.getByTestId('agent-run-status').textContent).toBe('已完成')
+      expect(screen.queryByTestId('agent-confirm-card')).toBeNull()
+      expect(screen.queryByLabelText('旧运行的问题?')).toBeNull()
+      const seqs = Array.from(screen.getByTestId('agent-timeline').querySelectorAll('span'))
+        .map((node) => node.textContent).filter((text) => /^#\d+$/.test(text ?? ''))
+      expect(seqs).toEqual(['#1', '#2', '#3'])
+    }
+  )
+
+  it('重复 seq 的不同快照不能覆盖已接纳状态，也不再次刷新', async () => {
+    const h = installApi({ events: [traceEvent(1, 'plan')] })
+    render(<AgentPage refreshKey={0} />)
+    await screen.findByTestId('agent-run')
+    await act(async () => {
+      h.emit('evt:agent-run-updated', { run: runView({ status: 'succeeded' }), event: traceEvent(2, 'output') })
+    })
+    const calls = vi.mocked(window.api.getAgentRun).mock.calls.length
+    await act(async () => {
+      h.emit('evt:agent-run-updated', {
+        run: runView({ status: 'awaiting_confirmation' }), event: traceEvent(2, 'confirmation')
+      })
+    })
+    expect(screen.getByTestId('agent-run-status').textContent).toBe('已完成')
+    expect(vi.mocked(window.api.getAgentRun).mock.calls).toHaveLength(calls)
+    expect(screen.getByTestId('agent-timeline').textContent?.match(/#2/g)).toHaveLength(1)
+  })
+
+  it('迟到的 refresh 与审批不能覆盖新终态，并合并补拉一次', async () => {
+    const staleRun = deferred<AgentRunView>()
+    const staleApprovals = deferred<AgentApprovalView[]>()
+    const h = installApi({ run: runView({ status: 'succeeded' }), events: [question] })
+    vi.mocked(window.api.getAgentRun).mockImplementationOnce(() => staleRun.promise)
+    vi.mocked(window.api.getAgentRunApprovals).mockImplementationOnce(() => staleApprovals.promise)
+    render(<AgentPage refreshKey={0} />)
+    await waitFor(() => expect(window.api.getAgentRunEvents).toHaveBeenCalledWith('run-1', 0))
+    await act(async () => {
+      h.emit('evt:agent-run-updated', { run: runView({ status: 'succeeded' }), event: traceEvent(2, 'output') })
+      staleRun.resolve(runView({ status: 'awaiting_input' }))
+      staleApprovals.resolve([approval()])
+    })
+    expect(screen.getByTestId('agent-run-status').textContent).toBe('已完成')
+    expect(screen.queryByTestId('agent-confirm-card')).toBeNull()
+    expect(screen.queryByLabelText('旧运行的问题?')).toBeNull()
+    expect(window.api.getAgentRun).toHaveBeenCalledTimes(2)
+    expect(window.api.getAgentRunApprovals).toHaveBeenCalledTimes(2)
+  })
+
+  it('迟到的 refresh 错误不污染新事件，并补拉最新状态', async () => {
+    const stale = deferred<AgentRunView>()
+    const h = installApi({ run: runView({ status: 'succeeded' }), events: [question] })
+    vi.mocked(window.api.getAgentRun).mockImplementationOnce(() => stale.promise)
+    render(<AgentPage refreshKey={0} />)
+    await waitFor(() => expect(window.api.getAgentRunEvents).toHaveBeenCalledWith('run-1', 0))
+    await act(async () => {
+      h.emit('evt:agent-run-updated', { run: runView({ status: 'succeeded' }), event: traceEvent(2, 'output') })
+      stale.reject(new Error('旧请求失败'))
+    })
+    expect(screen.queryByTestId('agent-error')).toBeNull()
+    expect(screen.getByTestId('agent-run-status').textContent).toBe('已完成')
+    expect(window.api.getAgentRun).toHaveBeenCalledTimes(2)
+  })
+
+  it('较新 refresh 已完成后，旧请求错误不覆盖当前错误区', async () => {
+    const stale = deferred<AgentRunView>()
+    const h = installApi({ run: runView({ status: 'awaiting_confirmation' }), approvals: [approval()] })
+    render(<AgentPage refreshKey={0} />)
+    await screen.findByTestId('agent-confirm-card')
+    vi.mocked(window.api.getAgentRun).mockImplementationOnce(() => stale.promise)
+    await act(async () => {
+      h.emit('evt:agent-run-updated', { run: runView({ status: 'awaiting_confirmation' }), event: traceEvent(1, 'confirmation') })
+    })
+    await act(async () => {
+      h.emit('evt:agent-run-updated', { run: runView({ status: 'awaiting_confirmation' }), event: traceEvent(2, 'confirmation') })
+    })
+    await act(async () => stale.reject(new Error('已被替代的请求失败')))
+    expect(screen.queryByTestId('agent-error')).toBeNull()
+    expect(screen.getByTestId('agent-confirm-card')).toBeTruthy()
+  })
+
+  it('新事件淘汰审批 refresh 后仍能拉到最新审批，两条同批事件只合并刷新一次', async () => {
+    const stale = deferred<AgentApprovalView[]>()
+    const h = installApi({ run: runView({ status: 'awaiting_confirmation' }), approvals: [approval({ approvalId: 'ap-new' })] })
+    vi.mocked(window.api.getAgentRunApprovals).mockImplementationOnce(() => stale.promise)
+    render(<AgentPage refreshKey={0} />)
+    await waitFor(() => expect(window.api.getAgentRunApprovals).toHaveBeenCalledTimes(1))
+    await act(async () => {
+      h.emit('evt:agent-run-updated', { run: runView({ status: 'awaiting_confirmation' }), event: traceEvent(1, 'model') })
+      h.emit('evt:agent-run-updated', { run: runView({ status: 'awaiting_confirmation' }), event: traceEvent(2, 'confirmation') })
+      stale.resolve([])
+    })
+    expect(screen.getByTestId('agent-confirm-card')).toBeTruthy()
+    expect(window.api.getAgentRun).toHaveBeenCalledTimes(2)
+    expect(window.api.getAgentRunApprovals).toHaveBeenCalledTimes(2)
+  })
+
+  it('补拉仍缺 seq=2 时游标停在 1，后续补齐 2/3/4 且各展示一次', async () => {
+    const events = [traceEvent(1, 'plan'), traceEvent(2, 'tool_call'), traceEvent(3, 'plan'), traceEvent(4, 'input')]
+    const h = installApi({ events: [events[0]!] })
+    vi.mocked(window.api.getAgentRunEvents)
+      .mockResolvedValueOnce({ run: runView(), events: [events[0]!] })
+      .mockResolvedValueOnce({ run: runView(), events: [events[2]!] })
+      .mockImplementation(async (_id, afterSeq) => ({ run: runView(), events: events.filter((e) => e.seq > (afterSeq ?? 0)) }))
+    render(<AgentPage refreshKey={0} />)
+    await screen.findByTestId('agent-run')
+    await act(async () => {
+      h.emit('evt:agent-run-updated', { run: runView(), event: events[2]! })
+    })
+    await act(async () => {
+      h.emit('evt:agent-run-updated', { run: runView(), event: events[3]! })
+    })
+    expect(vi.mocked(window.api.getAgentRunEvents).mock.calls.slice(1).map((call) => call[1])).toEqual([1, 1])
+    const seqs = Array.from(screen.getByTestId('agent-timeline').querySelectorAll('span'))
+      .map((node) => node.textContent).filter((text) => /^#\d+$/.test(text ?? ''))
+    expect(seqs).toEqual(['#1', '#2', '#3', '#4'])
+  })
+
+  it('当前缺口补拉失败显示错误、保留新快照且不自动重试', async () => {
+    const h = installApi({ events: [traceEvent(1, 'plan')] })
+    render(<AgentPage refreshKey={0} />)
+    await screen.findByTestId('agent-run')
+    vi.mocked(window.api.getAgentRunEvents).mockRejectedValueOnce(new Error('轨迹补拉失败'))
+    await act(async () => {
+      h.emit('evt:agent-run-updated', { run: runView({ status: 'succeeded' }), event: traceEvent(3, 'output') })
+    })
+    expect(screen.getByTestId('agent-error').textContent).toContain('轨迹补拉失败')
+    expect(screen.getByTestId('agent-run-status').textContent).toBe('已完成')
+    expect(screen.getByTestId('agent-timeline').textContent).toContain('#3')
+    expect(window.api.getAgentRunEvents).toHaveBeenCalledTimes(2)
+  })
+
+  it('旧补拉错误晚于新事件到达时不污染当前视图', async () => {
+    const stale = deferred<{ run: AgentRunView; events: TraceEvent[] }>()
+    const h = installApi({ events: [traceEvent(1, 'plan')] })
+    render(<AgentPage refreshKey={0} />)
+    await screen.findByTestId('agent-run')
+    vi.mocked(window.api.getAgentRunEvents).mockImplementationOnce(() => stale.promise)
+    await act(async () => {
+      h.emit('evt:agent-run-updated', { run: runView(), event: traceEvent(3, 'plan') })
+      h.emit('evt:agent-run-updated', { run: runView({ status: 'succeeded' }), event: traceEvent(2, 'output') })
+      h.emit('evt:agent-run-updated', { run: runView({ status: 'succeeded' }), event: traceEvent(4, 'output') })
+      stale.reject(new Error('旧轨迹查询失败'))
+    })
+    expect(screen.queryByTestId('agent-error')).toBeNull()
+    expect(screen.getByTestId('agent-run-status').textContent).toBe('已完成')
+  })
+
+  it('finished 无 seq 时保持当前快照，重复通知只合并一次权威刷新', async () => {
+    const authoritative = deferred<AgentRunView>()
+    const h = installApi()
+    render(<AgentPage refreshKey={0} />)
+    await screen.findByTestId('agent-run')
+    vi.mocked(window.api.getAgentRun).mockImplementationOnce(() => authoritative.promise)
+    await act(async () => {
+      h.emit('evt:agent-run-finished', { run: runView({ status: 'succeeded' }) })
+      h.emit('evt:agent-run-finished', { run: runView({ status: 'succeeded' }) })
+    })
+    expect(screen.getByTestId('agent-run-status').textContent).toBe('执行中')
+    expect(window.api.getAgentRun).toHaveBeenCalledTimes(2)
+    await act(async () => authoritative.resolve(runView({ status: 'partial' })))
+    expect(screen.getByTestId('agent-run-status').textContent).toBe('部分完成')
+  })
+
+  it('finished 权威刷新失败保留现状、显示错误且不自动重试', async () => {
+    const h = installApi()
+    render(<AgentPage refreshKey={0} />)
+    await screen.findByTestId('agent-run')
+    vi.mocked(window.api.getAgentRun).mockRejectedValueOnce(new Error('终态查询失败'))
+    await act(async () => {
+      h.emit('evt:agent-run-finished', { run: runView({ status: 'succeeded' }) })
+    })
+    expect(screen.getByTestId('agent-run-status').textContent).toBe('执行中')
+    expect(screen.getByTestId('agent-error').textContent).toContain('终态查询失败')
+    expect(window.api.getAgentRun).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['succeeded', 'partial', 'failed', 'cancelled'] as const)(
+    '%s 的有效刷新也拒绝人工等待态回退', async (status) => {
+      const h = installApi({ run: runView({ status }), events: [question] })
+      render(<AgentPage refreshKey={0} />)
+      await screen.findByTestId('agent-run')
+      vi.mocked(window.api.getAgentRun).mockResolvedValue(runView({ status: 'awaiting_input' }))
+      vi.mocked(window.api.getAgentRunApprovals).mockResolvedValue([approval()])
+      await act(async () => {
+        h.emit('evt:agent-run-finished', { run: runView({ status: 'awaiting_confirmation' }) })
+      })
+      expect(screen.getByTestId('agent-run-status').textContent).toBe(
+        { succeeded: '已完成', partial: '部分完成', failed: '失败', cancelled: '已取消' }[status]
+      )
+      expect(screen.queryByTestId('agent-confirm-card')).toBeNull()
+      expect(screen.queryByLabelText('旧运行的问题?')).toBeNull()
+    }
+  )
+
+  it.each(['resolve', 'reject'] as const)(
+    '跨运行的旧 refresh %s 后保留 run-2 回答文本和错误区', async (outcome) => {
+      const staleRun = deferred<AgentRunView>()
+      const staleApprovals = deferred<AgentApprovalView[]>()
+      installApi()
+      vi.mocked(window.api.listAgentRuns).mockResolvedValue([
+        runView({ input: '第一个运行' }), runView({ runId: 'run-2', input: '第二个运行', status: 'awaiting_input' })
+      ])
+      vi.mocked(window.api.getAgentRun).mockImplementation(async (id) =>
+        id === 'run-1' ? staleRun.promise : runView({ runId: 'run-2', input: '第二个运行', status: 'awaiting_input' })
+      )
+      vi.mocked(window.api.getAgentRunApprovals).mockImplementation(async (id) => id === 'run-1' ? staleApprovals.promise : [])
+      vi.mocked(window.api.getAgentRunEvents).mockImplementation(async (id) => ({
+        run: null, events: [traceEvent(1, 'input', { questions: [{ questionId: 'q-new', question: '新运行的问题?' }] }, id)]
+      }))
+      render(<AgentPage refreshKey={0} />)
+      await waitFor(() => expect(window.api.getAgentRun).toHaveBeenCalledWith('run-1'))
+      fireEvent.click(screen.getAllByTestId('agent-history-item')[1]!)
+      fireEvent.change(await screen.findByLabelText('新运行的问题?'), { target: { value: 'run-2 的回答' } })
+      await act(async () => {
+        staleApprovals.resolve([approval()])
+        if (outcome === 'resolve') staleRun.resolve(runView({ status: 'awaiting_confirmation' }))
+        else staleRun.reject(new Error('run-1 的旧错误'))
+      })
+      expect((screen.getByLabelText('新运行的问题?') as HTMLTextAreaElement).value).toBe('run-2 的回答')
+      expect(screen.queryByTestId('agent-error')).toBeNull()
+      expect(screen.queryByTestId('agent-confirm-card')).toBeNull()
+    }
+  )
+
+  it('epoch 变化重开同 runId，重置终态和 seq 并隔离旧 refresh/审批/补发', async () => {
+    const staleRun = deferred<AgentRunView>()
+    const staleApprovals = deferred<AgentApprovalView[]>()
+    const staleEvents = deferred<{ run: AgentRunView; events: TraceEvent[] }>()
+    const h = installApi({ run: runView({ status: 'succeeded' }), events: [traceEvent(1, 'plan')] })
+    render(<AgentPage refreshKey={0} />)
+    await screen.findByTestId('agent-run')
+    vi.mocked(window.api.getAgentRun).mockImplementationOnce(() => staleRun.promise)
+    vi.mocked(window.api.getAgentRunApprovals).mockImplementationOnce(() => staleApprovals.promise)
+    vi.mocked(window.api.getAgentRunEvents).mockImplementationOnce(() => staleEvents.promise)
+    await act(async () => {
+      h.emit('evt:agent-run-updated', { run: runView({ status: 'succeeded' }), event: traceEvent(5, 'output') })
+      h.emit('evt:agent-run-finished', { run: runView({ status: 'succeeded' }) })
+    })
+    vi.mocked(window.api.getAgentRun).mockResolvedValue(runView({ status: 'awaiting_input', input: '恢复后的运行' }))
+    vi.mocked(window.api.getAgentRunEvents).mockResolvedValue({
+      run: runView({ status: 'awaiting_input' }),
+      events: [traceEvent(1, 'input', { questions: [{ questionId: 'q-restored', question: '恢复后的问题?' }] })]
+    })
+    await act(async () => h.emit('evt:workspace-epoch-changed', { epoch: 'new-epoch' }))
+    fireEvent.change(await screen.findByLabelText('恢复后的问题?'), { target: { value: '新库的回答' } })
+    await act(async () => {
+      staleRun.resolve(runView({ status: 'awaiting_confirmation' }))
+      staleApprovals.resolve([approval()])
+      staleEvents.resolve({ run: runView({ status: 'succeeded' }), events: [traceEvent(5, 'output')] })
+    })
+    expect(screen.getByTestId('agent-run').textContent).toContain('恢复后的运行')
+    expect((screen.getByLabelText('恢复后的问题?') as HTMLTextAreaElement).value).toBe('新库的回答')
+    expect(screen.queryByTestId('agent-confirm-card')).toBeNull()
+    expect(screen.queryByTestId('agent-error')).toBeNull()
+    expect(screen.getByTestId('agent-timeline').textContent).not.toContain('#5')
+    expect(vi.mocked(window.api.getAgentRunEvents).mock.calls.at(-1)).toEqual(['run-1', 0])
+    await act(async () => h.emit('evt:agent-run-updated', { run: runView(), event: traceEvent(2, 'plan') }))
+    expect(screen.getByTestId('agent-run-status').textContent).toBe('执行中')
   })
 })

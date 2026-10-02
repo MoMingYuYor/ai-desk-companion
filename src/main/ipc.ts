@@ -116,6 +116,9 @@ import { markPetBubble } from './petBridge'
 import { createPetDragService } from './pet/drag'
 import type { PetActivityRegistry } from './pet/activity'
 import type { MailService } from './mail/service'
+import { recoverInterruptedRuns } from './agent/recovery'
+import type { FreezeInput } from '../shared/evals'
+import { normalizeTargetProfile } from './evals/freeze'
 
 export interface IpcDeps {
   db: SqliteDb
@@ -124,6 +127,7 @@ export interface IpcDeps {
   reminders: ReminderService
   petActivity: PetActivityRegistry
   mail: MailService
+  quiesceAgents?: () => Promise<() => void>
   /** 持久化协调器:存在时向全部窗口广播保存状态(evt:persist-state) */
   persistCoordinator?: PersistenceCoordinator
   /**
@@ -450,6 +454,17 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   // EVAL-05:取消、case 产物查询、配置发现、人工审阅读写
   handle(Channels.EvalCancelRun, (evalRunId: string) => evals().cancelRun(evalRunId))
   handle(Channels.EvalListConfigs, () => evals().listConfigs())
+  handle(Channels.EvalFreeze, (input: FreezeInput) => {
+    if (input?.executionKind === 'real') {
+      const target = normalizeTargetProfile(input.target)
+      const provider = listProviders(db).find(p => p.id === target.providerId)
+      if (!provider || provider.protocol !== target.protocol ||
+        normalizeTargetProfile({ providerId: provider.id, protocol: provider.protocol, baseUrl: provider.baseUrl, model: target.model }).baseUrl !== target.baseUrl ||
+        !provider.models.includes(target.model)) throw new OperationError(appError('FORBIDDEN', '评测目标必须来自已配置服务商和模型'))
+    }
+    const pair = evals().freeze(input)
+    return { configIds: [pair.baseline.config.configId, pair.candidate.config.configId], manifestSha256: pair.manifestSha256 }
+  })
   handle(Channels.EvalCaseArtifacts, (evalRunId: string, configId: string, caseId: string, repeatIndex: number) =>
     evals().getCaseArtifacts(evalRunId, configId, caseId, repeatIndex)
   )
@@ -760,7 +775,17 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     // 排他窗口:先验(坏文件零写入) → 阻止新写入 → 排空在途邮箱任务并落盘 →
     // 提升 workspaceEpoch → 门控后快照 → 单事务替换 → 落盘确认(失败回滚)
     await restoreBackup(db, r.filePaths[0], {
-      quiesceExternal: () => mail.quiesceExternal(),
+      quiesceExternal: async () => {
+        const resumeAgents = await deps.quiesceAgents?.()
+        try {
+          const resumeMail = await mail.quiesceExternal()
+          return () => { resumeMail(); resumeAgents?.() }
+        } catch (error) {
+          resumeAgents?.()
+          throw error
+        }
+      },
+      afterReplace: () => { recoverInterruptedRuns(db) },
       onRestored: () => {
         // 旧会话运行全部失效;提醒按新库重扫;各窗口重读 revision/epoch
         engine.invalidateAllRuns()

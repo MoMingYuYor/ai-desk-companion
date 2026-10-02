@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ProviderInfo } from '../src/shared/types'
+import type { TokenUsage } from '../src/shared/agent'
 import {
   buildChain,
   describeHttpError,
@@ -8,7 +9,7 @@ import {
   ModelRouter,
   type LlmMessage
 } from '../src/main/services/modelRouter'
-import type { ModelAttemptEvent, ModelRequestControl } from '../src/main/services/modelRequest'
+import { ModelRequestError, type ModelAttemptEvent, type ModelRequestControl } from '../src/main/services/modelRequest'
 
 function provider(partial: Partial<ProviderInfo>): ProviderInfo {
   return {
@@ -306,5 +307,342 @@ describe('RES-01 单发送契约', () => {
     expect(settled[0]!.attempt.outcome).toBe('failed')
     expect(settled[0]!.attempt.httpStatus).toBeNull()
     expect(settled[0]!.attempt.usage.totalTokens).toBeNull()
+  })
+})
+
+describe('T08 受控流观测与资源清理', () => {
+  const messages: LlmMessage[] = [{ role: 'user', content: 'synthetic request' }]
+  const observedUsage: TokenUsage = { inputTokens: 11, outputTokens: 7, totalTokens: 18, source: 'provider-reported' }
+  const noUsage: TokenUsage = { inputTokens: null, outputTokens: null, totalTokens: null, source: null }
+  let external: AbortController
+  let timeout: AbortController
+  let events: ModelAttemptEvent[]
+
+  beforeEach(() => {
+    external = new AbortController()
+    timeout = new AbortController()
+    events = []
+    // 用受控超时信号触发 abort，不依赖真实时钟。
+    vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeout.signal)
+    vi.spyOn(timeout.signal, 'addEventListener')
+    vi.spyOn(timeout.signal, 'removeEventListener')
+    vi.spyOn(external.signal, 'addEventListener')
+    vi.spyOn(external.signal, 'removeEventListener')
+  })
+
+  afterEach(() => vi.restoreAllMocks())
+
+  function control(onAttempt: ModelRequestControl['onAttempt'] = (event) => { events.push(event) }): ModelRequestControl {
+    return {
+      requestId: 't08-synthetic', signal: external.signal, timeoutMs: 1000,
+      policy: { maxAttempts: 1, fallback: 'disabled' }, beforeSend: () => {}, onAttempt
+    }
+  }
+
+  function frame(json: unknown): string {
+    return `data: ${JSON.stringify(json)}\n\n`
+  }
+
+  function metadata(protocol: string): string {
+    return protocol === 'responses'
+      ? frame({ type: 'response.completed', response: { model: 'reported-model', usage: { input_tokens: 11, output_tokens: 7, total_tokens: 18 } } })
+      : frame({ model: 'reported-model', choices: [], usage: { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 } })
+  }
+
+  function delta(protocol = 'chat-completions'): string {
+    return protocol === 'responses'
+      ? frame({ type: 'response.output_text.delta', delta: 'ok' })
+      : frame({ choices: [{ delta: { content: 'ok' } }] })
+  }
+
+  function streamResponse(
+    frames: string[],
+    finish: (controller: ReadableStreamDefaultController<Uint8Array>) => void = (controller) => controller.close(),
+    faults: { cancel?: Error; release?: Error; beforeCancel?: () => Promise<void> } = {}
+  ) {
+    let index = 0
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (index < frames.length) controller.enqueue(new TextEncoder().encode(frames[index++]!))
+        else finish(controller)
+      }
+    }, { highWaterMark: 0 })
+    const acquire = stream.getReader.bind(stream)
+    let cancelReader: () => Promise<void> = async () => {}
+    let releaseReader: () => void = () => {}
+    const cancel = vi.fn(async () => {
+      await faults.beforeCancel?.()
+      if (faults.cancel) throw faults.cancel
+      await cancelReader()
+    })
+    const releaseLock = vi.fn(() => {
+      releaseReader()
+      if (faults.release) throw faults.release
+    })
+    vi.spyOn(stream, 'getReader').mockImplementation(() => {
+      const reader = acquire()
+      cancelReader = reader.cancel.bind(reader)
+      releaseReader = reader.releaseLock.bind(reader)
+      vi.spyOn(reader, 'cancel').mockImplementation(cancel)
+      vi.spyOn(reader, 'releaseLock').mockImplementation(releaseLock)
+      return reader
+    })
+    return { response: new Response(stream, { status: 200 }), stream, cancel, releaseLock }
+  }
+
+  function assertListenersRemoved(): void {
+    for (const signal of [timeout.signal, external.signal]) {
+      const added = vi.mocked(signal.addEventListener).mock.calls.filter(([type]) => type === 'abort')
+      expect(added).toHaveLength(1)
+      expect(signal.removeEventListener).toHaveBeenCalledExactlyOnceWith('abort', added[0]![1])
+    }
+  }
+
+  function assertOneSettlement(error: unknown, outcome: string, usage = observedUsage, responseModel: string | null = 'reported-model'): void {
+    expect(error).toBeInstanceOf(ModelRequestError)
+    const attempts = (error as ModelRequestError).attempts
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]).toMatchObject({ outcome, httpStatus: 200, responseModel, usage })
+    const sent = events.filter((event) => event.type === 'sent')
+    const settled = events.filter((event) => event.type === 'settled')
+    expect(sent).toHaveLength(1)
+    expect(settled).toHaveLength(1)
+    expect(settled[0]!.attempt).toBe(attempts[0])
+    expect(settled[0]!.attempt.attemptId).toBe(sent[0]!.attempt.attemptId)
+  }
+
+  it.each(['chat-completions', 'responses'] as const)('T08 %s usage 后 read 抛错保留已观察字段', async (protocol) => {
+    const sourceError = new Error('synthetic reader failure')
+    const resource = streamResponse([metadata(protocol)], (controller) => controller.error(sourceError))
+    const fetchImpl = vi.fn(async () => resource.response)
+    const router = new ModelRouter({ apiKeyOf: () => 'synthetic-key', fetchImpl })
+    const error = await router.call([provider({ protocol })], { messages, control: control() }).catch((err: unknown) => err)
+    expect(error).toMatchObject({ code: 'TRANSPORT', message: sourceError.message })
+    assertOneSettlement(error, 'failed')
+    expect(resource.cancel).toHaveBeenCalledTimes(1)
+    expect(resource.releaseLock).toHaveBeenCalledTimes(1)
+    expect(resource.stream.locked).toBe(false)
+    assertListenersRemoved()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['cancel', 'timeout'] as const)('T08 usage 后 %s 保留字段并通过 signal 终止传输', async (ending) => {
+    let requestSignal: AbortSignal
+    const resource = streamResponse([metadata('chat-completions')], (controller) => {
+      if (ending === 'cancel') external.abort(new Error('synthetic cancellation'))
+      else timeout.abort(new DOMException('synthetic timeout', 'TimeoutError'))
+      // 合成传输遵守合并后的 signal，不把在途请求留在后台。
+      controller.error(requestSignal.reason)
+    })
+    const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
+      requestSignal = init.signal as AbortSignal
+      return resource.response
+    })
+    const router = new ModelRouter({ apiKeyOf: () => 'synthetic-key', fetchImpl })
+    const error = await router.call([provider({})], { messages, control: control() }).catch((err: unknown) => err)
+    expect(error).toMatchObject({ code: ending === 'cancel' ? 'CANCELLED' : 'TIMEOUT' })
+    expect(requestSignal!.aborted).toBe(true)
+    assertOneSettlement(error, ending === 'cancel' ? 'cancelled' : 'timeout')
+    expect(resource.cancel).toHaveBeenCalledTimes(1)
+    expect(resource.releaseLock).toHaveBeenCalledTimes(1)
+    expect(resource.stream.locked).toBe(false)
+    assertListenersRemoved()
+  })
+
+  it('T08 同一事件内 onDelta 抛错仍保留 model/usage；清理失败不覆盖原错', async () => {
+    const sourceError = new Error('synthetic delta failure')
+    const resource = streamResponse([
+      frame({ model: 'reported-model', usage: { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 }, choices: [{ delta: { content: 'ok' } }] })
+    ], undefined, { cancel: new Error('synthetic cancel failure'), release: new Error('synthetic release failure') })
+    const router = new ModelRouter({ apiKeyOf: () => 'synthetic-key', fetchImpl: async () => resource.response })
+    const error = await router.call([provider({})], {
+      messages, control: control(), onDelta: () => { throw sourceError }
+    }).catch((err: unknown) => err)
+    expect(error).toMatchObject({ code: 'TRANSPORT', message: sourceError.message })
+    assertOneSettlement(error, 'failed')
+    expect(resource.cancel).toHaveBeenCalledTimes(1)
+    expect(resource.releaseLock).toHaveBeenCalledTimes(1)
+    expect(resource.stream.locked).toBe(false)
+    assertListenersRemoved()
+  })
+
+  it.each(['success', 'read failure', 'cancel', 'timeout', 'HTTP rejection', 'sync fetch failure'] as const)(
+    'T08 %s 的 settled 观测失败只结算一次并报 OBSERVATION_FAILED', async (ending) => {
+      let requestSignal: AbortSignal
+      const resource = streamResponse([metadata('chat-completions'), delta()], (controller) => {
+        if (ending === 'success') controller.close()
+        else {
+          if (ending === 'cancel') external.abort()
+          if (ending === 'timeout') timeout.abort()
+          controller.error(ending === 'read failure' ? new Error('synthetic read failure') : requestSignal.reason)
+        }
+      })
+      const fetchImpl = vi.fn((_url: string, init: RequestInit): Promise<Response> => {
+        requestSignal = init.signal as AbortSignal
+        if (ending === 'sync fetch failure') throw new Error('synthetic sync fetch failure')
+        return Promise.resolve(ending === 'HTTP rejection' ? new Response('synthetic rejection', { status: 403 }) : resource.response)
+      })
+      const router = new ModelRouter({ apiKeyOf: () => 'synthetic-key', fetchImpl })
+      const error = await router.call([provider({})], {
+        messages, control: control((event) => {
+          events.push(event)
+          if (event.type === 'settled') throw new Error('synthetic observation failure')
+        })
+      }).catch((err: unknown) => err)
+      expect(error).toMatchObject({ code: 'OBSERVATION_FAILED', retryable: false })
+      expect((error as Error).message).toContain('synthetic observation failure')
+      expect((error as ModelRequestError).attempts).toHaveLength(1)
+      expect(events.filter((event) => event.type === 'settled')).toHaveLength(1)
+      const record = (error as ModelRequestError).attempts[0]!
+      expect(record.outcome).toBe(ending === 'success' ? 'succeeded' : ending === 'cancel' ? 'cancelled' : ending === 'timeout' ? 'timeout' : 'failed')
+      expect(record.httpStatus).toBe(ending === 'sync fetch failure' ? null : ending === 'HTTP rejection' ? 403 : 200)
+      expect(record.usage).toEqual(ending === 'HTTP rejection' || ending === 'sync fetch failure' ? noUsage : observedUsage)
+      if (ending !== 'HTTP rejection' && ending !== 'sync fetch failure') {
+        expect(resource.cancel).toHaveBeenCalledTimes(ending === 'success' ? 0 : 1)
+        expect(resource.releaseLock).toHaveBeenCalledTimes(1)
+        expect(resource.stream.locked).toBe(false)
+      }
+      expect(requestSignal!.aborted).toBe(true)
+      expect(fetchImpl).toHaveBeenCalledTimes(1)
+      assertListenersRemoved()
+    }
+  )
+
+  it.each([null, new Error('synthetic sent failure')] as const)('T08 sent 失败中止并等待传输，不发 settled（%s）', async (reason) => {
+    let requestSignal: AbortSignal
+    let transportStopped = false
+    const fetchImpl = vi.fn((_url: string, init: RequestInit): Promise<Response> => {
+      requestSignal = init.signal as AbortSignal
+      return new Promise((_resolve, reject) => {
+        requestSignal.addEventListener('abort', () => {
+          transportStopped = true
+          reject(requestSignal.reason)
+        }, { once: true })
+      })
+    })
+    const router = new ModelRouter({ apiKeyOf: () => 'synthetic-key', fetchImpl })
+    const error = await router.call([provider({})], {
+      messages, control: control((event) => { events.push(event); throw reason })
+    }).catch((err: unknown) => err)
+    expect(error).toMatchObject({ code: 'OBSERVATION_FAILED', retryable: false })
+    expect((error as ModelRequestError).attempts).toHaveLength(1)
+    expect((error as ModelRequestError).attempts[0]).toMatchObject({ outcome: 'cancelled', httpStatus: null, responseModel: null, usage: noUsage })
+    expect(events.map((event) => event.type)).toEqual(['sent'])
+    expect(transportStopped).toBe(true)
+    expect(requestSignal!.aborted).toBe(true)
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    assertListenersRemoved()
+  })
+
+  it('T08 成功 EOF 只释放 reader、移除监听器；后续 abort 不再传入已结束请求', async () => {
+    let requestSignal: AbortSignal
+    const resource = streamResponse([metadata('chat-completions'), delta()])
+    const router = new ModelRouter({ apiKeyOf: () => 'synthetic-key', fetchImpl: async (_url, init) => {
+      requestSignal = init.signal as AbortSignal
+      return resource.response
+    } })
+    const result = await router.call([provider({})], { messages, control: control() })
+    expect(result.text).toBe('ok')
+    expect(result.usage).toEqual(observedUsage)
+    expect(result.attempts).toHaveLength(1)
+    expect(events.filter((event) => event.type === 'settled')).toHaveLength(1)
+    expect(resource.cancel).not.toHaveBeenCalled()
+    expect(resource.releaseLock).toHaveBeenCalledTimes(1)
+    expect(resource.stream.locked).toBe(false)
+    assertListenersRemoved()
+    external.abort()
+    timeout.abort()
+    expect(requestSignal!.aborted).toBe(false)
+  })
+
+  it('T08 等待异步 cancel 完成后才释放锁并向调用方返回原错', async () => {
+    const sourceError = new Error('synthetic consumer failure')
+    let finishCancel!: () => void
+    let notifyCancel!: () => void
+    const cancelStarted = new Promise<void>((resolve) => { notifyCancel = resolve })
+    const cancelPending = new Promise<void>((resolve) => { finishCancel = resolve })
+    const resource = streamResponse([metadata('chat-completions'), delta()], undefined, {
+      beforeCancel: async () => { notifyCancel(); await cancelPending }
+    })
+    const router = new ModelRouter({ apiKeyOf: () => 'synthetic-key', fetchImpl: async () => resource.response })
+    let returned = false
+    const request = router.call([provider({})], {
+      messages, control: control(), onDelta: () => { throw sourceError }
+    }).catch((err: unknown) => { returned = true; return err })
+    await cancelStarted
+    try {
+      expect(returned).toBe(false)
+      expect(resource.releaseLock).not.toHaveBeenCalled()
+      expect(resource.stream.locked).toBe(true)
+    } finally {
+      finishCancel()
+    }
+    const error = await request
+    expect(error).toMatchObject({ code: 'TRANSPORT', message: sourceError.message })
+    assertOneSettlement(error, 'failed')
+    expect(resource.cancel).toHaveBeenCalledTimes(1)
+    expect(resource.releaseLock).toHaveBeenCalledTimes(1)
+    expect(resource.stream.locked).toBe(false)
+    assertListenersRemoved()
+  })
+
+  it('T08 成功后的 releaseLock 抛错不覆盖结果或重复结算', async () => {
+    const resource = streamResponse([metadata('chat-completions'), delta()], undefined, {
+      release: new Error('synthetic release failure')
+    })
+    const router = new ModelRouter({ apiKeyOf: () => 'synthetic-key', fetchImpl: async () => resource.response })
+    const result = await router.call([provider({})], { messages, control: control() })
+    expect(result.text).toBe('ok')
+    expect(result.usage).toEqual(observedUsage)
+    expect(result.attempts).toHaveLength(1)
+    expect(result.attempts?.[0]?.outcome).toBe('succeeded')
+    expect(events.filter((event) => event.type === 'settled')).toHaveLength(1)
+    expect(resource.cancel).not.toHaveBeenCalled()
+    expect(resource.releaseLock).toHaveBeenCalledTimes(1)
+    expect(resource.stream.locked).toBe(false)
+    assertListenersRemoved()
+  })
+
+  it.each(['HTTP rejection', 'no body', 'sync fetch failure'] as const)('T08 %s 保留已知状态、空观测并清理监听器', async (ending) => {
+    const fetchImpl = vi.fn((): Promise<Response> => {
+      if (ending === 'sync fetch failure') throw new Error('synthetic sync failure')
+      return Promise.resolve(ending === 'HTTP rejection' ? new Response('synthetic denied', { status: 403 }) : new Response(null, { status: 200 }))
+    })
+    const router = new ModelRouter({ apiKeyOf: () => 'synthetic-key', fetchImpl })
+    const error = await router.call([provider({})], { messages, control: control() }).catch((err: unknown) => err)
+    expect(error).toBeInstanceOf(ModelRequestError)
+    expect(error).toMatchObject({ code: 'TRANSPORT', retryable: ending !== 'HTTP rejection' })
+    expect((error as ModelRequestError).attempts).toHaveLength(1)
+    expect((error as ModelRequestError).attempts[0]).toMatchObject({
+      outcome: 'failed', httpStatus: ending === 'sync fetch failure' ? null : ending === 'HTTP rejection' ? 403 : 200,
+      responseModel: null, usage: noUsage
+    })
+    expect(events.filter((event) => event.type === 'sent')).toHaveLength(1)
+    expect(events.filter((event) => event.type === 'settled')).toHaveLength(1)
+    assertListenersRemoved()
+  })
+
+  it('T08 无 usage 的流中断保持全 null，不以请求 model 代替响应 model', async () => {
+    const resource = streamResponse([delta()], (controller) => controller.error(new Error('synthetic interruption')))
+    const router = new ModelRouter({ apiKeyOf: () => 'synthetic-key', fetchImpl: async () => resource.response })
+    const error = await router.call([provider({})], { messages, control: control() }).catch((err: unknown) => err)
+    assertOneSettlement(error, 'failed', noUsage, null)
+    expect(resource.releaseLock).toHaveBeenCalledTimes(1)
+    expect(resource.stream.locked).toBe(false)
+    assertListenersRemoved()
+  })
+
+  it.each(['chat-completions', 'responses'] as const)('T08 %s 后续缺失 usage 字段不会抹去已观察值（零值仍可更新）', async (protocol) => {
+    const partial = protocol === 'responses'
+      ? { type: 'response.completed', response: { usage: { output_tokens: 0 } } }
+      : { choices: [], usage: { completion_tokens: 0 } }
+    const resource = streamResponse([metadata(protocol), frame(partial), delta(protocol)])
+    const router = new ModelRouter({ apiKeyOf: () => 'synthetic-key', fetchImpl: async () => resource.response })
+    const result = await router.call([provider({ protocol })], { messages, control: control() })
+    expect(result.usage).toEqual({ inputTokens: 11, outputTokens: 0, totalTokens: 18, source: 'provider-reported' })
+    expect(result.attempts?.[0]?.responseModel).toBe('reported-model')
+    expect(resource.cancel).not.toHaveBeenCalled()
+    expect(resource.releaseLock).toHaveBeenCalledTimes(1)
+    assertListenersRemoved()
   })
 })

@@ -64,6 +64,7 @@ import {
 import {
   defaultCodeVersion,
   exportCaseArtifacts,
+  finalizeCaseArtifactOutcome,
   temporaryRoot,
   type CaseArtifactPayload
 } from './artifacts'
@@ -80,6 +81,7 @@ import type {
   StructuredCompleter
 } from '../agent/llm'
 import { opsFakeScriptFor, type EvalCompleterContext, type EvalCompleterFactory } from './completerFactory'
+import { selectExplicitSmokeCases } from './experiment'
 
 export type ExecutionKind = 'fake' | 'real'
 
@@ -157,6 +159,7 @@ export interface EvalRunState {
   executionKind: ExecutionKind
   repeats: number
   maxCases: number
+  caseIds?: string[]
   status: 'running' | 'completed' | 'cancelled'
   startedAt: string
   finishedAt: string | null
@@ -482,6 +485,9 @@ function loadStateFile(file: string, deps: RunnerDeps, incoming: EvalRunState): 
   if (stableJson(state.splits) !== stableJson(incoming.splits)) {
     throw new EvalStateError(`split 不一致,拒绝续跑:${file}`, file)
   }
+  if (stableJson(state.caseIds ?? null) !== stableJson(incoming.caseIds ?? null)) {
+    throw new EvalStateError(`smoke caseIds 不一致，拒绝续跑:${file}`, file)
+  }
   if (state.repeats !== incoming.repeats) {
     throw new EvalStateError(`重复次数不一致:文件 ${String(state.repeats)} ≠ 请求 ${String(incoming.repeats)}`, file)
   }
@@ -614,6 +620,15 @@ export class EvalRunner {
             outcome = await this.runSingle(configId, caseDef, repeat, controller.signal)
             // 真实单调时长(p50/p95 的样本;超时案例为预算截断观测)
             outcome.durationMs = Math.max(0, Math.round(performance.now() - startedAtMs))
+            if (outcome.artifactStatus === 'ok' && outcome.artifactDir) {
+              try {
+                finalizeCaseArtifactOutcome(join(this.deps.artifactRoot, outcome.artifactDir), outcome as unknown as Record<string, unknown>)
+              } catch (err) {
+                outcome.artifactStatus = 'artifact_failed'
+                outcome.artifactDir = null
+                outcome.failureReasons.push(`artifact_failed:最终评分保存失败:${err instanceof Error ? err.message : String(err)}`)
+              }
+            }
           } finally {
             this.activeController = null
           }
@@ -664,6 +679,7 @@ export class EvalRunner {
   }
 
   private selectedCases(): EvalCase[] {
+    if (this.state.caseIds) return selectExplicitSmokeCases(this.deps.dataset.cases, this.state.caseIds)
     return this.deps.dataset.cases.filter((c) => this.state.splits.includes(c.split))
   }
 
@@ -692,7 +708,7 @@ export class EvalRunner {
         if (!seed) throw new Error(`research case 缺少播种结果:${caseDef.case_id}`)
         return new RecordingCompleter(new FakeProvider({ script: researchFakeScriptFor(caseDef, seed), clock }))
       }
-      return new RecordingCompleter(new FakeProvider({ responses: opsFakeScriptFor(caseDef), clock }))
+      return new RecordingCompleter(new FakeProvider({ script: opsFakeScriptFor(caseDef), clock }))
     }
     const ctx: EvalCompleterContext =
       kind === 'fake'
@@ -865,6 +881,7 @@ export class EvalRunner {
         registry,
         gateway,
         queue,
+        clock: env.clock,
         completer: recording as never
       })
 
@@ -919,6 +936,9 @@ export class EvalRunner {
       base.toolObservations = scoringObservations
       const paramRules = evaluateParameterRules(caseDef.expected.required_arguments ?? {}, scoringObservations)
       base.ruleChecks = paramRules.checks
+      for (const check of paramRules.checks) {
+        if (!check.passed) base.failureReasons.push(`参数规则失败:${check.key}:${check.reason ?? '实参不匹配'}`)
+      }
       if (paramRules.ambiguousTools.length > 0) {
         base.failureReasons.push(`必需参数标注歧义,无法唯一匹配:${paramRules.ambiguousTools.join(', ')}`)
       }

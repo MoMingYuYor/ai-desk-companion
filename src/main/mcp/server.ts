@@ -141,6 +141,7 @@ function proposeWriteTool(
   // 提案已生成:queued → planning → awaiting_confirmation(与编排器产生的提案同一状态语义)
   transitionRun(deps.db, run.runId, 'planning')
   transitionRun(deps.db, run.runId, 'awaiting_confirmation')
+  deps.db.flush()
   return {
     runId: run.runId,
     approvalId: proposal.approvalId ?? '',
@@ -159,11 +160,22 @@ export async function handleMcpMessage(deps: McpDeps, raw: unknown): Promise<unk
     return jsonRpcError(null, -32600, '无效请求')
   }
   const msg = raw as McpRequest
+  const hasId = Object.prototype.hasOwnProperty.call(msg, 'id')
+  if (msg.jsonrpc !== '2.0' || typeof msg.method !== 'string' ||
+    (hasId && !(typeof msg.id === 'string' || (typeof msg.id === 'number' && Number.isFinite(msg.id))))) {
+    return jsonRpcError(null, -32600, '无效请求')
+  }
   const id = msg.id ?? null
   const method = typeof msg.method === 'string' ? msg.method : ''
   const isNotification = !('id' in msg) || msg.id === undefined
+  if (isNotification) return null
+  if (msg.params !== undefined && (msg.params === null || typeof msg.params !== 'object' || Array.isArray(msg.params))) {
+    return jsonRpcError(id, -32602, '无效参数:params 必须是对象')
+  }
 
   if (method === 'initialize') {
+    const requested = (msg.params as { protocolVersion?: unknown } | undefined)?.protocolVersion
+    if (requested !== undefined && requested !== '2024-11-05') return jsonRpcError(id, -32602, '不支持的协议版本')
     return jsonRpcResult(id, {
       protocolVersion: '2024-11-05',
       capabilities: { tools: {} },
@@ -233,14 +245,15 @@ export async function handleMcpMessage(deps: McpDeps, raw: unknown): Promise<unk
  * 上限 2 秒,防止管道阻塞导致进程无法退出。
  */
 function stdoutDrained(): Promise<void> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const stream = process.stdout
     const deadline = Date.now() + 2000
     const tick = (): void => {
-      if (!stream || stream.writableLength === 0 || Date.now() >= deadline) {
+      if (!stream || stream.writableLength === 0) {
         resolve()
         return
       }
+      if (Date.now() >= deadline) { reject(new Error('stdout 排空超时')); return }
       setTimeout(tick, 10)
     }
     tick()
@@ -259,6 +272,7 @@ function createFd0LineReader(): { readLine(): Promise<string | null> } {
   let buffer = ''
   const queue: string[] = []
   let done = false
+  let failure: Error | null = null
   let notify: (() => void) | null = null
   const wake = (): void => {
     const n = notify
@@ -281,17 +295,18 @@ function createFd0LineReader(): { readLine(): Promise<string | null> } {
     wake()
   })
   stream.on('error', (err: Error) => {
-    console.error('[mcp] fd 0 读取失败,按 EOF 处理:', err.message)
+    failure = err
     done = true
     wake()
   })
   return {
     readLine(): Promise<string | null> {
+      if (failure) return Promise.reject(failure)
       if (queue.length > 0) return Promise.resolve(queue.shift()!)
       if (done) return Promise.resolve(null)
       // MCP 循环严格串行:同一时刻至多一个未决 readLine,单槽唤醒即可
-      return new Promise<string | null>((resolve) => {
-        notify = () => resolve(queue.length > 0 ? queue.shift()! : null)
+      return new Promise<string | null>((resolve, reject) => {
+        notify = () => failure ? reject(failure) : resolve(queue.length > 0 ? queue.shift()! : null)
       })
     }
   }
@@ -315,23 +330,29 @@ export function startPersonalOpsMcpStdio(deps: McpDeps, io: {
   readLine(): Promise<string | null>
   writeLine(line: string): void
   /** EOF 收尾钩子:提供时由宿主负责进程退出(测试注入);未提供时服务以退出码 0 自行结束 */
-  onClose?: () => void
+  onClose?: (exitCode: 0 | 1) => void
+  fallbackReadLine?: () => Promise<string | null>
+  drain?: () => Promise<void>
 }): void {
   void (async () => {
+    let exitCode: 0 | 1 = 0
+    try {
     let reader = io.readLine
     let fallbackUsed = false
+    let firstRead = true
     for (;;) {
       let line = await reader()
-      if (line === null && !fallbackUsed) {
+      if (line === null && firstRead && !fallbackUsed) {
         // 注入通道首读即 EOF:Electron Windows 主进程 stdin 的已知失效形态。
         // fd 0 兜底读取器探测:同样立即 EOF 才是真 EOF(客户端关闭 stdin)。
-        const fallback = createFd0LineReader()
+        const fallback = io.fallbackReadLine ? { readLine: io.fallbackReadLine } : createFd0LineReader()
         const probed = await fallback.readLine()
         if (probed === null) break
         fallbackUsed = true
         reader = fallback.readLine
         line = probed
       }
+      firstRead = false
       if (line === null) break
       if (line.trim() === '') continue
       let parsed: unknown
@@ -344,20 +365,28 @@ export function startPersonalOpsMcpStdio(deps: McpDeps, io: {
       const response = await handleMcpMessage(deps, parsed)
       if (response !== null) io.writeLine(JSON.stringify(response))
     }
+    } catch (err) {
+      exitCode = 1
+      console.error('[mcp] 输入/输出异常:', err instanceof Error ? err.message : String(err))
+    }
     // EOF:先落盘,再排空协议输出,最后干净退出
     try {
       deps.db.flush()
     } catch (err) {
+      exitCode = 1
       console.error('[mcp] 退出前落盘失败:', err instanceof Error ? err.message : String(err))
     }
-    await stdoutDrained()
+    try { await (io.drain ?? stdoutDrained)() } catch (err) {
+      exitCode = 1
+      console.error('[mcp] stdout 排空失败:', err instanceof Error ? err.message : String(err))
+    }
     if (io.onClose) {
-      io.onClose()
+      io.onClose(exitCode)
     } else {
-      process.exit(0)
+      process.exit(exitCode)
     }
   })().catch((err: unknown) => {
     console.error('[mcp] stdio 服务异常:', err instanceof Error ? err.message : String(err))
-    process.exit(1)
+    if (!io.onClose) process.exit(1)
   })
 }

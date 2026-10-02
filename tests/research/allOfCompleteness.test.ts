@@ -18,7 +18,8 @@ import {
   createResearchRun,
   createSubQuestion,
   getClaim,
-  getResearchTaskByRun
+  getResearchTaskByRun,
+  listRunCitationsForClaim
 } from '../../src/main/research/repository'
 import {
   loadAllOfRequirements,
@@ -26,6 +27,7 @@ import {
 } from '../../src/main/research/repository'
 import {
   checkAllOfCompleteness,
+  allOfIncompleteClaimIds,
   validateCitations,
   type AllOfRequirement
 } from '../../src/main/research/citations'
@@ -40,6 +42,29 @@ const CONTEXT_CLOCK = '2026-09-27T18:00:00.000Z'
 // ---------- 纯函数判定 ----------
 
 describe('RES-03 checkAllOfCompleteness 纯函数', () => {
+  const complete: AllOfRequirement = {
+    version: 1, groupId: 'g', expectedIndices: [0, 1], members: [
+      { index: 0, evidenceId: 'e0', citationId: 'c0', rejectionReason: null },
+      { index: 1, evidenceId: 'e1', citationId: 'c1', rejectionReason: null }
+    ]
+  }
+  it.each([
+    { name: '重复成员', value: { ...complete, members: [...complete.members, complete.members[0]!] } },
+    { name: '额外成员', value: { ...complete, members: [...complete.members, { ...complete.members[0]!, index: 99 }] } },
+    { name: '复用 citation ID', value: { ...complete, members: [complete.members[0]!, { ...complete.members[1]!, citationId: 'c0' }] } },
+    { name: '复用 evidence ID', value: { ...complete, members: [complete.members[0]!, { ...complete.members[1]!, evidenceId: 'e0' }] } },
+    { name: '负数下标', value: { ...complete, expectedIndices: [-1], members: [{ ...complete.members[0]!, index: -1 }] } },
+    { name: '小数下标', value: { ...complete, expectedIndices: [0.5], members: [{ ...complete.members[0]!, index: 0.5 }] } },
+    { name: '空 ID', value: { ...complete, members: [{ ...complete.members[0]!, evidenceId: '' }, complete.members[1]!] } }
+  ])('T09 $name 无法用存活成员伪装精确 set', ({ value }) => {
+    expect(checkAllOfCompleteness(value, new Set(['c0', 'c1'])).satisfied).toBe(false)
+  })
+
+  it('T09 额外成员不成立且 missingIndices 不虚构缺失下标', () => {
+    const extra = { ...complete, members: [...complete.members, { ...complete.members[0]!, index: 99 }] }
+    expect(checkAllOfCompleteness(extra, new Set(['c0', 'c1']))).toEqual({ satisfied: false, missingIndices: [] })
+  })
+
   it('RES-03 预期两成员但一成员被拒时整组不成立', () => {
     const requirement: AllOfRequirement = {
       version: 1, groupId: 'g1', expectedIndices: [0, 1], members: [
@@ -165,6 +190,113 @@ async function seedIncompleteAllOf(): Promise<Seeded> {
   saveAllOfRequirement(db, claim.claimId, requirement)
   return { db, flush: opened.flush, file, runId, subquestionId: sub.subquestionId, snapshot, claimId: claim.claimId, groupId: 'g1', validCitationId: citation0.citationId, requirement }
 }
+
+/** 先构造结构有效的单成员组,再通过合成库 UPDATE 注入历史损坏清单。 */
+async function seedAllOfCase(kind: string): Promise<Seeded> {
+  const seeded = await seedIncompleteAllOf()
+  const { db, claimId, runId, validCitationId } = seeded
+  const member = seeded.requirement.members[0]!
+  const complete: AllOfRequirement = { version: 1, groupId: 'g1', expectedIndices: [0], members: [member] }
+  saveAllOfRequirement(db, claimId, complete)
+  validateCitations(db, runId)
+  let requirements: unknown[] | undefined = [complete]
+  if (kind === '缺清单') requirements = undefined
+  if (kind === '空组') requirements = [{ ...complete, expectedIndices: [], members: [] }]
+  if (kind === '重复预期') requirements = [{ ...complete, expectedIndices: [0, 0] }]
+  if (kind === '重复成员') requirements = [{ ...complete, members: [member, member] }]
+  if (kind === '额外成员') requirements = [{ ...complete, members: [member, { ...member, index: 99 }] }]
+  if (kind === '错 evidence') requirements = [{ ...complete, members: [{ ...member, evidenceId: 'unrelated-evidence' }] }]
+  if (kind === '同组重复清单') requirements = [complete, complete]
+  if (kind === '损坏版本') requirements = [{ ...complete, version: 99 }]
+  if (kind === '跨组' || kind === '额外 supports 引用') {
+    const source = listRunCitationsForClaim(db, getClaim(db, claimId)!)[0]!.span
+    const text = db.get<{ normalized_text: string }>('SELECT normalized_text FROM retrieval_documents WHERE document_id = ?', [seeded.snapshot.documentId])!.normalized_text
+    const quote = '加分项:SQL。'
+    const start = Array.from(text.slice(0, text.indexOf(quote))).length
+    const span = createEvidenceSpan(db, runId, seeded.subquestionId, {
+      snapshot_id: seeded.snapshot.documentId, chunk_id: source.chunkId,
+      start_offset: start, end_offset: start + Array.from(quote).length, quote
+    })
+    const other = createCitation(db, runId, {
+      claim_id: claimId, evidence_id: span.evidenceId, relation: 'supports', evidence_group_id: kind === '跨组' ? 'g2' : 'g1', group_operator: 'all_of'
+    })
+    db.run("UPDATE research_evidence_spans SET validation_status = 'valid' WHERE evidence_id = ?", [span.evidenceId])
+    if (kind === '跨组') {
+      const otherMember = { ...member, citationId: other.citationId, evidenceId: span.evidenceId }
+      requirements = [{ ...complete, members: [otherMember] }, { ...complete, groupId: 'g2', members: [otherMember] }]
+    }
+  }
+  if (kind === '引用全失') {
+    const other = createClaim(db, runId, { subquestionId: seeded.subquestionId, claim: { text: '合成引用归属', claim_type: 'fact' } })
+    db.run("UPDATE research_claims SET support_status = 'unsupported' WHERE claim_id = ?", [other.claimId])
+    db.run('UPDATE research_citations SET claim_id = ? WHERE citation_id = ?', [other.claimId, validCitationId])
+  }
+  if (kind === '缺结构结果') db.run("UPDATE research_evidence_spans SET validation_status = 'candidate' WHERE evidence_id = ?", [member.evidenceId!])
+  db.run("UPDATE research_claims SET support_status = 'candidate', review_json = ? WHERE claim_id = ?", [JSON.stringify(requirements === undefined ? {} : { evidence_requirements: requirements }), claimId])
+  return seeded
+}
+
+const invalidAllOfCases = ['缺清单', '空组', '重复预期', '重复成员', '额外成员', '跨组', '错 evidence', '额外 supports 引用', '同组重复清单', '损坏版本', '引用全失', '缺结构结果']
+
+describe('T09 all_of 每个入口采用完整清单和真实关联', () => {
+  it.each(invalidAllOfCases)('T09 直接审核拒绝 $0,不发送模型', async (kind) => {
+    const { db, runId, claimId } = await seedAllOfCase(kind)
+    try {
+      const provider = new FakeProvider({ responses: [{ verdicts: [{ claim_id: claimId, status: 'supported', reason: 'synthetic' }] }] })
+      const outcome = await reviewClaims(db, runId, provider, { contextBudget: 16000 })
+      expect(outcome.skipped).toBe(true)
+      expect(provider.callTotal).toBe(0)
+      expect(getClaim(db, claimId)!.supportStatus).toBe('unsupported')
+    } finally { db.close() }
+  })
+
+  it.each(invalidAllOfCases)('T09 报告终检拒绝 $0,零事实区成员', async (kind) => {
+    const { db, runId, claimId } = await seedAllOfCase(kind)
+    try {
+      db.run("UPDATE research_claims SET support_status = 'supported' WHERE claim_id = ?", [claimId])
+      const { report } = await buildReport(db, runId, { version: 1, completer: null })
+      expect(report.structured!.claim_order).not.toContain(claimId)
+      expect(report.markdown).not.toContain('该岗位同时要求 Python 与不存在的 X。')
+    } finally { db.close() }
+  })
+
+  it.each(invalidAllOfCases.filter((kind) => kind !== '缺结构结果'))('T09 结构检查拒绝 $0', async (kind) => {
+    const { db, runId, claimId } = await seedAllOfCase(kind)
+    try {
+      expect(validateCitations(db, runId).unsupportedClaimIds).toContain(claimId)
+    } finally { db.close() }
+  })
+
+  it('T09 正常完整组送审核模型并进入事实区,冻结后损坏清单只读排除', async () => {
+    const { db, runId, claimId } = await seedAllOfCase('完整')
+    try {
+      const provider = new FakeProvider({ responses: [{ verdicts: [{ claim_id: claimId, status: 'supported', reason: '片段直接支持' }] }] })
+      await reviewClaims(db, runId, provider, { contextBudget: 16000 })
+      expect(provider.callTotal).toBe(1)
+      const built = await buildReport(db, runId, { version: 1, completer: null })
+      expect(built.report.structured!.claim_order).toContain(claimId)
+      db.run('UPDATE research_claims SET review_json = ? WHERE claim_id = ?', [JSON.stringify({ evidence_requirements: [] }), claimId])
+      const before = getClaim(db, claimId)!
+      await reviewClaims(db, runId, provider, { contextBudget: 16000 })
+      validateCitations(db, runId)
+      expect(getClaim(db, claimId)).toEqual(before)
+    } finally { db.close() }
+  })
+
+  it('T09 重开合成库后重复成员和拒绝原因完整保留,判定一致', async () => {
+    const { db, file, claimId } = await seedAllOfCase('重复成员')
+    const claim = getClaim(db, claimId)!
+    expect(listRunCitationsForClaim(db, claim)).toHaveLength(1)
+    const blocked = allOfIncompleteClaimIds(db, [claim])
+    expect(blocked.has(claimId)).toBe(true)
+    db.close()
+    const reopened = await openDatabase(file, SQL_JS_DIST)
+    try {
+      expect(allOfIncompleteClaimIds(reopened.db, [getClaim(reopened.db, claimId)!])).toEqual(blocked)
+      expect(loadAllOfRequirements(reopened.db, claimId)[0]!.members).toHaveLength(2)
+    } finally { reopened.db.close() }
+  })
+})
 
 describe('RES-03 仓库清单保存/加载', () => {
   it('清单存于 review.evidence_requirements(同连接持久化形态)', async () => {

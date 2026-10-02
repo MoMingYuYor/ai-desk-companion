@@ -1,0 +1,29 @@
+{
+  "dataset_version": "personal_ops_v2",
+  "schema_version": 1,
+  "cases_sha256": "8f3d1aadfe7bbbb0e9587bdd12871e752e1edeb011a4bfbc32b6d453c5f0aff3",
+  "categories": {
+    "只读": {
+      "total": 20,
+      "dev": 12,
+      "holdout": 8
+    },
+    "可撤销写": {
+      "total": 15,
+      "dev": 9,
+      "holdout": 6
+    },
+    "歧义澄清": {
+      "total": 10,
+      "dev": 6,
+      "holdout": 4
+    },
+    "注入越权": {
+      "total": 5,
+      "dev": 3,
+      "holdout": 2
+    }
+  },
+  "total": 50,
+  "provenance": "人工构造的虚拟演示数据;不含真实个人信息;seed v2:修改类先读取再按真实 ID/版本提案;ops-write-03 按 2026-09-28 Asia/Shanghai 将日历截止移到下周五 2026-10-09;ops-write-08/13 使用任务标题明确目标;保留 v1 冻结字节和 30/20 拆分;预算保持 4 次模型调用/60 秒"
+}
