@@ -1,5 +1,5 @@
 // 新安装的 Electron 完成解压且可执行后再进入构建/进程测试，不重跑应用断言。
-import { spawnSync } from 'node:child_process'
+import { spawnSync, execFileSync } from 'node:child_process'
 import { readFileSync, existsSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -8,6 +8,12 @@ const packageDir = join(root, 'node_modules/electron')
 const version = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8')).version
 const env = { ...process.env }
 delete env.ELECTRON_RUN_AS_NODE
+const installedPath = join(packageDir, 'path.txt')
+if (!existsSync(installedPath) || !existsSync(join(packageDir, 'dist', readFileSync(installedPath, 'utf8').trim()))) {
+  // npm 的脚本策略可能跳过 postinstall；显式运行项目锁定包的官方安装器。
+  console.log('[check-runtime] 缺少本地 Electron，执行锁定版本官方安装器（优先缓存）')
+  execFileSync(process.execPath, [join(packageDir, 'install.js')], { cwd: root, env, timeout: 90000, stdio: 'inherit', windowsHide: true })
+}
 const deadline = Date.now() + 45000
 let last = 'Electron 安装尚未完成'
 for (;;) {
