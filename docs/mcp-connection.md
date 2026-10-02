@@ -27,8 +27,7 @@ node_modules\electron\dist\electron.exe . --mcp --user-data 'D:\absolute\path\to
 | `--mcp` | — | 以 stdio MCP 服务运行:不创建窗口、不注册 GUI IPC;协议输出走 stdout,日志走 stderr |
 | `--user-data <绝对目录>` | 必须绝对路径 | 独立用户目录;目录不存在会自动创建。**必须与桌面端日常使用的 `%APPDATA%\事务助手` 区分开**,避免 MCP 会话与桌面实例互相争锁或污染真实数据 |
 
-实测环境:Windows 11(x64)、Electron 44.4.3、源码版本 feat/agent-portfolio(762a148 + MCP-01 增强)。
-打包版(`事务助手.exe --mcp --user-data ...`)的 resourcesPath 资源布局属 PKG-01 范围,尚未实测。
+实测环境:Windows x64、Electron 44.4.3；当前应用构建为 feat/agent-portfolio 的 2a75c25。实际zip解压包已从源码之外的cwd执行 `事务助手.exe --mcp --user-data <独立绝对目录>`，完成两次启动与EOF退出、读工具、pending写提案和伪造approved拒绝。提案重开仍为pending，业务写入为0；非空stdout行只包含匹配请求的JSON-RPC响应。证据在本机 artifacts/acceptance/adc-rc1-20261002/T06/packaged-mcp.json，构建与包范围见 [当前交付记录](acceptance/rc1-20261002.md)。
 
 ## 独立 userData 与单实例约束
 

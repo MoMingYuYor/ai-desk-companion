@@ -357,7 +357,7 @@ async function main(argv) {
   const logs = []
   const report = {
     reportVersion: 1, status: 'RUNNING', startedAt: new Date().toISOString(), options,
-    environment: { platform: platform(), arch: arch(), osRelease: release(), controllerNode: process.version, cpu: cpus()[0]?.model, logicalCpus: cpus().length, totalMemoryBytes: totalmem(), appVersion: JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version, commit: spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', timeout: 5_000, windowsHide: true }).stdout.trim(), dirty: true },
+    environment: { platform: platform(), arch: arch(), osRelease: release(), controllerNode: process.version, cpu: cpus()[0]?.model, logicalCpus: cpus().length, totalMemoryBytes: totalmem(), appVersion: JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version, commit: spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', timeout: 5_000, windowsHide: true }).stdout.trim(), dirty: (() => { const status = spawnSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8', timeout: 5_000, windowsHide: true }); return status.status === 0 ? status.stdout.trim().length > 0 : null })() },
     build: Object.fromEntries(['out/main/index.js', 'out/preload/index.js', 'out/renderer/workbench.html'].map(path => [path, { sha256: createHash('sha256').update(readFileSync(join(root, path))).digest('hex'), mtime: statSync(join(root, path)).mtime.toISOString() }])),
     configuration: { warmup: WARMUP, iterations: ITERATIONS, percentile: 'nearest-rank ceil(0.95*n)-1; no sample removed', childLimitMs: CHILD_LIMIT_MS, queryLimitMs: QUERY_LIMIT_MS, resourceCadenceMs: 250, rendererTimerMs: 10, sourceClock: NOW },
     workloads: [],
