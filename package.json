@@ -8,6 +8,7 @@
   "private": true,
   "build": {
     "appId": "com.momingyu.aidesk",
+    "electronDist": "node_modules/electron/dist",
     "productName": "事务助手",
     "directories": {
       "output": "dist"
@@ -70,6 +71,7 @@
   },
   "scripts": {
     "dev": "electron-vite dev",
+    "check:runtime": "node scripts/check-runtime.mjs",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
@@ -79,7 +81,7 @@
     "eval:run": "node out/main/eval-cli.js run",
     "eval:report": "node out/main/eval-cli.js report",
     "gen:assets": "node scripts/gen-assets.mjs",
-    "dist": "node scripts/write-build-info.mjs && electron-vite build && electron-builder --win"
+    "dist": "node scripts/check-runtime.mjs && node scripts/write-build-info.mjs && electron-vite build && electron-builder --win"
   },
   "dependencies": {
     "html-to-text": "^10.0.1",

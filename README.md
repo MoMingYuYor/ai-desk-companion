@@ -16,6 +16,7 @@
 
 ```powershell
 npm ci
+npm run check:runtime
 npm run build
 npm run typecheck
 npm test -- --reporter=dot
@@ -23,6 +24,8 @@ npm run dev
 ```
 
 无模型配置时可先使用待办、日历和本地业务。需要 AI 功能时，在工作台设置中配置供应商、模型和运行时凭据；邮箱账号按需配置。业务模型的修复或回退与评测固定路由各自按其运行策略执行。评测不会更改业务默认供应商。
+
+check:runtime 在 45 秒内等待 Electron 安装完成，并实际检查锁定版本的可执行文件。缺少二进制时检查项目本地安装，可运行 node node_modules/electron/install.js；不需要全局安装。打包复用本地已安装的 Electron，避免重复下载同一 runtime。
 
 用于验收的构建可从源码启动到独立绝对用户目录，避免与日常数据混用：
 
