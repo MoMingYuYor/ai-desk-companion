@@ -15,6 +15,7 @@ import { RunQueue } from '../../src/main/agent/runQueue'
 import type { StructuredCompleteRequest } from '../../src/main/agent/llm'
 import { RunMode } from '../../src/shared/agent'
 import type { SqliteDb } from '../../src/main/db/connection'
+import { nullTokenUsage } from '../../src/main/services/modelRequest'
 
 // A-03/A-04:规划器与编排器。逐条覆盖验收用例 OPS-01~OPS-08、OPS-10。
 // FakeProvider 按调用序返回脚本,规划调用是第 1 次,澄清后的重新规划是第 2 次。
@@ -517,6 +518,80 @@ function budgetJsonWith(over: Partial<FrozenBudgetJson['budget']>): string {
 }
 
 describe('OPS-03 预算收口', () => {
+  it('案例预算创建时冻结，调用方后续修改不会改变运行上限', async () => {
+    const h = await makeHarness([])
+    const override = { maxModelCalls: 4, maxActiveSeconds: 60 }
+    const run = h.orchestrator.createQueuedRun({ mode: 'personal_ops', input: '案例预算' }, override)
+    override.maxModelCalls = 1
+    expect(budgetOf(h, run.runId).budget).toMatchObject({ maxModelCalls: 4, maxActiveSeconds: 60 })
+    expect(budgetOf(h, run.runId).usage).toEqual({ logicalModelCalls: 0, sentModelAttempts: 0, activeMs: 0 })
+  })
+
+  it('提额或非正预算在创建运行前拒绝，数据库不留下排队记录', async () => {
+    const h = await makeHarness([])
+    const before = h.db.all('SELECT * FROM agent_runs')
+    expect(() => h.orchestrator.createQueuedRun({ mode: 'personal_ops', input: '提额' }, { maxModelCalls: 7 }))
+      .toThrow(/不允许高于默认上限/)
+    expect(() => h.orchestrator.createQueuedRun({ mode: 'personal_ops', input: '非法秒数' }, { maxActiveSeconds: 0 }))
+      .toThrow(/大于 0 的整数/)
+    expect(h.db.all('SELECT * FROM agent_runs')).toEqual(before)
+  })
+
+  it('创建时下调为4次后，第5轮规划不调用补全且已读取结果保留', async () => {
+    const h = await makeHarness((callIndex) =>
+      planOf([{ tool: 'todo.list', arguments: { status: `case-${callIndex}` } }], { continue_after_read: true })
+    )
+    const run = h.orchestrator.createQueuedRun({ mode: 'personal_ops', input: '4次预算' }, {
+      maxModelCalls: 4, maxActiveSeconds: 60
+    })
+    await h.orchestrator.drivePlanning(run.runId)
+    expect(getRun(h.db, run.runId)?.errorCode).toBe('PLAN_NO_PROGRESS')
+    expect(h.provider.calls).toHaveLength(4)
+    expect(budgetOf(h, run.runId).usage).toMatchObject({ logicalModelCalls: 4, sentModelAttempts: 4 })
+    expect(listTraceEvents(h.db, run.runId).filter((e) => e.eventType === 'tool_call'
+      && (e.payload as { phase?: string }).phase === 'tool')).toHaveLength(4)
+  })
+
+  it('发送前准入也限制同一逻辑调用的额外尝试，第5次未派发', async () => {
+    let sent = 0
+    const completer: import('../../src/main/agent/llm').StructuredCompleter = {
+      completeJson: async <T>(request: StructuredCompleteRequest) => {
+        const control = request.control!
+        // 故意模拟违反单发送策略的适配器，准入守卫仍需拒绝超限。
+        for (let ordinal = 1; ordinal <= 5; ordinal++) {
+          control.beforeSend({ providerId: 'mock', providerName: 'mock', model: 'mock',
+            requestId: control.requestId, attemptId: `mock-${ordinal}`, ordinal })
+          sent++
+        }
+        return { data: planOf([]) as T, model: 'mock', usage: nullTokenUsage(), latencyMs: 0,
+          actualProvider: null, actualAttempts: sent, attempts: [] }
+      }
+    }
+    const h = await makeHarness([], completer)
+    const run = h.orchestrator.createQueuedRun({ mode: 'personal_ops', input: '尝试预算' }, { maxModelCalls: 4 })
+    await h.orchestrator.drivePlanning(run.runId)
+    expect(sent).toBe(4)
+    expect(budgetOf(h, run.runId).usage).toMatchObject({ logicalModelCalls: 1, sentModelAttempts: 4 })
+    expect(getRun(h.db, run.runId)?.errorCode).toBe('PLAN_NO_PROGRESS')
+  })
+
+  it('案例活动时间三轮累计达到60秒后不发第4轮，领域时钟保持冻结', async () => {
+    let elapsed = 0
+    const h = await makeHarness((callIndex) => {
+      elapsed += 20000
+      return planOf([{ tool: 'todo.list', arguments: { status: `time-${callIndex}` } }], { continue_after_read: true })
+    })
+    const deps = (h.orchestrator as unknown as { deps: OrchestratorDeps }).deps
+    const orchestrator = new RunOrchestrator({ ...deps,
+      clock: { now: () => new Date(NOW), monotonicMs: () => elapsed } })
+    const run = orchestrator.createQueuedRun({ mode: 'personal_ops', input: '活动时间预算' }, { maxActiveSeconds: 60 })
+    await orchestrator.drivePlanning(run.runId)
+    expect(run.contextClock).toBe(NOW)
+    expect(h.provider.calls).toHaveLength(3)
+    expect(budgetOf(h, run.runId).usage.activeMs).toBe(60000)
+    expect(getRun(h.db, run.runId)?.errorCode).toBe('PLAN_NO_PROGRESS')
+  })
+
   it('创建运行时冻结解析后的 AgentBudget 到 budgetJson,计数从零开始', async () => {
     const h = await makeHarness([planOf([{ tool: 'todo.list', arguments: {} }])])
     const run = h.orchestrator.createQueuedRun({ mode: 'personal_ops' as RunMode, input: '预算冻结' })

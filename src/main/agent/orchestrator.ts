@@ -288,13 +288,15 @@ export class RunOrchestrator {
   /** 只创建排队运行(不驱动规划):IPC 层先写回执,再异步驱动。
    *  OPS-03 预算收口:创建时冻结解析后的 AgentBudget(只可下调的默认上限)进 budgetJson,
    *  计数从零开始;旧运行保持 {} 由读取侧按默认上限兼容。 */
-  createQueuedRun(input: StartRunInput): AgentRunRecord {
+  createQueuedRun(input: StartRunInput, budgetOverride: Partial<AgentBudget> = {}): AgentRunRecord {
+    // 评测可下调案例预算；插入前校验，非法上限不得留下排队记录。
+    const budget = resolveAgentBudget(budgetOverride)
     return createRun(this.deps.db, {
       mode: input.mode,
       input: input.input,
       contextClock: this.deps.clock?.now().toISOString() ?? new Date().toISOString(),
       timezone: input.timezone,
-      budgetJson: JSON.stringify({ budget: resolveAgentBudget(), usage: { ...ZERO_USAGE } })
+      budgetJson: JSON.stringify({ budget, usage: { ...ZERO_USAGE } })
     })
   }
 

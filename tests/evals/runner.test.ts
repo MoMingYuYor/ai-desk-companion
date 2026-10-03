@@ -132,6 +132,23 @@ function runnerFor(
   return { runner, artifactRoot }
 }
 
+describe('Ops案例预算端到端冻结', () => {
+  it.each([
+    [{ max_model_calls: 4, max_active_seconds: 60 }, { maxModelCalls: 4, maxActiveSeconds: 60 }],
+    [{ max_model_calls: 1 }, { maxModelCalls: 1, maxActiveSeconds: 120 }],
+    [{}, { maxModelCalls: 6, maxActiveSeconds: 120 }]
+  ])('声明预算%j进入导出run.json，缺省字段保持默认', async (budgets, expectedBudget) => {
+    const { runner, artifactRoot } = runnerFor([caseLine('budget-case', { budgets })])
+    const state = await runner.run()
+    const result = state.results[0]!
+    expect(result.status).toBe('passed')
+    expect(result.artifactStatus).toBe('ok')
+    const artifact = loadCaseArtifacts(join(artifactRoot, result.artifactDir!))
+    const run = artifact.run.run as { budgetJson: string }
+    expect(JSON.parse(run.budgetJson).budget).toMatchObject(expectedBudget)
+  })
+})
+
 /** 轮询直到条件成立(取消探针的确定性时序控制) */
 async function until(cond: () => boolean, what: string): Promise<void> {
   for (let i = 0; i < 500; i += 1) {

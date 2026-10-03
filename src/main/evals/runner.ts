@@ -885,11 +885,20 @@ export class EvalRunner {
         completer: recording as never
       })
 
+      // 案例声明上限必须进入真实预算账本，不能只用于实验清单估算。
+      const budgetOverride = {
+        ...(caseDef.budgets.max_model_calls !== undefined
+          ? { maxModelCalls: caseDef.budgets.max_model_calls }
+          : {}),
+        ...(caseDef.budgets.max_active_seconds !== undefined
+          ? { maxActiveSeconds: caseDef.budgets.max_active_seconds }
+          : {})
+      }
       const run = orchestrator.createQueuedRun({
         mode: caseDef.mode,
         input: caseDef.input,
         timezone: caseDef.timezone
-      })
+      }, budgetOverride)
       base.runId = run.runId
 
       // 驱动规划,然后按脚本驱动真实入口(批准/回答)
