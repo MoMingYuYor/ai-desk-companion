@@ -131,6 +131,7 @@ export class StagePromptCompleter implements StructuredCompleter {
  * - 注入/越权类:模拟被攻陷的模型,输出引用未注册工具的计划——
  *   编排器必须在规划阶段拒绝(这是注入防御的真实测试);
  * - 修改类:先请求真实读取，再从下一轮请求的读取结果中选择 ID/版本并生成提案;
+ * - 目标缺失类:成功读取且标题零匹配后澄清，消费无其他目标的回答后返回空计划;
  * - 其余:直接返回执行计划。
  */
 export function opsFakeScriptFor(caseDef: EvalCase): (callIndex: number, request: StructuredCompleteRequest) => unknown {
@@ -145,6 +146,59 @@ export function opsFakeScriptFor(caseDef: EvalCase): (callIndex: number, request
         assumptions: [],
         clarifications: []
       }
+    }
+  }
+  if (caseDef.tags.includes('missing-target')) {
+    const title = /“([^”]+)”/.exec(caseDef.input)?.[1]
+    const expectedAnswer = caseDef.interaction_script.find((step) => step.on === 'clarification')?.answer
+    let missingVerified = false
+    return (callIndex, request) => {
+      if (callIndex === 0) {
+        return {
+          goal: caseDef.input, steps: [{ tool: 'todo.list', arguments: {} }],
+          assumptions: [], clarifications: [], continue_after_read: true
+        }
+      }
+      if (callIndex === 1) {
+        // “查无目标”必须来自实际成功读取；缺读、错读、损坏或目标存在都不能冒充缺失。
+        const lines = request.prompt.split('\n')
+        const marker = lines.findIndex((line) => line.startsWith('本运行已执行的读取结果('))
+        if (marker < 0) throw new Error('目标缺失 fake 缺少真实读取结果')
+        let reads: ReadResult[]
+        try {
+          reads = JSON.parse(lines[marker + 1]!) as ReadResult[]
+        } catch {
+          throw new Error('目标缺失 fake 读取区块不是有效 JSON')
+        }
+        if (!Array.isArray(reads)) throw new Error('目标缺失 fake 读取区块必须是数组')
+        const read = reads.find((item) => item?.tool === 'todo.list' && item.result?.ok === true)
+        if (!read || !read.result.ok) throw new Error('目标缺失 fake 缺少成功的 todo.list 读取')
+        const data = read.result.data as { todos?: unknown } | null
+        const todos = data?.todos
+        if (!Array.isArray(todos) || todos.some((todo) =>
+          !todo || typeof todo.id !== 'string' || typeof todo.title !== 'string')) {
+          throw new Error('目标缺失 fake 读取结果缺少有效待办记录')
+        }
+        if (!title) throw new Error('目标缺失 fake 输入缺少目标标题')
+        if (todos.some((todo) => todo.title === title)) throw new Error('目标缺失 fake 实际读取中存在同标题目标')
+        missingVerified = true
+        return {
+          goal: caseDef.input, steps: [], assumptions: [],
+          clarifications: [{ question_id: 'q-1', question: `未找到标题为“${title}”的待办，请确认是否有其他目标。` }]
+        }
+      }
+      if (callIndex === 2) {
+        if (!missingVerified) throw new Error('目标缺失 fake 尚未验证真实读取')
+        // 澄清重入沿用原编排器语义，末轮消费实际回答，不要求重新读取或改变运行终态逻辑。
+        const lines = request.prompt.split('\n')
+        const marker = lines.indexOf('用户对上一轮澄清的回答:')
+        const answer = marker < 0 ? undefined : lines.slice(marker + 1).find((line) => line.startsWith('- q-1: '))?.slice(7).trim()
+        if (!expectedAnswer?.trim() || answer !== expectedAnswer.trim()) {
+          throw new Error('目标缺失 fake 缺少预期的 q-1 澄清回答')
+        }
+        return { goal: caseDef.input, steps: [], assumptions: [], clarifications: [] }
+      }
+      throw new Error('目标缺失 fake 脚本耗尽')
     }
   }
   const steps = (caseDef.expected.tool_sequence ?? []).map((tool) => ({

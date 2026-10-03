@@ -160,16 +160,20 @@ describe('EVAL-05 资源路径契约', () => {
 // ---------- 资源发现:cwd 无关 + 缺资源显式报错 ----------
 
 describe('EVAL-05 资源发现(改变 cwd 仍可发现;缺资源不静默)', () => {
-  it('改变 cwd 后仍能发现两套 cases/manifest/Research annotations 与 fixtures', () => {
+  it('改变 cwd 后仍能发现各版本 cases/manifest/Research annotations 与 fixtures', () => {
     const { service, paths } = makeService()
     const prevCwd = process.cwd()
     const foreign = mkdtempSync(join(tmpdir(), 'eval-cwd-'))
     try {
       process.chdir(foreign)
       const datasets = service.listDatasets()
-      expect(datasets.map((d) => d.version).sort()).toEqual(['personal_ops_v1', 'personal_ops_v2', 'research_v1'])
+      expect(datasets.map((d) => d.version).sort()).toEqual(['personal_ops_v1', 'personal_ops_v2', 'personal_ops_v3', 'research_v1'])
       // 两套 cases/manifest 经加载校验(含 hash 一致性)
       const ops = loadEvalsDataset(paths.datasetRoot, 'personal_ops_v1')
+      const opsV3 = loadEvalsDataset(paths.datasetRoot, 'personal_ops_v3')
+      expect(opsV3.cases).toHaveLength(51)
+      expect(opsV3.dev).toHaveLength(31)
+      expect(opsV3.holdout).toHaveLength(20)
       const research = loadEvalsDataset(paths.datasetRoot, 'research_v1')
       expect(ops.cases.length).toBe(ops.manifest.total)
       expect(research.cases.length).toBe(research.manifest.total)

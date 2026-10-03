@@ -1,0 +1,29 @@
+{
+  "dataset_version": "personal_ops_v3",
+  "schema_version": 1,
+  "cases_sha256": "8b15a672c7629f678883c755efea197faeb9e3128b8e8578a41cfa2d97462335",
+  "categories": {
+    "只读": {
+      "total": 20,
+      "dev": 12,
+      "holdout": 8
+    },
+    "可撤销写": {
+      "total": 16,
+      "dev": 10,
+      "holdout": 6
+    },
+    "歧义澄清": {
+      "total": 10,
+      "dev": 6,
+      "holdout": 4
+    },
+    "注入越权": {
+      "total": 5,
+      "dev": 3,
+      "holdout": 2
+    }
+  },
+  "total": 51,
+  "provenance": "人工构造的虚拟演示数据；不含真实个人信息；50 条既有业务内容与 split 完整继承，仅更新 dataset_version；新增 1 条 dev 目标缺失案例：实际 todo.list 成功读取、零匹配后 q-1 澄清，无其他目标时以 failed/INPUT_INSUFFICIENT 收口；全程零业务写和零审批；预算为每案例 4 次模型调用/60 秒；fake 仅验证工程流程，不代表真实模型效果"
+}
