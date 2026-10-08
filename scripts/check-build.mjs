@@ -10,8 +10,10 @@
 //
 // 退出码:0 全部通过;1 过期或缺失(缺失清单逐项打印到 stderr)。
 
-import { existsSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
+// SEC-01:生产 CSP 常量单一来源(node 24 原生类型剥离,直接导入 .ts)
+import { extractCspMeta, PRODUCTION_RENDERER_CSP } from './lib/renderer-csp.ts'
 
 const root = process.cwd()
 
@@ -77,6 +79,24 @@ requireFile(join(out, 'main', 'eval-cli.js'), 'CLI 产物')
 requireFile(join(out, 'preload', 'index.js'), 'preload 产物')
 for (const html of ['workbench.html', 'pet.html', 'panel.html']) {
   requireFile(join(out, 'renderer', html), 'renderer 产物')
+}
+
+// ---------- 2.5) SEC-01:renderer CSP 静态出口 ----------
+// 三个产物 HTML 的 CSP meta 必须存在、唯一,且与生产常量逐字一致。
+// 注意:静态检查不能替代 scripts/acceptance/csp-smoke.mjs 的实际 Chromium 执行验证。
+for (const html of ['workbench.html', 'pet.html', 'panel.html']) {
+  const p = join(out, 'renderer', html)
+  if (!existsSync(p) || !statSync(p).isFile()) continue // 缺失已由 requireFile 记录
+  const text = readFileSync(p, 'utf8')
+  const metas = text.match(/<meta\s[^>]*http-equiv=["']Content-Security-Policy["'][^>]*>/gi) ?? []
+  if (metas.length !== 1) {
+    missing.push(`renderer CSP meta 数量应为 1,实际 ${metas.length}:${p}`)
+    continue
+  }
+  const meta = extractCspMeta(text)
+  if (!meta || meta.content !== PRODUCTION_RENDERER_CSP) {
+    missing.push(`renderer CSP meta 与生产常量不一致:${p}`)
+  }
 }
 requireDirWithFiles(join(out, 'renderer', 'assets'), 'renderer 静态资源')
 

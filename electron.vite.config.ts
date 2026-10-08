@@ -1,6 +1,8 @@
 import { resolve } from 'node:path'
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import react from '@vitejs/plugin-react'
+// SEC-01:renderer 开发 CSP 插件(apply:'serve'),只影响 dev server,生产 build 不应用
+import { createRendererCspDevPlugin } from './scripts/lib/renderer-csp'
 
 export default defineConfig({
   main: {
@@ -30,7 +32,7 @@ export default defineConfig({
     }
   },
   renderer: {
-    plugins: [react()],
+    plugins: [react(), createRendererCspDevPlugin()],
     resolve: {
       alias: {
         '@shared': resolve('src/shared'),
