@@ -99,7 +99,7 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
   )
 
   return (
-    <div className="page" style={{ flexDirection: 'column' }}>
+    <div className="page" data-page="calendar" style={{ flexDirection: 'column' }}>
       <div className="row" style={{ marginBottom: 8 }}>
         <button onClick={() => setCursor(stepMonth(cursor, -1))}>←</button>
         <span style={{ fontWeight: 700, fontSize: 16 }}>
@@ -134,6 +134,7 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
               return (
                 <div
                   key={d}
+                  data-date={d}
                   className={`cal-cell ${isToday ? 'today' : ''} ${otherMonth ? 'other-month' : ''}`}
                   onClick={() => setSelected(d)}
                 >
@@ -161,7 +162,7 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
         </div>
 
         {/* 日详情 */}
-        <div className="card" style={{ width: 300, flexShrink: 0 }}>
+        <div className="card" data-agenda-date={selected} style={{ width: 300, flexShrink: 0 }}>
           <h3>
             {selected} {weekdayCn(dayOfWeek(selected))}
           </h3>

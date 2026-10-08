@@ -46,7 +46,7 @@ export function TodosPage({ refreshKey, petAction }: Props): JSX.Element {
   ]
 
   return (
-    <div className="page" style={{ flexDirection: 'column' }}>
+    <div className="page" data-page="todos" style={{ flexDirection: 'column' }}>
       <div className="row" style={{ marginBottom: 8 }}>
         <h3 style={{ margin: 0 }}>待办清单</h3>
         <div className="spacer" />
@@ -63,7 +63,7 @@ export function TodosPage({ refreshKey, petAction }: Props): JSX.Element {
                 {g.label}({g.items.length})
               </div>
               {g.items.map((t) => (
-                <div key={t.id} className={`todo-item ${t.completedAt ? 'done' : ''}`}>
+                <div key={t.id} data-record-id={t.id} className={`todo-item ${t.completedAt ? 'done' : ''}`}>
                   <input type="checkbox" checked={!!t.completedAt} onChange={() => void toggle(t)} />
                   <span className="title" onClick={() => setEditor(t)} role="button">
                     {t.title}

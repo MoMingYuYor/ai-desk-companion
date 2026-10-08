@@ -148,6 +148,7 @@ export default function App(): JSX.Element {
             {group.items.map((n) => (
               <div
                 key={n.key}
+                data-nav={n.key}
                 className={`nav-item ${page === n.key ? 'active' : ''}`}
                 role="button"
                 tabIndex={0}
