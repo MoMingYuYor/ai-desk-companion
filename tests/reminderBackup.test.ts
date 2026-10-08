@@ -10,7 +10,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { SCHEMA_VERSION } from '../src/main/db/schema'
 
-function makeReminderDeps(db: Awaited<ReturnType<typeof makeTestDb>>): { deps: ReminderDeps; notices: Array<{ title: string }> } {
+function makeReminderDeps(db: Awaited<ReturnType<typeof makeTestDb>>, now?: () => Date): { deps: ReminderDeps; notices: Array<{ title: string }> } {
   const notices: Array<{ title: string }> = []
   return {
     notices,
@@ -18,7 +18,9 @@ function makeReminderDeps(db: Awaited<ReturnType<typeof makeTestDb>>): { deps: R
       db,
       broadcast: () => {},
       showNotification: (n) => notices.push({ title: n.title }),
-      onFired: () => {}
+      onFired: () => {},
+      // 时钟注入:锚定种子时刻,避免午夜窗口跑测试时把 now-10min 翻到前一自然日
+      ...(now ? { now } : {})
     }
   }
 }
@@ -205,8 +207,10 @@ describe('R6: 备份恢复后按 24 小时窗口补报', () => {
     const ids = dueReminders(db2, now).map((r) => r.entityId)
     expect(ids).toEqual([recent.id])
 
-    // 重启语义:同一恢复库上新服务实例只补报一次,重复扫描不重发
-    const { deps, notices } = makeReminderDeps(db2)
+    // 重启语义:同一恢复库上新服务实例只补报一次,重复扫描不重发。
+    // 时钟锚定到种子时刻:自然日判定在午夜窗口(00:00~00:10)会把
+    // now-10min 的种子翻到前一自然日,属测试时钟脆弱而非产品缺陷。
+    const { deps, notices } = makeReminderDeps(db2, () => now)
     new ReminderService(deps).tick()
     expect(notices.map((n) => n.title)).toEqual(['即将开始:窗口内日程'])
     new ReminderService(deps).tick()

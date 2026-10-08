@@ -10,6 +10,12 @@ export interface ReminderDeps {
   broadcast: (channel: string, payload: unknown) => void
   showNotification: (n: ReminderNotice) => void
   onFired?: (n: ReminderNotice) => void
+  /**
+   * 可注入时钟:缺省为真实系统时间。测试经它锚定时刻——
+   * 「错过/即将开始」按自然日判定,用真实午夜窗口跑测试会把
+   * now-10min 的种子事件翻到前一自然日而误判(见 reminderBackup R6)。
+   */
+  now?: () => Date
 }
 
 /** 补报窗口:fireAt ∈ [now - 24h, now],闭合区间(Global Constraints / R6) */
@@ -113,7 +119,7 @@ export class ReminderService {
    * 通知抛错时不标记 fired,下一轮重试,避免"先标记后丢通知"。
    */
   tick(): void {
-    const now = new Date()
+    const now = this.deps.now ? this.deps.now() : new Date()
     for (const due of dueReminders(this.deps.db, now)) {
       const notice: ReminderNotice = {
         key: due.key,
