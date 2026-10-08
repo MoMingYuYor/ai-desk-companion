@@ -191,3 +191,11 @@ PASS 判据对照:合法恢复后数据一致;坏备份零变更(逐页对照截
 
 **文案更新**:`docs/portfolio/demo-script.md` 已改为 180~300 秒分段时间线骨架(0:00-0:30 问题与入口;0:30-1:30 导入与引用研究;1:30-2:30 转待办与审批;2:30-3:30 评测与失败回放;结尾验证边界),每段标注来源 GUI 项与「待录制」;`docs/portfolio/project-card.md` 仅做事实核对后的最小更新(补当前候选包绑定与证据入口)。六类素材与完整视频状态:**待录制**(依赖 DEL-02 真人结果与真实模型/公开授权);演示通过与真实 AI 效果通过分别登记,公开主页接入待授权,本地准备完成不等待发布。
 
+
+## 追加：终版包 r4（绑定最终源码）
+
+- 候选 commit：`28acbe6`（含 healthcheck 调度器竞态修复 1a884ad 与 reminder 时钟注入 28acbe6，`gitDirty: false`）
+- 包：`artifacts/acceptance/adc-improvements-20261008/DEL-01/package-r4/事务助手-0.1.0-portable-x64.zip`，SHA-256 `46827ad774c9acc5cf9ab7c57855fff2dbb558202a68b17c3ae095b3130a369e`，`identity-r4.json` PASS
+- 健康检查：exit 0、迁移 v9、todo.list 返回 2 条（readOnlyTool 证据字段正常——r2 发现的「非法状态转移」回归已由 1a884ad 修复）
+- DEL-02 的 gui-checks.csv 绑定更新为 r4 身份：buildCommit=`28acbe6…`、zipSha256=`46827ad7…`（重打包后包字节变化，绑定字段已重算；操作步骤与判据不变）
+- 包演进说明：r2（dirty 被身份校验正确拒绝，暴露 DEL-01 交付文件未提交）→ r3（674d5b6，身份 PASS）→ r4（28acbe6 终版）。历史包保留于各自目录，未覆盖。
