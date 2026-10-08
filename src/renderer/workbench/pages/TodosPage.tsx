@@ -1,17 +1,23 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { CalendarEvent, Todo, TodoInput } from '../../../shared/types'
 import { fmtDateCn, fmtTime, nowLocalIso, toDateStr } from '../../../shared/dateUtils'
-import { Toast, useSubscribe, useToast } from '../../shared/util'
+import { Toast, useToast } from '../../shared/util'
 
 interface Props {
   refreshKey: number
   petAction: { action: string; at: number } | null
 }
 
+/** 各分组初始可见条数(PERF-02):DOM 只渲染可见切片,业务记录不裁剪 */
+const PAGE_SIZE = 50
+
 export function TodosPage({ refreshKey, petAction }: Props): JSX.Element {
   const [todos, setTodos] = useState<Todo[]>([])
   const [editor, setEditor] = useState<Todo | 'new' | null>(null)
   const [toast, showToast] = useToast()
+  // 各组独立可见上限:只影响渲染切片,不改业务记录;重新进入页面(重新挂载)默认 50,
+  // 页内刷新(落库重拉)保留已调大的上限。
+  const [visibleByGroup, setVisibleByGroup] = useState<Record<string, number>>({})
 
   const reload = useCallback((): void => {
     void window.api.listTodos().then(setTodos)
@@ -25,28 +31,61 @@ export function TodosPage({ refreshKey, petAction }: Props): JSX.Element {
     if (petAction?.action === 'new-todo') setEditor('new')
   }, [petAction])
 
-  useSubscribe('evt:data-changed', useCallback(() => reload(), [reload]))
+  // 刷新入口:挂载 + App 在 evt:data-changed 时统一递增的 refreshKey。
+  // 页面不再自行订阅 evt:data-changed:App 已把该广播转为 refreshKey,
+  // 双重订阅会让同一次写入触发两次全量 listTodos(PERF-02)。
 
   const toggle = async (t: Todo): Promise<void> => {
+    // 列表刷新由 evt:data-changed 广播驱动(写通道统一经主进程 writeNotify 广播,
+    // 广播先于 IPC 回执到达),不再手动重拉:避免同一次完成/取消触发两次全量 listTodos(PERF-02)
     await window.api.updateTodo(t.id, { completedAt: t.completedAt ? null : nowLocalIso() })
-    reload()
   }
 
-  const groups: Array<{ label: string; items: Todo[] }> = [
-    { label: '已逾期', items: todos.filter((t) => !t.completedAt && t.dueAt && t.dueAt < nowLocalIso().slice(0, 10) + 'T00:00') },
-    { label: '今天', items: todos.filter((t) => !t.completedAt && t.dueAt && t.dueAt.slice(0, 10) === toDateStr(new Date())) },
-    {
-      label: '未来',
-      items: todos.filter(
-        (t) => !t.completedAt && t.dueAt && t.dueAt.slice(0, 10) > toDateStr(new Date())
-      )
-    },
-    { label: '无截止时间', items: todos.filter((t) => !t.completedAt && !t.dueAt) },
-    { label: '已完成', items: todos.filter((t) => t.completedAt) }
-  ]
+  // 分组计算移入 useMemo(PERF-02):同一次计算捕获一次 nowLocalIso() 与当天字符串,
+  // 避免每次渲染对 10k 级数据重复执行 5 次 filter + 每行重复取当前时间。
+  const { groups, nowIso } = useMemo(() => {
+    const capturedNow = nowLocalIso()
+    const today = toDateStr(new Date())
+    const overdueBefore = capturedNow.slice(0, 10) + 'T00:00'
+    const computed: Array<{ label: string; items: Todo[] }> = [
+      { label: '已逾期', items: todos.filter((t) => !t.completedAt && t.dueAt && t.dueAt < overdueBefore) },
+      { label: '今天', items: todos.filter((t) => !t.completedAt && t.dueAt && t.dueAt.slice(0, 10) === today) },
+      {
+        label: '未来',
+        items: todos.filter(
+          (t) => !t.completedAt && t.dueAt && t.dueAt.slice(0, 10) > today
+        )
+      },
+      { label: '无截止时间', items: todos.filter((t) => !t.completedAt && !t.dueAt) },
+      { label: '已完成', items: todos.filter((t) => t.completedAt) }
+    ]
+    return { groups: computed, nowIso: capturedNow }
+  }, [todos])
+
+  // 当前编辑条目保持可见:分组在编辑期间重算(如页内刷新)后,
+  // 该条目所在组的可见上限至少覆盖其位置。
+  const editingId = editor && editor !== 'new' ? editor.id : null
+  const visibleLimitOf = (g: { label: string; items: Todo[] }): number => {
+    const base = visibleByGroup[g.label] ?? PAGE_SIZE
+    if (!editingId) return base
+    const idx = g.items.findIndex((t) => t.id === editingId)
+    return idx >= 0 ? Math.max(base, idx + 1) : base
+  }
+  const showMore = (g: { label: string; items: Todo[] }): void => {
+    setVisibleByGroup((prev) => ({
+      ...prev,
+      [g.label]: Math.min(g.items.length, (prev[g.label] ?? PAGE_SIZE) + PAGE_SIZE)
+    }))
+  }
 
   return (
-    <div className="page" data-page="todos" style={{ flexDirection: 'column' }}>
+    <div
+      className="page"
+      data-page="todos"
+      data-record-total={todos.length}
+      data-visible-count={groups.reduce((n, g) => n + Math.min(g.items.length, visibleLimitOf(g)), 0)}
+      style={{ flexDirection: 'column' }}
+    >
       <div className="row" style={{ marginBottom: 8 }}>
         <h3 style={{ margin: 0 }}>待办清单</h3>
         <div className="spacer" />
@@ -56,13 +95,17 @@ export function TodosPage({ refreshKey, petAction }: Props): JSX.Element {
       </div>
       <div className="card" style={{ flex: 1 }}>
         {todos.length === 0 && <div className="empty">还没有待办。可以把通知拖给桌宠自动生成,或手动新建。</div>}
-        {groups.map((g) =>
-          g.items.length > 0 ? (
+        {groups.map((g) => {
+          if (g.items.length === 0) return null
+          const limit = visibleLimitOf(g)
+          const visibleItems = g.items.slice(0, limit)
+          const hiddenCount = g.items.length - visibleItems.length
+          return (
             <div key={g.label}>
               <div className="group-title">
                 {g.label}({g.items.length})
               </div>
-              {g.items.map((t) => (
+              {visibleItems.map((t) => (
                 <div key={t.id} data-record-id={t.id} className={`todo-item ${t.completedAt ? 'done' : ''}`}>
                   <input type="checkbox" checked={!!t.completedAt} onChange={() => void toggle(t)} />
                   <span className="title" onClick={() => setEditor(t)} role="button">
@@ -75,7 +118,7 @@ export function TodosPage({ refreshKey, petAction }: Props): JSX.Element {
                     )}
                   </span>
                   {t.dueAt && (
-                    <span className={`muted ${!t.completedAt && t.dueAt < nowLocalIso() ? 'danger' : ''}`} style={{ color: !t.completedAt && t.dueAt < nowLocalIso() ? 'var(--danger)' : undefined }}>
+                    <span className={`muted ${!t.completedAt && t.dueAt < nowIso ? 'danger' : ''}`} style={{ color: !t.completedAt && t.dueAt < nowIso ? 'var(--danger)' : undefined }}>
                       截止 {fmtDateCn(t.dueAt)} {fmtTime(t.dueAt)}
                     </span>
                   )}
@@ -84,9 +127,14 @@ export function TodosPage({ refreshKey, petAction }: Props): JSX.Element {
                   </button>
                 </div>
               ))}
+              {hiddenCount > 0 && (
+                <button className="ghost" style={{ margin: '4px 0 8px' }} onClick={() => showMore(g)}>
+                  显示更多(还有 {hiddenCount} 条)
+                </button>
+              )}
             </div>
-          ) : null
-        )}
+          )
+        })}
       </div>
 
       {editor && (
@@ -94,8 +142,8 @@ export function TodosPage({ refreshKey, petAction }: Props): JSX.Element {
           initial={editor === 'new' ? null : editor}
           onClose={() => setEditor(null)}
           onSaved={() => {
+            // 广播已驱动列表刷新;只负责关闭编辑器
             setEditor(null)
-            reload()
           }}
           onToast={showToast}
         />
@@ -105,8 +153,8 @@ export function TodosPage({ refreshKey, petAction }: Props): JSX.Element {
   )
 
   async function del(id: string): Promise<void> {
+    // 刷新由 evt:data-changed 广播驱动,不手动重拉(PERF-02)
     await window.api.deleteTodo(id)
-    reload()
   }
 }
 

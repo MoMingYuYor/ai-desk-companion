@@ -84,19 +84,55 @@ export function visibilityLimitation(state) {
 }
 
 export function collectTodosSnapshot(doc) {
+  const root = doc.querySelector('[data-page="todos"]')
+  const parseAttr = value => (value == null || value === '' ? null : Number(value))
   return {
-    pageRootPresent: doc.querySelector('[data-page="todos"]') != null,
+    pageRootPresent: root != null,
     recordIds: Array.from(doc.querySelectorAll('[data-record-id]'), node => node.getAttribute('data-record-id')),
+    // PERF-02 分页锚点:页面声明的业务记录总数与可见行数(缺省 = 未分页的旧实现)
+    recordTotal: root ? parseAttr(root.getAttribute('data-record-total')) : null,
+    declaredVisible: root ? parseAttr(root.getAttribute('data-visible-count')) : null,
     visibilityState: doc.visibilityState
   }
 }
 
-// 待办页完成条件:当前实现无分页(PERF-02 未做),要求种子全部 ID 与 DOM 渲染 ID 集合一致。
-// IPC 返回 10000 条而页面只渲染 1 条 → RECORD_COUNT_MISMATCH;数量对但关键 ID 缺失 → MISSING_RECORD_IDS。
+// 待办页完成条件(PERF-02 起支持两种口径,规范:"待办核对所有 ID 或分页后的可见 ID 与总数"):
+// 1) 页面未声明 data-record-total(无分页旧口径):要求种子全部 ID 与 DOM 渲染 ID 集合一致。
+//    IPC 返回 10000 条而页面只渲染 1 条 → RECORD_COUNT_MISMATCH;数量对但关键 ID 缺失 → MISSING_RECORD_IDS。
+// 2) 页面声明 data-record-total / data-visible-count(分页口径):
+//    - recordTotal 必须等于种子总数(显示完整总数,防丢数据);
+//    - DOM 可见行数必须等于声明的可见行数且 > 0(防声明与渲染不一致);
+//    - 可见 ID 全部属于种子且无重复(防伪造/重复行)。
+//    各组精确切片语义(初始每组 ≤50、"显示更多"步进 50)由 tests/ui/todosPerformance.test.tsx 用
+//    10000 条替身逐条反例保证,此处不复制页面分组逻辑(分组归属依赖 SQLite 同键并列时的顺序)。
 export function verifyTodosCompletion(snapshot, expected) {
   const limited = visibilityLimitation(snapshot.visibilityState)
   if (limited.limited) return { pass: false, reason: limited.reason, detail: { visibilityState: snapshot.visibilityState } }
   if (!snapshot.pageRootPresent) return { pass: false, reason: 'MISSING_PAGE_ROOT', detail: null }
+  if (snapshot.recordTotal != null && snapshot.declaredVisible != null) {
+    if (snapshot.recordTotal !== expected.expectedIds.length) {
+      return {
+        pass: false,
+        reason: 'RECORD_TOTAL_MISMATCH',
+        detail: { declaredTotal: snapshot.recordTotal, expectedRows: expected.expectedIds.length }
+      }
+    }
+    if (snapshot.recordIds.length !== snapshot.declaredVisible || snapshot.recordIds.length === 0) {
+      return {
+        pass: false,
+        reason: 'VISIBLE_ROWS_MISMATCH',
+        detail: { domRows: snapshot.recordIds.length, declaredVisible: snapshot.declaredVisible }
+      }
+    }
+    const seeds = new Set(expected.expectedIds)
+    const seen = new Set()
+    for (const id of snapshot.recordIds) {
+      if (!seeds.has(id)) return { pass: false, reason: 'RECORD_COUNT_MISMATCH', detail: { foreignId: id } }
+      if (seen.has(id)) return { pass: false, reason: 'RECORD_COUNT_MISMATCH', detail: { duplicateId: id } }
+      seen.add(id)
+    }
+    return { pass: true, reason: 'OK', detail: { domRows: snapshot.recordIds.length, total: snapshot.recordTotal } }
+  }
   if (snapshot.recordIds.length !== expected.expectedIds.length) {
     return {
       pass: false,
@@ -115,19 +151,29 @@ export function verifyTodosCompletion(snapshot, expected) {
 export function collectCalendarSnapshot(doc) {
   const detail = doc.querySelector('[data-agenda-date]')
   const grid = doc.querySelector('.cal-grid')
+  const parseAttr = value => (value == null || value === '' ? null : Number(value))
   return {
     pageRootPresent: doc.querySelector('[data-page="calendar"]') != null,
     cellDates: Array.from(doc.querySelectorAll('[data-date]'), node => node.getAttribute('data-date')),
     agendaDate: detail ? detail.getAttribute('data-agenda-date') : null,
     agendaRowCount: detail ? detail.querySelectorAll('.list-row').length : 0,
     agendaEmptyNote: detail != null && detail.textContent.includes('这一天暂无安排'),
+    // PERF-02 分页锚点:详情面板声明的完整 agenda 行数与可见行数(缺省 = 未分页的旧实现)
+    agendaTotal: detail ? parseAttr(detail.getAttribute('data-agenda-total')) : null,
+    agendaVisible: detail ? parseAttr(detail.getAttribute('data-agenda-visible')) : null,
     eventChipCount: grid ? grid.querySelectorAll('.chip.event').length : 0,
     visibilityState: doc.visibilityState
   }
 }
 
-// 日历完成条件:42 格且与期望月网格逐格一致、选中日一致、可见明细行数与种子期望一致
-// (期望行数 = 该日 events + 未完成且当日截止 todos,与 buildDayAgenda 口径相同;0 行时要求空态可见)。
+// 日历完成条件:42 格且与期望月网格逐格一致、选中日一致、明细核对(PERF-02 起两种口径,规范:
+// "日历核对 42 格、选中日和可见明细"):
+// 1) 面板未声明 data-agenda-total(无分页旧口径):可见明细行数与种子期望完整行数一致
+//    (期望行数 = 该日 events + 未完成且当日截止 todos,与 buildDayAgenda 口径相同;0 行时要求空态可见)。
+// 2) 面板声明 data-agenda-total / data-agenda-visible(分页口径):
+//    - agendaTotal 必须等于种子期望完整行数(独立于页面的总数核对,防"渲染少行冒充就绪");
+//    - DOM .list-row 数必须等于面板声明的可见行数且 > 0;
+//    - 0 行时同样要求空态可见。事件/待办分区 50 条切片语义由 tests/ui/calendarPerformance.test.tsx 保证。
 export function verifyCalendarCompletion(snapshot, expected) {
   const limited = visibilityLimitation(snapshot.visibilityState)
   if (limited.limited) return { pass: false, reason: limited.reason, detail: { visibilityState: snapshot.visibilityState } }
@@ -144,11 +190,20 @@ export function verifyCalendarCompletion(snapshot, expected) {
   if (snapshot.agendaDate !== expected.selectedDate) {
     return { pass: false, reason: 'AGENDA_DATE_MISMATCH', detail: { agendaDate: snapshot.agendaDate, expected: expected.selectedDate } }
   }
-  const rowsOk = expected.expectedAgendaRows > 0
-    ? snapshot.agendaRowCount === expected.expectedAgendaRows
-    : snapshot.agendaEmptyNote
+  let rowsOk
+  if (snapshot.agendaTotal != null && snapshot.agendaVisible != null) {
+    rowsOk = expected.expectedAgendaRows > 0
+      ? snapshot.agendaTotal === expected.expectedAgendaRows &&
+        snapshot.agendaVisible === snapshot.agendaRowCount &&
+        snapshot.agendaRowCount > 0
+      : snapshot.agendaEmptyNote && snapshot.agendaTotal === 0
+  } else {
+    rowsOk = expected.expectedAgendaRows > 0
+      ? snapshot.agendaRowCount === expected.expectedAgendaRows
+      : snapshot.agendaEmptyNote
+  }
   if (!rowsOk) {
-    return { pass: false, reason: 'AGENDA_ROWS_MISMATCH', detail: { rows: snapshot.agendaRowCount, expected: expected.expectedAgendaRows, emptyNote: snapshot.agendaEmptyNote } }
+    return { pass: false, reason: 'AGENDA_ROWS_MISMATCH', detail: { rows: snapshot.agendaRowCount, expected: expected.expectedAgendaRows, emptyNote: snapshot.agendaEmptyNote, agendaTotal: snapshot.agendaTotal, agendaVisible: snapshot.agendaVisible } }
   }
   if (expected.expectedEventChips != null && snapshot.eventChipCount !== expected.expectedEventChips) {
     return { pass: false, reason: 'EVENT_CHIPS_MISMATCH', detail: { chips: snapshot.eventChipCount, expected: expected.expectedEventChips } }

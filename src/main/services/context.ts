@@ -1,6 +1,6 @@
 // 构建发送给模型的"个人背景 + 近期日程"上下文
 import type { SqliteDb } from '../db/connection'
-import { listCourseOverrides, listCourses, listEventsRange, listProfileFacts, listSchoolEvents, listSemesters, listTodos } from '../db/dao'
+import { listCourseOverrides, listCourses, listEventsRange, listProfileFacts, listSchoolEvents, listSemesters, listTodosDueOn } from '../db/dao'
 import type { CourseOccurrence, DayAgenda } from '../../shared/types'
 import {
   addDays,
@@ -91,11 +91,8 @@ export function buildFullContext(db: SqliteDb): string {
 export function buildDayAgenda(db: SqliteDb, date: string): DayAgenda {
   const courses = courseOccurrencesOn(db, date)
   const events = listEventsRange(db, `${date}T00:00`, `${date}T23:59`)
-  const todos = listTodos(db).filter((t) => {
-    if (t.completedAt) return false
-    if (!t.dueAt) return false
-    return t.dueAt.slice(0, 10) === date
-  })
+  // PERF-02:按日定向查询替代全量 listTodos + 内存过滤(日历挂载逐日调用是 IPC/DAO 大头)
+  const todos = listTodosDueOn(db, date)
   const school = listSchoolEvents(db).filter(
     (e) => e.startDate.slice(0, 10) <= date && (!e.endDate || e.endDate.slice(0, 10) >= date)
   )

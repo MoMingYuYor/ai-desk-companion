@@ -1,7 +1,9 @@
 // runOperation / 操作回执 / 条件更新测试(计划 Task 2 Interfaces)。
 // 红灯依据:src/main/db/operations.ts 尚不存在,导入即失败。
 import { describe, expect, it, vi } from 'vitest'
-import { createEvent, createTodo, deleteEventInner, updateTodo } from '../../src/main/db/dao'
+import type { SqliteDb } from '../../src/main/db/connection'
+import { createEvent, createTodo, deleteEventInner, listTodos, listTodosDueOn, updateTodo } from '../../src/main/db/dao'
+import { buildDayAgenda } from '../../src/main/services/context'
 import { OperationError, assertRevision, getOperationReceipt, runOperation } from '../../src/main/db/operations'
 import { makeTestDb } from '../helpers'
 
@@ -167,6 +169,80 @@ describe('runOperation:关键命令唯一事务拥有者', () => {
       runOperation(db, opInput({ operationId: '' }), () => ({}))
     } catch (err) {
       expect((err as OperationError).appError).toMatchObject({ code: 'VALIDATION' })
+    }
+  })
+})
+
+// ---------- PERF-02:listTodosDueOn / buildDayAgenda 查询一致性 ----------
+
+describe('PERF-02:按日定向待办查询与全量路径逐字段一致(20% 关联夹具)', () => {
+  /** 夹具:200 条待办,截止日跨 5 天(各 40 条),其中 20% 关联日程;
+   *  含已完成、无截止、同日不同时刻(验证排序)与缺失关联(事件已删)的情况。 */
+  async function seedLinkedFixture(): Promise<SqliteDb> {
+    const db = await makeTestDb()
+    const dueDays = ['2026-10-06', '2026-10-07', '2026-10-08', '2026-10-09', '2026-10-10']
+    const times = ['08:00', '12:00', '18:00', '23:59', '06:30']
+    for (let i = 0; i < 200; i++) {
+      const day = dueDays[i % dueDays.length]
+      const time = times[i % times.length]
+      // 20% 关联日程;其中 i === 40 的关联事件稍后删除,验证缺失关联时 linkedEvent 同样缺省
+      let linkedEventId: string | null = null
+      if (i % 5 === 0) {
+        const ev = createEvent(db, { title: `执行时段 ${i}`, startAt: `${day}T${time}`, endAt: `${day}T${time}` })
+        linkedEventId = ev.id
+      }
+      const completedAt = i % 10 === 1 ? '2026-10-07T09:00' : null
+      const todo = createTodo(db, { title: `待办 ${i}`, notes: i % 2 === 0 ? `备注 ${i}` : null, dueAt: i % 10 === 2 ? null : `${day}T${time}`, linkedEventId })
+      if (completedAt) updateTodo(db, todo.id, { completedAt })
+    }
+    // 直接删除事件行(绕过 deleteEventInner 的外键清理)制造悬挂关联:
+    // 该待办 linked_event_id 仍指向已不存在的事件,验证缺失关联时 linkedEvent 同样缺省
+    const orphan = db.get<{ id: string }>("SELECT id FROM events WHERE title = '执行时段 40'")
+    db.run('DELETE FROM events WHERE id = ?', [orphan!.id])
+    return db
+  }
+
+  /** 旧实现口径:全量 listTodos 后内存过滤(与改动前 buildDayAgenda 相同) */
+  function legacyFilter(db: SqliteDb, date: string) {
+    return listTodos(db).filter((t) => {
+      if (t.completedAt) return false
+      if (!t.dueAt) return false
+      return t.dueAt.slice(0, 10) === date
+    })
+  }
+
+  it('listTodosDueOn 与 listTodos+filter 的字段、排序、linkedEvent 附着完全一致', async () => {
+    const db = await seedLinkedFixture()
+    for (const date of ['2026-10-06', '2026-10-07', '2026-10-08', '2026-10-09', '2026-10-10', '2026-10-11']) {
+      const viaTargeted = listTodosDueOn(db, date)
+      const viaLegacy = legacyFilter(db, date)
+      expect(viaTargeted.map((t) => t.id)).toEqual(viaLegacy.map((t) => t.id))
+      // 逐字段深度相等(含 linkedEvent 附着与缺失关联时的缺省形态)
+      expect(JSON.parse(JSON.stringify(viaTargeted))).toEqual(JSON.parse(JSON.stringify(viaLegacy)))
+    }
+    // 抽查关联附着:命中行中 20% 关联仍带 linkedEvent;缺失关联(事件已删)不携带 linkedEvent 字段
+    const dayTodos = listTodosDueOn(db, '2026-10-08')
+    expect(dayTodos.length).toBeGreaterThan(0)
+    for (const t of dayTodos) {
+      if (t.linkedEventId && db.get('SELECT id FROM events WHERE id = ?', [t.linkedEventId])) {
+        expect(t.linkedEvent?.id).toBe(t.linkedEventId)
+      } else {
+        expect(t.linkedEvent).toBeUndefined()
+      }
+    }
+  })
+
+  it('buildDayAgenda(date).todos 与旧口径一致,events/schoolEvents 不受影响', async () => {
+    const db = await seedLinkedFixture()
+    for (const date of ['2026-10-06', '2026-10-08', '2026-10-10']) {
+      const agenda = buildDayAgenda(db, date)
+      const legacy = legacyFilter(db, date)
+      expect(agenda.date).toBe(date)
+      expect(JSON.parse(JSON.stringify(agenda.todos))).toEqual(JSON.parse(JSON.stringify(legacy)))
+      // 事件分区与旧实现同一查询路径(listEventsRange 按日区间),此处核对排序键稳定性
+      for (const ev of agenda.events) {
+        expect(ev.startAt.slice(0, 10)).toBe(date)
+      }
     }
   })
 })

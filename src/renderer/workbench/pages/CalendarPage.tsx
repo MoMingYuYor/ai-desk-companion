@@ -1,13 +1,16 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CalendarEvent, CourseOccurrence, DayAgenda, EventInput } from '../../../shared/types'
 import { fmtTime, toDateStr, weekdayCn } from '../../../shared/dateUtils'
 import { lunarInfo, lunarLabel } from '../../../shared/lunarDay'
-import { Toast, useSubscribe, useToast } from '../../shared/util'
+import { Toast, useToast } from '../../shared/util'
 
 interface Props {
   refreshKey: number
   petAction: { action: string; at: number } | null
 }
+
+/** 选中日详情各分区初始可见条数(PERF-02):只影响渲染切片,不裁剪业务数据 */
+const DETAIL_PAGE_SIZE = 50
 
 export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
   const today = toDateStr(new Date())
@@ -19,14 +22,22 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
   const [editor, setEditor] = useState<CalendarEvent | 'new' | null>(null)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [toast, showToast] = useToast()
+  // 选中日详情各分区可见上限;切日时重置(见下方 effect)
+  const [agendaLimits, setAgendaLimits] = useState({ events: DETAIL_PAGE_SIZE, todos: DETAIL_PAGE_SIZE })
+  // PERF-02:请求代号防显示回退——切日/切月/刷新后,晚到的旧日期/旧月份响应一律丢弃
+  const monthReqRef = useRef(0)
+  const dayReqRef = useRef(0)
+  const prevSelectedRef = useRef(selected)
 
   const monthStart = useMemo(() => `${cursor.y}-${pad(cursor.m)}-01`, [cursor])
 
   const reload = useCallback((): void => {
     // 读取整个月(含前后各 7 天以覆盖跨月事件)
+    const token = ++monthReqRef.current
     const from = addDaysStr(`${cursor.y}-${pad(cursor.m)}-01`, -7)
     const to = addDaysStr(nextMonth(cursor.y, cursor.m) + '-01', 7)
     void window.api.listEvents(from + 'T00:00', to + 'T23:59').then((events) => {
+      if (monthReqRef.current !== token) return // 已有更新的月份请求,丢弃旧响应
       const map: Record<string, CalendarEvent[]> = {}
       for (const ev of events) {
         const d = ev.startAt.slice(0, 10)
@@ -39,6 +50,7 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
     void Promise.all(
       days.map((d) => window.api.getDayAgenda(d).then((a) => [d, a.courses] as const))
     ).then((entries) => {
+      if (monthReqRef.current !== token) return // 已有更新的月份请求,丢弃旧响应
       const map: Record<string, CourseOccurrence[]> = {}
       for (const [d, c] of entries) map[d] = c
       setCoursesByDay(map)
@@ -49,16 +61,34 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
     reload()
   }, [reload, refreshKey])
 
+  // 刷新入口:挂载 + App 在 evt:data-changed 时统一递增的 refreshKey(refreshKey 变化
+  // 同时经日详情效应重取选中日 agenda)。页面不再自行订阅 evt:data-changed,
+  // 否则同一次写入会触发两次整月重载(listEvents + 31 次 getDayAgenda,PERF-02)。
+
   useEffect(() => {
-    void window.api.getDayAgenda(selected).then(setAgenda)
+    const token = ++dayReqRef.current
+    void window.api.getDayAgenda(selected).then((a) => {
+      if (dayReqRef.current !== token) return // 已切到别的日期,丢弃旧日期响应
+      setAgenda(a)
+    })
   }, [selected, refreshKey, editor])
+
+  // 切日重置详情各分区可见上限(仅日期变化时;同日的刷新/编辑关闭不折叠)
+  useEffect(() => {
+    if (prevSelectedRef.current !== selected) {
+      prevSelectedRef.current = selected
+      setAgendaLimits({ events: DETAIL_PAGE_SIZE, todos: DETAIL_PAGE_SIZE })
+    }
+  }, [selected])
 
   // 桌宠"新建日程"
   useEffect(() => {
     if (petAction?.action === 'new-event') setEditor('new')
   }, [petAction])
 
-  useSubscribe('evt:data-changed', useCallback(() => reload(), [reload]))
+  // 刷新入口:挂载 + App 在 evt:data-changed 时统一递增的 refreshKey(refreshKey 变化
+  // 同时经日详情效应重取选中日 agenda)。页面不再自行订阅 evt:data-changed,
+  // 否则同一次写入会触发两次整月重载(listEvents + 31 次 getDayAgenda,PERF-02)。
 
   const save = async (input: EventInput, id?: string): Promise<void> => {
     try {
@@ -73,7 +103,8 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
     }
     setSaveError(null)
     setEditor(null)
-    reload()
+    // 网格刷新由 evt:data-changed 广播驱动(写通道统一经主进程 writeNotify 广播),
+    // 日详情随编辑器关闭经 [selected, refreshKey, editor] 效应重取;不手动重拉整月(PERF-02)
     showToast('已保存')
   }
 
@@ -162,7 +193,18 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
         </div>
 
         {/* 日详情 */}
-        <div className="card" data-agenda-date={selected} style={{ width: 300, flexShrink: 0 }}>
+        <div
+          className="card"
+          data-agenda-date={selected}
+          data-agenda-total={agenda ? agenda.courses.length + agenda.events.length + agenda.todos.length + agenda.schoolEvents.length : 0}
+          data-agenda-visible={agenda
+            ? agenda.courses.length +
+              Math.min(agenda.events.length, agendaLimits.events) +
+              Math.min(agenda.todos.length, agendaLimits.todos) +
+              agenda.schoolEvents.length
+            : 0}
+          style={{ width: 300, flexShrink: 0 }}
+        >
           <h3>
             {selected} {weekdayCn(dayOfWeek(selected))}
           </h3>
@@ -184,19 +226,36 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
                   </span>
                 </div>
               ))}
-              {agenda.events.map((ev) => (
-                <div key={ev.id} className="list-row">
-                  <span className="chip event">
-                    {ev.allDay ? '全天' : `${fmtTime(ev.startAt)}-${fmtTime(ev.endAt)}`}
-                  </span>
-                  <span style={{ flex: 1 }} onClick={() => setEditor(ev)} role="button">
-                    {ev.title}
-                  </span>
-                  <button className="ghost danger" onClick={() => void delEvent(ev.id)}>
-                    删
-                  </button>
-                </div>
-              ))}
+              {(() => {
+                // PERF-02:事件/待办分区 50 条分页——切片渲染,总数与继续加载可见,业务数据不裁剪
+                const visibleEvents = agenda.events.slice(0, agendaLimits.events)
+                const hiddenEvents = agenda.events.length - visibleEvents.length
+                return (
+                  <>
+                    {visibleEvents.map((ev) => (
+                      <div key={ev.id} className="list-row">
+                        <span className="chip event">
+                          {ev.allDay ? '全天' : `${fmtTime(ev.startAt)}-${fmtTime(ev.endAt)}`}
+                        </span>
+                        <span style={{ flex: 1 }} onClick={() => setEditor(ev)} role="button">
+                          {ev.title}
+                        </span>
+                        <button className="ghost danger" onClick={() => void delEvent(ev.id)}>
+                          删
+                        </button>
+                      </div>
+                    ))}
+                    {hiddenEvents > 0 && (
+                      <div className="muted" style={{ marginBottom: 6 }}>
+                        日程 共 {agenda.events.length} 条,已显示 {visibleEvents.length} 条
+                        <button className="ghost" style={{ marginLeft: 6 }} onClick={() => setAgendaLimits((prev) => ({ ...prev, events: Math.min(agenda.events.length, prev.events + DETAIL_PAGE_SIZE) }))}>
+                          显示更多日程(还有 {hiddenEvents} 条)
+                        </button>
+                      </div>
+                    )}
+                  </>
+                )
+              })()}
               {agenda.schoolEvents.map((s) => (
                 <div key={s.id} className="list-row">
                   <span className="chip school">{schoolLabel(s.type)}</span>
@@ -205,12 +264,28 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
               ))}
               {agenda.todos.length > 0 && (
                 <>
-                  <div className="group-title">当天截止的待办</div>
-                  {agenda.todos.map((t) => (
-                    <div key={t.id} className="list-row">
-                      ☑ {t.title}
-                    </div>
-                  ))}
+                  <div className="group-title">当天截止的待办({agenda.todos.length})</div>
+                  {(() => {
+                    const visibleTodos = agenda.todos.slice(0, agendaLimits.todos)
+                    const hiddenTodos = agenda.todos.length - visibleTodos.length
+                    return (
+                      <>
+                        {visibleTodos.map((t) => (
+                          <div key={t.id} className="list-row">
+                            ☑ {t.title}
+                          </div>
+                        ))}
+                        {hiddenTodos > 0 && (
+                          <div className="muted" style={{ marginBottom: 6 }}>
+                            已显示 {visibleTodos.length} 条
+                            <button className="ghost" style={{ marginLeft: 6 }} onClick={() => setAgendaLimits((prev) => ({ ...prev, todos: Math.min(agenda.todos.length, prev.todos + DETAIL_PAGE_SIZE) }))}>
+                              显示更多待办(还有 {hiddenTodos} 条)
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    )
+                  })()}
                 </>
               )}
               {agenda.courses.length === 0 && agenda.events.length === 0 && agenda.schoolEvents.length === 0 && (
@@ -240,8 +315,8 @@ export function CalendarPage({ refreshKey, petAction }: Props): JSX.Element {
   )
 
   async function delEvent(id: string): Promise<void> {
+    // 网格刷新由 evt:data-changed 广播驱动,不手动重拉整月(PERF-02)
     await window.api.deleteEvent(id)
-    reload()
     showToast('已删除')
   }
 }

@@ -594,6 +594,25 @@ export function listTodos(db: SqliteDb): Todo[] {
   )
 }
 
+/**
+ * 某日截止且未完成的待办(PERF-02 热点查询)。
+ * 语义与 listTodos(db).filter(t => !t.completedAt && t.dueAt && t.dueAt.slice(0, 10) === date) 逐字段一致:
+ * - 谓词等价:completed_at / due_at 只有 NULL 或非空串两种形态,JS 取反与 SQL IS NULL 等价;
+ *   substr(due_at, 1, 10) 与 JS slice(0, 10) 等价(dueAt 为 ASCII 'YYYY-MM-DDTHH:mm' 文本);
+ * - 排序等价:子集相对次序由同一组排序键 (due_at IS NULL), due_at, created_at 决定;
+ * - linkedEvent 附着等价:仅对命中行调用 attachLinkedEvent(全量路径也只对命中行保留附着结果)。
+ * 避免 buildDayAgenda 每次全量物化 todos 并对每条关联行做 getEvent(N+1)。
+ */
+export function listTodosDueOn(db: SqliteDb, date: string): Todo[] {
+  const rows = db.all<Todo>(
+    `SELECT ${TODO_COLS} FROM todos
+     WHERE completed_at IS NULL AND due_at IS NOT NULL AND substr(due_at, 1, 10) = ?
+     ORDER BY (due_at IS NULL), due_at, created_at`,
+    [date]
+  ) as Todo[]
+  return rows.map((t) => attachLinkedEvent(db, t))
+}
+
 export function getTodo(db: SqliteDb, id: string): Todo | undefined {
   const t = db.get<Todo>(`SELECT ${TODO_COLS} FROM todos WHERE id = ?`, [id]) as Todo | undefined
   return t ? attachLinkedEvent(db, t) : undefined

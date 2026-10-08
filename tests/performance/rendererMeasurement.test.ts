@@ -28,6 +28,10 @@ interface Verdict {
 interface TodosSnapshot {
   pageRootPresent: boolean
   recordIds: string[]
+  /** PERF-02 分页锚点:页面声明的业务记录总数;缺省/未声明 = 旧无分页口径 */
+  recordTotal?: number | null
+  /** PERF-02 分页锚点:页面声明的可见行数;缺省/未声明 = 旧无分页口径 */
+  declaredVisible?: number | null
   visibilityState: string
 }
 interface CalendarSnapshot {
@@ -36,6 +40,10 @@ interface CalendarSnapshot {
   agendaDate: string | null
   agendaRowCount: number
   agendaEmptyNote: boolean
+  /** PERF-02 分页锚点:详情面板声明的完整 agenda 行数;缺省 = 旧无分页口径 */
+  agendaTotal?: number | null
+  /** PERF-02 分页锚点:详情面板声明的可见行数;缺省 = 旧无分页口径 */
+  agendaVisible?: number | null
   eventChipCount: number
   visibilityState: string
 }
@@ -85,6 +93,9 @@ describe('PERF-01 观测锚点', () => {
     const source = readSource('src/renderer/workbench/pages/TodosPage.tsx')
     expect(source).toContain('data-page="todos"')
     expect(source).toContain('data-record-id={t.id}')
+    // PERF-02 分页锚点:业务记录总数与可见行数(验证器分页口径依赖)
+    expect(source).toContain('data-record-total={todos.length}')
+    expect(source).toContain('data-visible-count=')
   })
 
   it('CalendarPage.tsx 包含 data-page/data-date/data-agenda-date 观测锚点', () => {
@@ -92,6 +103,9 @@ describe('PERF-01 观测锚点', () => {
     expect(source).toContain('data-page="calendar"')
     expect(source).toContain('data-date={d}')
     expect(source).toContain('data-agenda-date={selected}')
+    // PERF-02 分页锚点:详情完整行数与可见行数(验证器分页口径依赖)
+    expect(source).toContain('data-agenda-total=')
+    expect(source).toContain('data-agenda-visible=')
   })
 
   it('观测锚点不引入测量开关,也不进入普通用户文案(仅作为 DOM 属性)', () => {
@@ -228,6 +242,120 @@ describe('PERF-01 完成条件反例', () => {
       expectedAgendaRows: 0
     })
     expect(verdict).toMatchObject({ pass: true, reason: 'OK' })
+  })
+})
+
+// ---------- PERF-02 分页口径反例(页面声明总数/可见行数时的完成条件) ----------
+
+describe('PERF-02 分页口径:待办完成条件', () => {
+  const expectedIds10k = Array.from({ length: 10000 }, (_, i) => `perf-todo-${i}`)
+
+  it('分页通过路径:声明总数等于种子总数,可见行与声明一致且均为种子 ID', () => {
+    const visible = expectedIds10k.slice(0, 150)
+    const rows = visible.map((id) => `<div data-record-id="${id}"></div>`).join('')
+    document.body.innerHTML = `<div data-page="todos" data-record-total="10000" data-visible-count="150">${rows}</div>`
+    const snapshot = perf.collectTodosSnapshot(document)
+    expect(snapshot.recordTotal).toBe(10000)
+    expect(snapshot.declaredVisible).toBe(150)
+    expect(perf.verifyTodosCompletion(snapshot, { expectedIds: expectedIds10k })).toMatchObject({
+      pass: true,
+      reason: 'OK'
+    })
+  })
+
+  it('声明总数与种子总数不符(数据丢失/虚报)时不能通过', () => {
+    const rows = Array.from({ length: 150 }, (_, i) => `<div data-record-id="perf-todo-${i}"></div>`).join('')
+    document.body.innerHTML = `<div data-page="todos" data-record-total="9999" data-visible-count="150">${rows}</div>`
+    const verdict = perf.verifyTodosCompletion(perf.collectTodosSnapshot(document), { expectedIds: expectedIds10k })
+    expect(verdict.pass).toBe(false)
+    expect(verdict.reason).toBe('RECORD_TOTAL_MISMATCH')
+  })
+
+  it('声明可见行数与 DOM 实际渲染行数不符(含只渲染 1 条的冒充)时不能通过', () => {
+    document.body.innerHTML =
+      '<div data-page="todos" data-record-total="10000" data-visible-count="150"><div data-record-id="perf-todo-0"></div></div>'
+    const verdict = perf.verifyTodosCompletion(perf.collectTodosSnapshot(document), { expectedIds: expectedIds10k })
+    expect(verdict.pass).toBe(false)
+    expect(verdict.reason).toBe('VISIBLE_ROWS_MISMATCH')
+  })
+
+  it('可见行数为 0(空渲染冒充分页)时不能通过', () => {
+    document.body.innerHTML = '<div data-page="todos" data-record-total="10000" data-visible-count="0"></div>'
+    const verdict = perf.verifyTodosCompletion(perf.collectTodosSnapshot(document), { expectedIds: expectedIds10k })
+    expect(verdict.pass).toBe(false)
+    expect(verdict.reason).toBe('VISIBLE_ROWS_MISMATCH')
+  })
+
+  it('可见行出现种子之外的 ID 或重复 ID 时不能通过', () => {
+    const mk = (rows: string): string =>
+      `<div data-page="todos" data-record-total="10000" data-visible-count="2">${rows}</div>`
+    document.body.innerHTML = mk('<div data-record-id="perf-todo-0"></div><div data-record-id="perf-fake"></div>')
+    expect(
+      perf.verifyTodosCompletion(perf.collectTodosSnapshot(document), { expectedIds: expectedIds10k }).reason
+    ).toBe('RECORD_COUNT_MISMATCH')
+    document.body.innerHTML = mk('<div data-record-id="perf-todo-0"></div><div data-record-id="perf-todo-0"></div>')
+    expect(
+      perf.verifyTodosCompletion(perf.collectTodosSnapshot(document), { expectedIds: expectedIds10k }).reason
+    ).toBe('RECORD_COUNT_MISMATCH')
+  })
+
+  it('未声明分页锚点时保持旧口径:全部 ID 必须渲染', () => {
+    document.body.innerHTML =
+      '<div data-page="todos" ><div data-record-id="perf-todo-0"></div></div>'
+    const verdict = perf.verifyTodosCompletion(perf.collectTodosSnapshot(document), { expectedIds: expectedIds10k })
+    expect(verdict.pass).toBe(false)
+    expect(verdict.reason).toBe('RECORD_COUNT_MISMATCH')
+  })
+})
+
+describe('PERF-02 分页口径:日历完成条件', () => {
+  const baseExpectation = (expectedAgendaRows: number): { gridDates: string[]; selectedDate: string; expectedAgendaRows: number } => ({
+    gridDates: CELL_DATES,
+    selectedDate: '2026-10-08',
+    expectedAgendaRows
+  })
+  const mk = (overrides: Partial<CalendarSnapshot>): CalendarSnapshot => ({
+    pageRootPresent: true,
+    cellDates: CELL_DATES,
+    agendaDate: '2026-10-08',
+    agendaRowCount: 100,
+    agendaEmptyNote: false,
+    agendaTotal: 714,
+    agendaVisible: 100,
+    eventChipCount: 0,
+    visibilityState: 'visible',
+    ...overrides
+  })
+
+  it('分页通过路径:声明完整行数等于种子期望,DOM 行数等于声明可见行数', () => {
+    expect(perf.verifyCalendarCompletion(mk({}), baseExpectation(714))).toMatchObject({ pass: true, reason: 'OK' })
+  })
+
+  it('声明完整行数与种子期望不符(虚报总数)时不能通过', () => {
+    const verdict = perf.verifyCalendarCompletion(mk({ agendaTotal: 713 }), baseExpectation(714))
+    expect(verdict.pass).toBe(false)
+    expect(verdict.reason).toBe('AGENDA_ROWS_MISMATCH')
+  })
+
+  it('DOM 明细行数与声明可见行数不符(渲染 1 条冒充)时不能通过', () => {
+    const verdict = perf.verifyCalendarCompletion(mk({ agendaRowCount: 1, agendaVisible: 100 }), baseExpectation(714))
+    expect(verdict.pass).toBe(false)
+    expect(verdict.reason).toBe('AGENDA_ROWS_MISMATCH')
+  })
+
+  it('期望 0 行时仍要求空态可见且声明总数为 0', () => {
+    expect(
+      perf.verifyCalendarCompletion(mk({ agendaRowCount: 0, agendaVisible: 0, agendaTotal: 0, agendaEmptyNote: true }), baseExpectation(0))
+    ).toMatchObject({ pass: true, reason: 'OK' })
+    expect(
+      perf.verifyCalendarCompletion(mk({ agendaRowCount: 0, agendaVisible: 0, agendaTotal: 0, agendaEmptyNote: false }), baseExpectation(0)).reason
+    ).toBe('AGENDA_ROWS_MISMATCH')
+  })
+
+  it('未声明分页锚点时保持旧口径:DOM 行数必须等于完整期望行数', () => {
+    const legacy = { pageRootPresent: true, cellDates: CELL_DATES, agendaDate: '2026-10-08', agendaRowCount: 2, agendaEmptyNote: false, eventChipCount: 0, visibilityState: 'visible' }
+    expect(perf.verifyCalendarCompletion(legacy, baseExpectation(2))).toMatchObject({ pass: true, reason: 'OK' })
+    expect(perf.verifyCalendarCompletion(legacy, baseExpectation(714)).reason).toBe('AGENDA_ROWS_MISMATCH')
   })
 })
 
