@@ -4,6 +4,9 @@
 // 订阅 evt:agent-run-updated / finished 按 runId 过滤、按 seq 去重合并;
 // 进入 awaiting_confirmation 时经 agent:run-approvals 拉取待批提案渲染确认卡;
 // 断线或切页回来时经 agent:run-events 按最后 seq 补发(不重复渲染)。
+// REL-03:finished 无 seq,除权威快照刷新外还按连续游标一次补取完整尾部;
+// 同打开代的排队刷新合并 tail 意图;事件补拉错误独立存放(eventError),
+// 成功快照刷新不清除,只经显式重试或成功补拉清除。
 //
 // 边界(模块规格第 16 节):空输入禁止提交;partial 不可伪装成完整成功;
 // 过期提案禁止批准;渲染层不保存模型 Key。
@@ -113,6 +116,8 @@ export function AgentPage({ refreshKey }: { refreshKey: number }): JSX.Element {
   const [approvals, setApprovals] = useState<AgentApprovalView[]>([])
   const [history, setHistory] = useState<Array<{ runId: string; status: string; input: string; startedAt: string }>>([])
   const [error, setError] = useState<string | null>(null)
+  // REL-03:事件补拉错误独立于主错误区;成功快照刷新不清除,只经显式重试或成功补拉清除
+  const [eventError, setEventError] = useState<string | null>(null)
   const [decideBusy, setDecideBusy] = useState(false)
   // OPS-04:受控澄清回答表单(questionId → 已输入文本)与提交防重
   const [answerDrafts, setAnswerDrafts] = useState<Record<string, string>>({})
@@ -129,20 +134,44 @@ export function AgentPage({ refreshKey }: { refreshKey: number }): JSX.Element {
   const openTokenRef = useRef(0)
   const refreshSeqRef = useRef(0)
   const backfillSeqRef = useRef(0)
-  const refreshQueuedRef = useRef<{ id: string; openToken: number } | null>(null)
+  // REL-03:排队任务携带可选 tail 补拉回调;同打开代的后续合并只叠加意图,不丢弃补拉
+  const refreshQueuedRef = useRef<{ id: string; openToken: number; tail: (() => Promise<void>) | null } | null>(null)
 
-  /** 同一批事件合并一次刷新;切换或卸载后排队任务也失效。 */
-  const queueRefresh = useCallback((id: string, refresh: (id: string) => Promise<void>): void => {
-    const openToken = openTokenRef.current
-    if (runIdRef.current !== id || refreshQueuedRef.current?.openToken === openToken) return
-    const queued = { id, openToken }
-    refreshQueuedRef.current = queued
-    queueMicrotask(() => {
-      if (refreshQueuedRef.current !== queued) return
-      refreshQueuedRef.current = null
-      if (openTokenRef.current === openToken && runIdRef.current === id) void refresh(id)
-    })
-  }, [])
+  /**
+   * 同一批事件合并一次刷新;切换或卸载后排队任务也失效。
+   * REL-03:同一打开代已有排队任务时合并 tail 意图(直接 return 会丢弃补拉,
+   * 导致只收到 finished 时尾事件永久缺失);微任务执行前再次检查 runId 与 openToken。
+   */
+  const queueRefresh = useCallback(
+    (id: string, refresh: (id: string) => Promise<void>, tail?: () => Promise<void>): void => {
+      const openToken = openTokenRef.current
+      if (runIdRef.current !== id) return
+      const existing = refreshQueuedRef.current
+      if (existing && existing.openToken === openToken) {
+        // 同一代的合并:新调用带 tail 则替换意图(最新语义),否则保留既有 tail
+        if (tail) existing.tail = tail
+        return
+      }
+      const queued: { id: string; openToken: number; tail: (() => Promise<void>) | null } = {
+        id,
+        openToken,
+        tail: tail ?? null
+      }
+      refreshQueuedRef.current = queued
+      queueMicrotask(() => {
+        if (refreshQueuedRef.current !== queued) return
+        refreshQueuedRef.current = null
+        if (openTokenRef.current === openToken && runIdRef.current === id) {
+          // 快照读取与 tail 请求各自沿用 refreshSeq/backfillSeq 请求代号,互不干扰
+          void refresh(id).then(() => {
+            // tail 意图属于发起时的打开代:refresh 期间切换运行/epoch 则不再补拉
+            if (openTokenRef.current === openToken && runIdRef.current === id) void queued.tail?.()
+          })
+        }
+      })
+    },
+    []
+  )
 
   const refreshRun = useCallback(
     async (id: string): Promise<void> => {
@@ -205,11 +234,13 @@ export function AgentPage({ refreshKey }: { refreshKey: number }): JSX.Element {
       const result: AgentRunEventsResult = await window.api.getAgentRunEvents(id, after)
       if (openTokenRef.current !== openToken || runIdRef.current !== id || backfillSeqRef.current !== req) return
       appendEvents(result.events)
+      // 成功补齐即清除事件错误;该状态只被成功补拉或显式重试清除,快照刷新不触碰
+      setEventError(null)
     } catch (err) {
-      // 读取失败显示可识别错误并保留已有内容;下次有效事件重新触发补发
+      // 读取失败存入独立事件错误并保留已有内容;成功快照刷新不清除,只经重试或下次成功补拉清除
       if (openTokenRef.current !== openToken || runIdRef.current !== id ||
           backfillSeqRef.current !== req || viewRevisionRef.current !== revision) return
-      setError(err instanceof Error ? err.message : String(err))
+      setEventError(err instanceof Error ? err.message : String(err))
     }
   }, [appendEvents])
 
@@ -229,6 +260,8 @@ export function AgentPage({ refreshKey }: { refreshKey: number }): JSX.Element {
       // 运行切换重置回答表单:答案不泄漏到另一个 run
       setAnswerDrafts({})
       setError(null)
+      // 事件错误同样不跨运行/跨打开代泄漏
+      setEventError(null)
       await Promise.all([refreshRun(id), backfillEvents(id)])
     },
     [refreshRun, backfillEvents]
@@ -290,9 +323,11 @@ export function AgentPage({ refreshKey }: { refreshKey: number }): JSX.Element {
   useSubscribe(Channels.EventAgentRunFinished, (...args: unknown[]) => {
     const payload = args[0] as { run: AgentRunView } | undefined
     if (!payload || payload.run.runId !== runIdRef.current) return
-    // finished 没有 seq，作为失效通知触发权威读取，不直接应用其快照。
+    // finished 没有 seq,作为失效通知触发权威读取与尾事件补拉,不直接应用其快照。
+    // REL-03:广播丢失的中段/尾部事件只能在这里按连续游标补齐,合并进同一排队任务。
+    const id = payload.run.runId
     viewRevisionRef.current += 1
-    queueRefresh(payload.run.runId, refreshRun)
+    queueRefresh(id, refreshRun, () => backfillEvents(id))
     void loadHistory()
   })
   useSubscribe('evt:workspace-epoch-changed', () => {
@@ -485,6 +520,24 @@ export function AgentPage({ refreshKey }: { refreshKey: number }): JSX.Element {
             ))}
             {events.length === 0 && <div className="muted">暂无轨迹事件</div>}
           </div>
+
+          {/* REL-03:事件补拉错误独立显示;重试只补事件,不触发快照刷新 */}
+          {eventError && (
+            <div data-testid="agent-event-error" style={{ color: 'var(--danger, #c62828)', marginTop: 6 }}>
+              事件加载失败:{eventError}
+              <button
+                data-testid="agent-event-retry"
+                className="ghost"
+                style={{ marginLeft: 8 }}
+                onClick={() => {
+                  const id = runIdRef.current
+                  if (id) void backfillEvents(id)
+                }}
+              >
+                重试
+              </button>
+            </div>
+          )}
 
           {/* 结果区:partial 不伪装成功 */}
           {(run.status === 'partial' || run.status === 'failed') && (

@@ -836,7 +836,7 @@ describe('AgentPage T05 事件与刷新版本', () => {
     expect(seqs).toEqual(['#1', '#2', '#3', '#4'])
   })
 
-  it('当前缺口补拉失败显示错误、保留新快照且不自动重试', async () => {
+  it('当前缺口补拉失败:错误进独立事件错误区,保留新快照且不自动重试', async () => {
     const h = installApi({ events: [traceEvent(1, 'plan')] })
     render(<AgentPage refreshKey={0} />)
     await screen.findByTestId('agent-run')
@@ -844,7 +844,9 @@ describe('AgentPage T05 事件与刷新版本', () => {
     await act(async () => {
       h.emit('evt:agent-run-updated', { run: runView({ status: 'succeeded' }), event: traceEvent(3, 'output') })
     })
-    expect(screen.getByTestId('agent-error').textContent).toContain('轨迹补拉失败')
+    // REL-03:事件补拉错误保存在独立 eventError,不占用主错误区
+    expect(screen.getByTestId('agent-event-error').textContent).toContain('轨迹补拉失败')
+    expect(screen.queryByTestId('agent-error')).toBeNull()
     expect(screen.getByTestId('agent-run-status').textContent).toBe('已完成')
     expect(screen.getByTestId('agent-timeline').textContent).toContain('#3')
     expect(window.api.getAgentRunEvents).toHaveBeenCalledTimes(2)
@@ -863,6 +865,7 @@ describe('AgentPage T05 事件与刷新版本', () => {
       stale.reject(new Error('旧轨迹查询失败'))
     })
     expect(screen.queryByTestId('agent-error')).toBeNull()
+    expect(screen.queryByTestId('agent-event-error')).toBeNull()
     expect(screen.getByTestId('agent-run-status').textContent).toBe('已完成')
   })
 
@@ -973,9 +976,199 @@ describe('AgentPage T05 事件与刷新版本', () => {
     expect((screen.getByLabelText('恢复后的问题?') as HTMLTextAreaElement).value).toBe('新库的回答')
     expect(screen.queryByTestId('agent-confirm-card')).toBeNull()
     expect(screen.queryByTestId('agent-error')).toBeNull()
+    expect(screen.queryByTestId('agent-event-error')).toBeNull()
     expect(screen.getByTestId('agent-timeline').textContent).not.toContain('#5')
     expect(vi.mocked(window.api.getAgentRunEvents).mock.calls.at(-1)).toEqual(['run-1', 0])
     await act(async () => h.emit('evt:agent-run-updated', { run: runView(), event: traceEvent(2, 'plan') }))
     expect(screen.getByTestId('agent-run-status').textContent).toBe('执行中')
+  })
+})
+
+// REL-03:finished 尾事件补拉与事件错误独立状态。
+// finished payload 只有 run 没有 seq,它是"本运行不再有后续事件"的失效通知:
+// 权威快照刷新之外,还必须按连续游标一次补取完整尾部,否则广播丢失的尾事件永久缺失。
+describe('AgentPage finished 尾事件补拉与事件错误(REL-03)', () => {
+  /** 从时间线 DOM 提取按序渲染的 seq 文本(#1、#2…) */
+  function renderedSeqs(timeline: HTMLElement): string[] {
+    return Array.from(timeline.querySelectorAll('span'))
+      .map((node) => node.textContent)
+      .filter((text) => /^#\d+$/.test(text ?? ''))
+  }
+
+  it('只发 finished 时按连续游标一次补取尾部事件并显示权威终态', async () => {
+    const allEvents = [
+      traceEvent(1, 'plan', { goal: '第一步' }),
+      traceEvent(2, 'tool_call', { tool: 'todo.list', ok: true }),
+      traceEvent(3, 'output', {})
+    ]
+    const h = installApi({ run: runView(), events: [] })
+    // 首次打开(打开代补发)只返回 seq 1;数据库随后已有 seq 2/3
+    vi.mocked(window.api.getAgentRunEvents)
+      .mockResolvedValueOnce({ run: runView(), events: [allEvents[0]!] })
+      .mockImplementation(async (_id, afterSeq) => ({
+        run: runView({ status: 'succeeded' }),
+        events: allEvents.filter((e) => e.seq > (afterSeq ?? 0))
+      }))
+    // 权威读取:挂载返回执行中,finished 后返回终态
+    const getRunMock = window.api.getAgentRun as ReturnType<typeof vi.fn>
+    getRunMock.mockImplementation(async () =>
+      getRunMock.mock.calls.length > 1 ? runView({ status: 'succeeded' }) : runView()
+    )
+    render(<AgentPage refreshKey={0} />)
+    await screen.findByTestId('agent-run')
+    await waitFor(() => expect(window.api.getAgentRunEvents).toHaveBeenCalledWith('run-1', 0))
+    expect(screen.getByTestId('agent-timeline').textContent).toContain('#1')
+    // 丢弃所有最后 updated,只发送 finished:尾事件只能经 finished 触发的补拉恢复
+    await act(async () => {
+      h.emit('evt:agent-run-finished', { run: runView({ status: 'succeeded' }) })
+    })
+    // 从连续游标 1 一次补取完整尾部
+    expect(window.api.getAgentRunEvents).toHaveBeenCalledWith('run-1', 1)
+    const timeline = screen.getByTestId('agent-timeline')
+    await waitFor(() => expect(timeline.textContent).toContain('#3'))
+    expect(renderedSeqs(timeline)).toEqual(['#1', '#2', '#3'])
+    expect(screen.getByTestId('agent-run-status').textContent).toBe('已完成')
+  })
+
+  it('重复 finished 只合并一次权威刷新与尾事件补拉', async () => {
+    const h = installApi()
+    vi.mocked(window.api.getAgentRunEvents).mockResolvedValue({ run: runView(), events: [] })
+    vi.mocked(window.api.getAgentRun).mockResolvedValue(runView({ status: 'succeeded' }))
+    render(<AgentPage refreshKey={0} />)
+    await screen.findByTestId('agent-run')
+    await waitFor(() => expect(window.api.getAgentRunEvents).toHaveBeenCalledWith('run-1', 0))
+    await act(async () => {
+      h.emit('evt:agent-run-finished', { run: runView({ status: 'succeeded' }) })
+      h.emit('evt:agent-run-finished', { run: runView({ status: 'succeeded' }) })
+    })
+    // 打开代补发 + 一次尾部补拉;第二次 finished 合并进同一排队任务,不重复刷新/补拉
+    expect(window.api.getAgentRunEvents).toHaveBeenCalledTimes(2)
+    expect(window.api.getAgentRun).toHaveBeenCalledTimes(2)
+  })
+
+  it('已收到 seq 3 但缺 seq 2 时,finished 尾部补拉补齐缺口', async () => {
+    const allEvents = [
+      traceEvent(1, 'plan', { goal: 'g1' }),
+      traceEvent(2, 'tool_call', { tool: 'todo.list', ok: true }),
+      traceEvent(3, 'output', {})
+    ]
+    const h = installApi({ events: [allEvents[0]!] })
+    // 权威读取:finished 后返回终态
+    vi.mocked(window.api.getAgentRun).mockResolvedValue(runView({ status: 'succeeded' }))
+    vi.mocked(window.api.getAgentRunEvents)
+      .mockResolvedValueOnce({ run: runView(), events: [allEvents[0]!] }) // 打开代:只有 #1
+      .mockResolvedValueOnce({ run: runView(), events: [] }) // seq3 缺口自动补拉:#2 仍未取到
+      .mockResolvedValue({ run: runView(), events: [allEvents[1]!] }) // finished 尾部:补回 #2
+    render(<AgentPage refreshKey={0} />)
+    await screen.findByTestId('agent-run')
+    await waitFor(() => expect(window.api.getAgentRunEvents).toHaveBeenCalledWith('run-1', 0))
+    await act(async () => {
+      h.emit('evt:agent-run-updated', { run: runView(), event: allEvents[2]! })
+    })
+    await waitFor(() => expect(window.api.getAgentRunEvents).toHaveBeenCalledWith('run-1', 1))
+    await act(async () => {
+      h.emit('evt:agent-run-finished', { run: runView({ status: 'succeeded' }) })
+    })
+    await waitFor(() => expect(screen.getByTestId('agent-run-status').textContent).toBe('已完成'))
+    expect(renderedSeqs(screen.getByTestId('agent-timeline'))).toEqual(['#1', '#2', '#3'])
+  })
+
+  it('尾部补拉拒绝:事件错误独立显示且不被成功快照刷新清除,重试只补事件', async () => {
+    const h = installApi()
+    vi.mocked(window.api.getAgentRunEvents).mockResolvedValue({ run: runView(), events: [] })
+    vi.mocked(window.api.getAgentRun).mockResolvedValue(runView({ status: 'succeeded' }))
+    render(<AgentPage refreshKey={0} />)
+    await screen.findByTestId('agent-run')
+    await waitFor(() => expect(window.api.getAgentRunEvents).toHaveBeenCalledWith('run-1', 0))
+    // 只发送 finished;尾部补拉拒绝
+    vi.mocked(window.api.getAgentRunEvents).mockRejectedValueOnce(new Error('轨迹服务不可用'))
+    await act(async () => {
+      h.emit('evt:agent-run-finished', { run: runView({ status: 'succeeded' }) })
+    })
+    // 终态照常应用,事件错误独立显示;主错误区不被污染
+    await waitFor(() =>
+      expect(screen.getByTestId('agent-event-error').textContent).toContain('轨迹服务不可用')
+    )
+    expect(screen.getByTestId('agent-event-error').textContent).toContain('事件加载失败')
+    expect(screen.getByTestId('agent-run-status').textContent).toBe('已完成')
+    expect(screen.queryByTestId('agent-error')).toBeNull()
+    // 成功快照刷新不清除事件错误:再来一次 finished,快照成功而补拉仍失败
+    vi.mocked(window.api.getAgentRunEvents).mockRejectedValueOnce(new Error('补拉仍然失败'))
+    await act(async () => {
+      h.emit('evt:agent-run-finished', { run: runView({ status: 'succeeded' }) })
+    })
+    expect(screen.getByTestId('agent-event-error').textContent).toContain('补拉仍然失败')
+    expect(screen.queryByTestId('agent-error')).toBeNull()
+    // 重试只补事件:成功补齐后错误清除,事件渲染
+    vi.mocked(window.api.getAgentRunEvents).mockResolvedValue({
+      run: runView(),
+      events: [traceEvent(1, 'plan', { goal: '补齐的事件' })]
+    })
+    fireEvent.click(screen.getByTestId('agent-event-retry'))
+    await waitFor(() => expect(screen.queryByTestId('agent-event-error')).toBeNull())
+    expect(screen.getByTestId('agent-timeline').textContent).toContain('补齐的事件')
+  })
+
+  it('事件错误不跨运行泄漏:切换运行后错误与旧事件不残留', async () => {
+    const h = installApi()
+    vi.mocked(window.api.listAgentRuns).mockResolvedValue([
+      {
+        runId: 'run-1',
+        mode: 'personal_ops',
+        status: 'executing',
+        input: '第一个运行',
+        errorCode: null,
+        startedAt: '2026-09-28T01:00:00.000Z',
+        finishedAt: null
+      },
+      {
+        runId: 'run-2',
+        mode: 'personal_ops',
+        status: 'executing',
+        input: '第二个运行',
+        errorCode: null,
+        startedAt: '2026-09-28T01:00:00.000Z',
+        finishedAt: null
+      }
+    ])
+    vi.mocked(window.api.getAgentRun).mockImplementation(async (id) =>
+      id === 'run-2' ? runView({ runId: 'run-2', input: '第二个运行' }) : runView({ input: '第一个运行' })
+    )
+    vi.mocked(window.api.getAgentRunEvents).mockImplementation(async (id) => ({
+      run: null,
+      events: [traceEvent(1, 'plan', { goal: `goal-of-${id}` }, id)]
+    }))
+    render(<AgentPage refreshKey={0} />)
+    await waitFor(() => expect(window.api.getAgentRun).toHaveBeenCalledWith('run-1'))
+    vi.mocked(window.api.getAgentRunEvents).mockRejectedValueOnce(new Error('run-1 补拉失败'))
+    await act(async () => {
+      h.emit('evt:agent-run-finished', { run: runView({ status: 'succeeded' }) })
+    })
+    await waitFor(() =>
+      expect(screen.getByTestId('agent-event-error').textContent).toContain('run-1 补拉失败')
+    )
+    fireEvent.click(screen.getAllByTestId('agent-history-item')[1]!)
+    // 切换运行后:错误不残留,run-2 的事件正常渲染,run-1 的事件不泄漏
+    await waitFor(() => expect(screen.getByTestId('agent-timeline').textContent).toContain('goal-of-run-2'))
+    expect(screen.queryByTestId('agent-event-error')).toBeNull()
+    expect(screen.getByTestId('agent-timeline').textContent).not.toContain('goal-of-run-1')
+  })
+
+  it('finished 后立即卸载:排队的刷新与尾事件补拉不执行', async () => {
+    const h = installApi()
+    const { unmount } = render(<AgentPage refreshKey={0} />)
+    await screen.findByTestId('agent-run')
+    await waitFor(() => expect(window.api.getAgentRunEvents).toHaveBeenCalledWith('run-1', 0))
+    const eventCallsBefore = vi.mocked(window.api.getAgentRunEvents).mock.calls.length
+    const runCallsBefore = vi.mocked(window.api.getAgentRun).mock.calls.length
+    await act(async () => {
+      h.emit('evt:agent-run-finished', { run: runView({ status: 'succeeded' }) })
+      unmount()
+    })
+    // 微任务冲刷后:卸载使排队任务失效,不产生新的权威读取或尾事件补拉
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(vi.mocked(window.api.getAgentRun).mock.calls.length).toBe(runCallsBefore)
+    expect(vi.mocked(window.api.getAgentRunEvents).mock.calls.length).toBe(eventCallsBefore)
   })
 })
