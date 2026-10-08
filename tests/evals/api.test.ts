@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest'
 import { createHash } from 'node:crypto'
-import { EvalsService, loadEvalsDataset, AUTO_FAKE_CONFIG_ID, EVAL_START_LIMITS, type EvalStartRequest } from '../../src/main/evals/api'
+import { EvalsService, EVAL_START_LIMITS, fixtureCorpusSha256, loadEvalsDataset, AUTO_FAKE_CONFIG_ID, type EvalStartRequest } from '../../src/main/evals/api'
 import { resolveEvalPaths, type EvalResourcePaths } from '../../src/main/evals/resources'
 import { saveFrozenConfig, type FrozenEvalConfig } from '../../src/main/evals/configStore'
 import type { EvalRunState } from '../../src/main/evals/runner'
@@ -15,6 +15,7 @@ import { authorizeIpc, type IpcPolicyEvent, type IpcPolicyWindow } from '../../s
 import { Channels } from '../../src/shared/api'
 import { createRealCompleterFor } from '../../src/main/evals/realAdapter'
 import { exportCaseArtifacts } from '../../src/main/evals/artifacts'
+import { expandExperimentItems, selectExplicitSmokeCases } from '../../src/main/evals/experiment'
 
 const REPO_ROOT = resolve(__dirname, '..', '..')
 const REPO_DATASETS = join(REPO_ROOT, 'evals', 'datasets')
@@ -36,9 +37,51 @@ it('schema 2 冻结配置经真实适配器执行指定 dev 用例，两模板�
     realCompleterFor: createRealCompleterFor({ credentialOf, fetchImpl }) })
   const pair = service.freeze({ experimentId: 'integration', datasetVersion: 'personal_ops_v2', stage: 'ops-planning', executionKind: 'real',
     target: { providerId: 'frozen-a', protocol: 'chat-completions', baseUrl: 'https://a.example.invalid/v1', model: 'model-a' } })
+  // EVAL-02 真实启动门:构造已签发 release 与本次批次授权(无密钥),经服务层预检
+  const dataset = loadEvalsDataset(paths.datasetRoot, 'personal_ops_v2')
+  const releaseFile = join(userData, 'data-release.json')
+  writeFileSync(releaseFile, JSON.stringify({
+    status: 'SIGNED',
+    signing: { status: 'SIGNED', signedBy: 'api-test', signedAt: '2026-10-08T00:00:00.000Z' },
+    bindings: {
+      personal_ops_v2: { datasetTreeSha256: '1'.repeat(64), casesJsonlSha256: dataset.casesSha256 },
+      rubric: { version: 'rubric-v1' }
+    },
+    reviewPackage: { coverage: { humanReviewed: 1, required: 1 } }
+  }), 'utf-8')
   const configIds = [pair.baseline.config.configId, pair.candidate.config.configId]
+  const smokeIds = ['ops-read-01']
+  const maximumRequests = expandExperimentItems(
+    selectExplicitSmokeCases(dataset.cases, smokeIds),
+    configIds.map((configId, index) => ({ configId, pipelineVariant: index === 0 ? 'baseline' as const : 'candidate' as const })),
+    1
+  ).reduce((sum, item) => sum + item.maxModelCalls, 0)
+  const authorizationFile = join(userData, 'authorization.json')
+  writeFileSync(authorizationFile, JSON.stringify({
+    schemaVersion: 1,
+    kind: 'eval-real-authorization',
+    authorizationId: 'auth-api-test',
+    releaseFile,
+    issuedAtUtc: '2026-10-01T00:00:00.000Z',
+    validUntilUtc: '2026-12-31T00:00:00.000Z',
+    batch: { experimentId: 'integration', label: 'smoke', splits: ['dev'] },
+    providerId: 'frozen-a',
+    targetSha256: pair.baseline.config.targetSha256,
+    configHashes: Object.fromEntries(configIds.map((configId, index) => [configId, index === 0 ? pair.baseline.sha256 : pair.candidate.sha256])),
+    dataScope: {
+      personal_ops_v2: {
+        casesSha256: dataset.casesSha256,
+        fixtureSha256: fixtureCorpusSha256(paths.fixtureRoot, [...new Set(dataset.cases.map((c) => c.fixture_id))]),
+        rubricVersion: 'rubric-v1'
+      }
+    },
+    maxRequests: maximumRequests,
+    pricing: { source: 'api-test', notedAtUtc: '2026-10-08T00:00:00.000Z', estimateBasis: '现算上界', currency: null, authorizedAmount: null },
+    providerHardLimit: { available: false, note: '测试' },
+    requiresHardCostCap: false
+  }), 'utf-8')
   const { evalRunId } = service.startBatch({ datasetVersion: 'personal_ops_v2', split: 'dev', executionKind: 'real', configIds,
-    repeats: 1, maxCases: 2, caseIds: ['ops-read-01'] })
+    repeats: 1, maxCases: 2, caseIds: ['ops-read-01'], approval: { authorizationFile } })
   const state = await waitTerminal(service, evalRunId)
   expect(state.status).toBe('completed')
   expect(state.caseIds).toEqual(['ops-read-01'])

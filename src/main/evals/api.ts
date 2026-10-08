@@ -63,7 +63,22 @@ import type { ReviewAnnotation, ReviewDecision } from './reviews'
 import type { EvalFreezeVersions, FreezeInput } from '../../shared/evals'
 import type { RealCompleterFor } from './realAdapter'
 import { freezeExperiment, validateFrozenExperiment, type FrozenExperimentPair } from './freeze'
-import { selectExplicitSmokeCases } from './experiment'
+import {
+  expandExperimentItems,
+  maximumRequestCount,
+  selectExplicitSmokeCases,
+  type ExperimentConfigRef
+} from './experiment'
+import {
+  appendApprovalIntent,
+  assertNoUnclearApprovalIntents,
+  approvedRequestCountFor,
+  authorizationReleaseFile,
+  PreflightError,
+  updateApprovalIntent,
+  validateRealPreflight,
+  type ApprovalIntentRecord
+} from './realPreflight'
 
 // ---------- 依赖契约 ----------
 
@@ -94,6 +109,16 @@ export interface EvalStartRequest {
   repeats: number
   maxCases: number
   caseIds?: string[]
+  /**
+   * EVAL-02 真实启动门:real 执行必须提供授权文件(其 releaseFile 字段定位
+   * 数据 release);fake 不要求。缺省或文件无效在服务层确定性拒绝——CLI 与
+   * 桌面调用经过同一道门。授权文件无密钥,密钥只经进程内凭据注入。
+   */
+  approval?: {
+    authorizationFile: string
+    /** 可选显式定位;与授权文件内绑定的 releaseFile 不一致即拒绝 */
+    releaseFile?: string
+  }
 }
 
 /** 服务端启动上限(渲染层输入不可信,预算与数量在此收口) */
@@ -203,8 +228,9 @@ function stableSha256(value: unknown): string {
  * 磁盘上存在的 fixture(研究语料)按目录名+文件名+内容 hash 参与;
  * 代码内置的 ops fixture(不在磁盘)以 id 固定进 hash(其行为由
  * toolsVersion/codeCommit 冻结字段承载)。研究语料目录缺失仍显式报错。
+ * (导出:EVAL-02 真实启动预检与授权 dataScope 绑定使用同一口径。)
  */
-function fixtureCorpusSha256(fixtureRoot: string, fixtureIds: readonly string[]): string {
+export function fixtureCorpusSha256(fixtureRoot: string, fixtureIds: readonly string[]): string {
   const entries: Array<{ fixture: string; corpus: Array<{ name: string; sha256: string }> | null }> = []
   for (const fixtureId of [...fixtureIds].sort()) {
     const dir = join(fixtureRoot, fixtureId)
@@ -487,17 +513,123 @@ export class EvalsService {
       if (config.schemaVersion === 2) this.validateExperiment(config.configId)
       else if (params.executionKind === 'real') throw validationError('real 新实验需要 schema 2 和冻结 target')
     }
+    // 3.5) EVAL-02 真实启动门(EvalsService 层,CLI 与桌面同门):预检全部
+    //      拒绝路径都在创建 runner / 发送任何请求之前失败;fake 不走本门,
+    //      保留上方的数据 hash 一致性检查。
+    interface RegisteredApproval {
+      intentId: string
+      authorizationId: string
+      authorizationSha256: string
+      maximumRequests: number
+    }
+    let approval: RegisteredApproval | null = null
+    if (params.executionKind === 'real') {
+      if (!params.approval?.authorizationFile) {
+        throw validationError(
+          'real 执行需要授权文件(startBatch approval.authorizationFile,其 releaseFile 字段定位数据 release;CLI 传 --approval-file;桌面同门,不提供即拒绝)'
+        )
+      }
+      const providerIds = new Set(configs.map((c) => c.providerId))
+      if (providerIds.size !== 1) {
+        throw validationError(
+          `real 一次批次只允许单一 providerId(凭据按 providerId 精确绑定),收到:${[...providerIds].join(', ')}`
+        )
+      }
+      const rubricVersions = new Set(configs.map((c) => c.rubricVersion))
+      if (rubricVersions.size !== 1) {
+        throw validationError(`real 批次配置的 rubricVersion 必须一致,收到:${[...rubricVersions].join(', ')}`)
+      }
+      const targetSha256s = new Set(configs.map((c) => c.targetSha256 ?? ''))
+      if (targetSha256s.size !== 1 || targetSha256s.has('')) {
+        throw validationError('real 批次配置必须共享同一冻结 targetSha256(schema 2)')
+      }
+      try {
+        // 请求数上限以 maximumRequestCount 按实际案例预算现算(默认预算 6 的
+        // 全量算术上界 3276 仅为参照;现算值随 budgets 与 case 清单变化)
+        const selectedCases =
+          params.caseIds !== undefined
+            ? selectExplicitSmokeCases(dataset.cases, params.caseIds)
+            : dataset.cases.filter((c) => c.split === params.split)
+        const configRefs: ExperimentConfigRef[] = configs.map((c) => ({
+          configId: c.configId,
+          pipelineVariant: c.pipelineVariant
+        }))
+        const expectedItems = expandExperimentItems(selectedCases, configRefs, params.repeats)
+        const maximumRequests = maximumRequestCount(expectedItems)
+        const preflight = validateRealPreflight({
+          releaseFile: params.approval.releaseFile ?? authorizationReleaseFile(params.approval.authorizationFile),
+          authorizationFile: params.approval.authorizationFile,
+          datasetVersion: params.datasetVersion,
+          datasetSha256: dataset.casesSha256,
+          fixtureSha256: fixtureCorpusSha256(fixtureRoot, [...new Set(dataset.cases.map((c) => c.fixture_id))]),
+          rubricVersion: configs[0]!.rubricVersion,
+          configHashes: Object.fromEntries(configs.map((c) => [c.configId, frozenConfigSha256(c)])),
+          targetSha256: configs[0]!.targetSha256!,
+          expectedItems,
+          maximumRequests,
+          nowUtc: new Date().toISOString(),
+          splits: [params.split],
+          // 凭据门:credentialOf 已在上面解析过全部配置的 providerId
+          credentialProviderId: configs[0]!.providerId
+        })
+        // 授权批次台账:已批准次数累计不重置;发送状态不明(launching)即暂停核对
+        assertNoUnclearApprovalIntents(artifactRoot, preflight.authorizationId)
+        const approvedSoFar = approvedRequestCountFor(artifactRoot, preflight.authorizationId)
+        if (approvedSoFar + preflight.maximumRequests > preflight.authorization.maxRequests) {
+          throw new PreflightError(
+            'REQUEST_BUDGET_EXCEEDED',
+            `授权 ${preflight.authorizationId} 请求数累计超限:已批准 ${approvedSoFar} + 本次 ${preflight.maximumRequests} > 授权上限 ${preflight.authorization.maxRequests}`
+          )
+        }
+        approval = {
+          intentId: `intent-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`,
+          authorizationId: preflight.authorizationId,
+          authorizationSha256: preflight.authorizationSha256,
+          maximumRequests: preflight.maximumRequests
+        }
+        console.error(
+          `[evals] 真实启动预检通过:authorization=${preflight.authorizationId} maximumRequests=${preflight.maximumRequests} releases=${params.approval.authorizationFile}`
+        )
+      } catch (err) {
+        if (err instanceof PreflightError) {
+          throw validationError(`真实启动预检拒绝(${err.code}):${err.message}`)
+        }
+        throw err
+      }
+    }
     // 4) fixture 语料根注入:case 执行器不再从 cwd 推导(打包/CLI 关键)
     setResearchFixtureRoot(fixtureRoot)
 
     const evalRunId = `eval-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`
+    if (approval !== null) {
+      // 先登记 intent(launching)再创建 runner:崩溃后该状态即发送状态不明,
+      // 后续真实启动会被 assertNoUnclearApprovalIntents 暂停,直到人工核对
+      const nowUtc = new Date().toISOString()
+      const record: ApprovalIntentRecord = {
+        intentId: approval.intentId,
+        authorizationId: approval.authorizationId,
+        authorizationSha256: approval.authorizationSha256,
+        evalRunId,
+        datasetVersion: params.datasetVersion,
+        split: params.split,
+        configIds: [...params.configIds],
+        maximumRequests: approval.maximumRequests,
+        state: 'launching',
+        registeredAtUtc: nowUtc,
+        updatedAtUtc: nowUtc,
+        finishedAtUtc: null
+      }
+      appendApprovalIntent(artifactRoot, record)
+    }
     const runner = new EvalRunner(
       {
         artifactRoot,
         sqlJsDistDir: this.deps.sqlJsDistDir,
         dataset,
         completerFactory: this.completerFactory(),
-        datasetRoot,
+        // EVAL-03 契约:research gold 标注从 <datasetRoot>/<datasetVersion>/annotations
+        // 读取(runner.goldFor 与 researchIntegration 同一口径;传版本目录,不传父根)
+        datasetRoot: join(datasetRoot, dataset.manifest.dataset_version),
         // 领取前控制点(IPC 不传;测试注入确定性取消时机)
         beforeClaim: hooks?.beforeClaim
       },
@@ -518,6 +650,14 @@ export class EvalsService {
       }
     )
     this.running.set(evalRunId, runner)
+    if (approval !== null) {
+      // runner 已创建并即将调度:确认启动(launching → running)。
+      // run() 的同步段不发送任何请求,此更新必然先于第一次真实发送落盘。
+      updateApprovalIntent(artifactRoot, approval.intentId, {
+        state: 'running',
+        updatedAtUtc: new Date().toISOString()
+      })
+    }
     void runner
       .run()
       .then((state) => {
@@ -530,6 +670,17 @@ export class EvalsService {
       })
       .finally(() => {
         this.running.delete(evalRunId)
+        if (approval !== null) {
+          try {
+            updateApprovalIntent(artifactRoot, approval.intentId, {
+              state: 'finished',
+              updatedAtUtc: new Date().toISOString(),
+              finishedAtUtc: new Date().toISOString()
+            })
+          } catch (err) {
+            console.error('[evals] 授权 intent 收尾更新失败:', err instanceof Error ? err.message : String(err))
+          }
+        }
       })
     return { evalRunId, status: 'running' }
   }
