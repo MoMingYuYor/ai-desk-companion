@@ -423,11 +423,15 @@ export class ModelRouter {
     // 合并"用户取消"与"单次超时"两个信号
     const controller = new AbortController()
     const timer = AbortSignal.timeout(timeoutMs)
-    timer.addEventListener('abort', () => controller.abort(timer.reason), { once: true })
-    if (options.signal) {
-      if (options.signal.aborted) controller.abort(options.signal.reason)
-      else options.signal.addEventListener('abort', () => controller.abort(options.signal!.reason), { once: true })
-    }
+    // REL-01:具名回调,结束时在 finally 成对移除——旧实现注册匿名监听器从不移除,
+    // 每次普通 Chat 请求都会泄漏 timer/外部 signal 上的 abort 监听器
+    const onTimeout = (): void => controller.abort(timer.reason)
+    const onExternalAbort = (): void => controller.abort(options.signal?.reason)
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
+    let readCompleted = false
+    timer.addEventListener('abort', onTimeout, { once: true })
+    if (options.signal?.aborted) onExternalAbort()
+    else options.signal?.addEventListener('abort', onExternalAbort, { once: true })
     const signal: AbortSignal = controller.signal
     const { provider } = attempt
     const headers: Record<string, string> = { 'Content-Type': 'application/json' }
@@ -453,57 +457,80 @@ export class ModelRouter {
       }
     }
 
-    const res = await this.fetchImpl(joinUrl(provider.baseUrl, path), {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal
-    })
-    if (!res.ok) {
-      const text = await res.text().catch(() => '')
-      const err = new Error(describeHttpError(res.status, text))
-      if (!isRetryableStatus(res.status)) throw new NonRetryableError(err.message)
-      throw err
-    }
-    if (!res.body) throw new Error('服务未返回流式响应体')
+    // REL-01:try/finally 覆盖整个 fetch 与消费周期,Promise 完成前完成清理
+    try {
+      const res = await this.fetchImpl(joinUrl(provider.baseUrl, path), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal
+      })
+      if (!res.ok) {
+        const text = await res.text().catch(() => '')
+        const err = new Error(describeHttpError(res.status, text))
+        if (!isRetryableStatus(res.status)) throw new NonRetryableError(err.message)
+        throw err
+      }
+      if (!res.body) throw new Error('服务未返回流式响应体')
 
-    const reader = res.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-    let full = ''
-    let sawDone = false
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split(/\r?\n/)
-      buffer = lines.pop() ?? ''
-      for (const line of lines) {
-        const trimmed = line.trim()
-        if (!trimmed.startsWith('data:')) continue
-        const data = trimmed.slice(5).trim()
-        if (data === '[DONE]') {
-          sawDone = true
-          continue
+      reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let full = ''
+      let sawDone = false
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) {
+          // REL-01:仅真实 EOF 置位;[DONE] 只是协议标记,底层 reader 仍需继续读到 done
+          readCompleted = true
+          break
         }
-        if (!data) continue
-        let json: Record<string, unknown>
-        try {
-          json = JSON.parse(data) as Record<string, unknown>
-        } catch {
-          continue
-        }
-        const delta = extractDelta(json, provider.protocol)
-        if (delta) {
-          full += delta
-          options.onDelta?.(delta)
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split(/\r?\n/)
+        buffer = lines.pop() ?? ''
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed.startsWith('data:')) continue
+          const data = trimmed.slice(5).trim()
+          if (data === '[DONE]') {
+            sawDone = true
+            continue
+          }
+          if (!data) continue
+          let json: Record<string, unknown>
+          try {
+            json = JSON.parse(data) as Record<string, unknown>
+          } catch {
+            continue
+          }
+          const delta = extractDelta(json, provider.protocol)
+          if (delta) {
+            full += delta
+            options.onDelta?.(delta)
+          }
         }
       }
+      if (!sawDone && full.length === 0) {
+        throw new Error('模型没有返回任何内容(连接提前中断)')
+      }
+      return full
+    } finally {
+      // REL-01:监听器成对移除;未读到 EOF 的流先 abort 在途网络再 cancel,最后释放锁。
+      // 清理失败一律吞掉,不覆盖原始传输/回调错误或成功结果。
+      timer.removeEventListener('abort', onTimeout)
+      options.signal?.removeEventListener('abort', onExternalAbort)
+      if (reader) {
+        if (!readCompleted) {
+          controller.abort()
+          try {
+            await reader.cancel()
+          } catch { /* 保留原始错误 */ }
+        }
+        try {
+          reader.releaseLock()
+        } catch { /* 不覆盖已确定的结果 */ }
+      }
     }
-    if (!sawDone && full.length === 0) {
-      throw new Error('模型没有返回任何内容(连接提前中断)')
-    }
-    return full
   }
 
   async testProvider(input: {

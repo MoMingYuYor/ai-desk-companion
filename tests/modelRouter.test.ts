@@ -646,3 +646,270 @@ describe('T08 受控流观测与资源清理', () => {
     assertListenersRemoved()
   })
 })
+
+// ---------- REL-01 普通 Chat 流资源与监听器清理(无 control 分支) ----------
+
+describe('REL-01 普通 Chat 流资源与监听器清理', () => {
+  const messages: LlmMessage[] = [{ role: 'user', content: 'x' }]
+  let external: AbortController
+  let timeout: AbortController
+
+  beforeEach(() => {
+    external = new AbortController()
+    timeout = new AbortController()
+    // 用受控超时信号触发 abort,不依赖真实时钟;对两个信号 spy 以记录 add/remove 净数
+    vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeout.signal)
+    vi.spyOn(timeout.signal, 'addEventListener')
+    vi.spyOn(timeout.signal, 'removeEventListener')
+    vi.spyOn(external.signal, 'addEventListener')
+    vi.spyOn(external.signal, 'removeEventListener')
+  })
+
+  afterEach(() => vi.restoreAllMocks())
+
+  function deltaFrame(text = 'ok'): string {
+    return `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`
+  }
+  const doneFrame = 'data: [DONE]\n\n'
+
+  /** 可观测假流:记录 reader 的 cancel/releaseLock 调用(与 T08 streamResponse 同模式) */
+  function streamResponse(
+    frames: string[],
+    finish: (controller: ReadableStreamDefaultController<Uint8Array>) => void = (controller) => controller.close()
+  ) {
+    let index = 0
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (index < frames.length) controller.enqueue(new TextEncoder().encode(frames[index++]!))
+        else finish(controller)
+      }
+    }, { highWaterMark: 0 })
+    const acquire = stream.getReader.bind(stream)
+    let cancelReader: () => Promise<void> = async () => {}
+    let releaseReader: () => void = () => {}
+    const cancel = vi.fn(async () => { await cancelReader() })
+    const releaseLock = vi.fn(() => { releaseReader() })
+    vi.spyOn(stream, 'getReader').mockImplementation(() => {
+      const reader = acquire()
+      cancelReader = reader.cancel.bind(reader)
+      releaseReader = reader.releaseLock.bind(reader)
+      vi.spyOn(reader, 'cancel').mockImplementation(cancel)
+      vi.spyOn(reader, 'releaseLock').mockImplementation(releaseLock)
+      return reader
+    })
+    return { response: new Response(stream, { status: 200 }), stream, cancel, releaseLock }
+  }
+
+  /** 监听器净数为零:每次 attempt 对每个信号的 add 都有配对 remove(至少 minAdds 次) */
+  function assertNoListenerLeak(minAdds = 1): void {
+    for (const signal of [timeout.signal, external.signal]) {
+      const added = vi.mocked(signal.addEventListener).mock.calls.filter(([type]) => type === 'abort')
+      const removed = vi.mocked(signal.removeEventListener).mock.calls.filter(([type]) => type === 'abort')
+      expect(added.length).toBeGreaterThanOrEqual(minAdds)
+      expect(removed).toHaveLength(added.length)
+      for (const call of added) {
+        expect(removed.some((r) => r[1] === call[1])).toBe(true)
+      }
+    }
+  }
+
+  it('正常 EOF(含 [DONE]):不 cancel、释放锁、监听器成对移除;返回后 abort 不影响已结束请求', async () => {
+    let requestSignal: AbortSignal
+    const resource = streamResponse([deltaFrame(), deltaFrame('第二段'), doneFrame])
+    const fetchImpl = vi.fn(async (_url: string, init: RequestInit): Promise<Response> => {
+      requestSignal = init.signal as AbortSignal
+      return resource.response
+    })
+    const router = new ModelRouter({ apiKeyOf: keyOf, fetchImpl: fetchImpl as unknown as typeof fetch })
+    const deltas: string[] = []
+    const result = await router.call([provider({ id: 'a', isDefault: true })], {
+      messages,
+      signal: external.signal,
+      onDelta: (d) => deltas.push(d)
+    })
+    expect(result.text).toBe('ok第二段')
+    expect(deltas).toEqual(['ok', '第二段'])
+    // 正常 EOF 不 cancel,但锁必须释放
+    expect(resource.cancel).not.toHaveBeenCalled()
+    expect(resource.releaseLock).toHaveBeenCalledTimes(1)
+    expect(resource.stream.locked).toBe(false)
+    assertNoListenerLeak(1)
+    // 成功返回后再 abort 外部/超时信号:已结束请求不受影响(旧实现残留监听器会误中止)
+    external.abort(new Error('迟到取消'))
+    timeout.abort(new DOMException('迟到超时', 'TimeoutError'))
+    expect(requestSignal!.aborted).toBe(false)
+  })
+
+  it('read 抛错:reader 取消且释放,原始错误传播', async () => {
+    const sourceError = new Error('synthetic read failure')
+    const resource = streamResponse([deltaFrame()], (controller) => controller.error(sourceError))
+    const router = new ModelRouter({ apiKeyOf: keyOf, fetchImpl: (async () => resource.response) as unknown as typeof fetch })
+    await expect(
+      router.call([provider({ id: 'a', isDefault: true })], {
+        messages, maxRetriesPerProvider: 0, signal: external.signal
+      })
+    ).rejects.toThrow('synthetic read failure')
+    expect(resource.cancel).toHaveBeenCalledTimes(1)
+    expect(resource.releaseLock).toHaveBeenCalledTimes(1)
+    expect(resource.stream.locked).toBe(false)
+    assertNoListenerLeak(1)
+  })
+
+  it('onDelta 抛错:reader 取消且释放,原始错误传播', async () => {
+    const resource = streamResponse([deltaFrame()])
+    const router = new ModelRouter({ apiKeyOf: keyOf, fetchImpl: (async () => resource.response) as unknown as typeof fetch })
+    await expect(
+      router.call([provider({ id: 'a', isDefault: true })], {
+        messages, maxRetriesPerProvider: 0, signal: external.signal,
+        onDelta: () => { throw new Error('synthetic delta failure') }
+      })
+    ).rejects.toThrow('synthetic delta failure')
+    expect(resource.cancel).toHaveBeenCalledTimes(1)
+    expect(resource.releaseLock).toHaveBeenCalledTimes(1)
+    expect(resource.stream.locked).toBe(false)
+    assertNoListenerLeak(1)
+  })
+
+  it('读取中外部取消:reader 取消且释放,AbortError 传播,监听器成对移除', async () => {
+    let requestSignal: AbortSignal
+    const resource = streamResponse([deltaFrame()], (controller) => {
+      external.abort(new Error('用户停止'))
+      // 合成传输遵守合并后的 signal,不把在途请求留在后台
+      controller.error(requestSignal.reason)
+    })
+    const fetchImpl = vi.fn(async (_url: string, init: RequestInit): Promise<Response> => {
+      requestSignal = init.signal as AbortSignal
+      return resource.response
+    })
+    const router = new ModelRouter({ apiKeyOf: keyOf, fetchImpl: fetchImpl as unknown as typeof fetch })
+    await expect(
+      router.call([provider({ id: 'a', isDefault: true })], {
+        messages, maxRetriesPerProvider: 0, signal: external.signal
+      })
+    ).rejects.toMatchObject({ name: 'AbortError' })
+    expect(requestSignal!.aborted).toBe(true)
+    expect(resource.cancel).toHaveBeenCalledTimes(1)
+    expect(resource.releaseLock).toHaveBeenCalledTimes(1)
+    expect(resource.stream.locked).toBe(false)
+    assertNoListenerLeak(1)
+  })
+
+  it('超时:合并 signal 按超时原因 abort,reader 取消且释放', async () => {
+    let requestSignal: AbortSignal
+    const timeoutReason = new DOMException('synthetic timeout', 'TimeoutError')
+    const resource = streamResponse([deltaFrame()], (controller) => {
+      timeout.abort(timeoutReason)
+      controller.error(requestSignal.reason)
+    })
+    const fetchImpl = vi.fn(async (_url: string, init: RequestInit): Promise<Response> => {
+      requestSignal = init.signal as AbortSignal
+      return resource.response
+    })
+    const router = new ModelRouter({ apiKeyOf: keyOf, fetchImpl: fetchImpl as unknown as typeof fetch })
+    await expect(
+      router.call([provider({ id: 'a', isDefault: true })], {
+        messages, maxRetriesPerProvider: 0, signal: external.signal
+      })
+    ).rejects.toThrow('synthetic timeout')
+    expect(requestSignal!.aborted).toBe(true)
+    expect(requestSignal!.reason).toBe(timeoutReason)
+    expect(resource.cancel).toHaveBeenCalledTimes(1)
+    expect(resource.releaseLock).toHaveBeenCalledTimes(1)
+    expect(resource.stream.locked).toBe(false)
+    assertNoListenerLeak(1)
+  })
+
+  it('[DONE] 之后流再出错:不视为已完成,reader 取消且原始错误传播', async () => {
+    const lateError = new Error('synthetic post-done failure')
+    const resource = streamResponse([deltaFrame(), doneFrame], (controller) => controller.error(lateError))
+    const router = new ModelRouter({ apiKeyOf: keyOf, fetchImpl: (async () => resource.response) as unknown as typeof fetch })
+    await expect(
+      router.call([provider({ id: 'a', isDefault: true })], {
+        messages, maxRetriesPerProvider: 0, signal: external.signal
+      })
+    ).rejects.toThrow('synthetic post-done failure')
+    expect(resource.cancel).toHaveBeenCalledTimes(1)
+    expect(resource.releaseLock).toHaveBeenCalledTimes(1)
+    expect(resource.stream.locked).toBe(false)
+    assertNoListenerLeak(1)
+  })
+
+  it.each(['HTTP 拒绝', '无 body', '同步 fetch 抛错'] as const)('%s:错误分类不变,监听器成对移除', async (ending) => {
+    const fetchImpl = vi.fn((): Promise<Response> => {
+      if (ending === '同步 fetch 抛错') throw new Error('synthetic connect failure')
+      if (ending === 'HTTP 拒绝') return Promise.resolve(new Response('denied', { status: 403 }))
+      return Promise.resolve(new Response(null, { status: 200 }))
+    })
+    const router = new ModelRouter({ apiKeyOf: keyOf, fetchImpl: fetchImpl as unknown as typeof fetch })
+    await expect(
+      router.call([provider({ id: 'a', isDefault: true })], {
+        messages, maxRetriesPerProvider: 0, signal: external.signal
+      })
+    ).rejects.toBeInstanceOf(ModelCallError)
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    assertNoListenerLeak(1)
+  })
+
+  it('预取消:发送 0 次,直接 AbortError(既有契约不回归)', async () => {
+    const fetchImpl = vi.fn(async (): Promise<Response> => { throw new Error('不应发送') })
+    const router = new ModelRouter({ apiKeyOf: keyOf, fetchImpl: fetchImpl as unknown as typeof fetch })
+    const controller = new AbortController()
+    controller.abort()
+    await expect(
+      router.call([provider({ id: 'a', isDefault: true })], {
+        messages, maxRetriesPerProvider: 0, signal: controller.signal
+      })
+    ).rejects.toMatchObject({ name: 'AbortError' })
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
+  it('20 次重复成功:每次锁释放、cancel 为零、监听器净数为零', async () => {
+    const resources: Array<ReturnType<typeof streamResponse>> = []
+    const fetchImpl = vi.fn(async (): Promise<Response> => {
+      const resource = streamResponse([deltaFrame(), doneFrame])
+      resources.push(resource)
+      return resource.response
+    })
+    const router = new ModelRouter({ apiKeyOf: keyOf, fetchImpl: fetchImpl as unknown as typeof fetch })
+    for (let i = 0; i < 20; i++) {
+      const result = await router.call([provider({ id: 'a', isDefault: true })], {
+        messages, signal: external.signal
+      })
+      expect(result.text).toBe('ok')
+    }
+    expect(resources).toHaveLength(20)
+    for (const resource of resources) {
+      expect(resource.cancel).not.toHaveBeenCalled()
+      expect(resource.releaseLock).toHaveBeenCalledTimes(1)
+      expect(resource.stream.locked).toBe(false)
+    }
+    assertNoListenerLeak(20)
+  })
+
+  it('失败后重试:重试开始前前一个流已释放,监听器净数为零', async () => {
+    const sourceError = new Error('synthetic first failure')
+    const failed = streamResponse([deltaFrame()], (controller) => controller.error(sourceError))
+    let second: ReturnType<typeof streamResponse> | null = null
+    let firstReleasedBeforeRetry = false
+    let attemptNo = 0
+    const fetchImpl = vi.fn(async (): Promise<Response> => {
+      attemptNo += 1
+      if (attemptNo === 1) return failed.response
+      // 第二次发送开始时,第一个流的 reader 必须已取消并释放
+      firstReleasedBeforeRetry = failed.stream.locked === false && failed.cancel.mock.calls.length === 1
+      second = streamResponse([deltaFrame(), doneFrame])
+      return second.response
+    })
+    const router = new ModelRouter({ apiKeyOf: keyOf, fetchImpl: fetchImpl as unknown as typeof fetch })
+    const result = await router.call([provider({ id: 'a', isDefault: true })], {
+      messages, maxRetriesPerProvider: 1, signal: external.signal
+    })
+    expect(result.text).toBe('ok')
+    expect(firstReleasedBeforeRetry).toBe(true)
+    expect(failed.cancel).toHaveBeenCalledTimes(1)
+    expect(failed.releaseLock).toHaveBeenCalledTimes(1)
+    expect(second!.cancel).not.toHaveBeenCalled()
+    expect(second!.stream.locked).toBe(false)
+    assertNoListenerLeak(2)
+  })
+})

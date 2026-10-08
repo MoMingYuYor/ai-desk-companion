@@ -537,7 +537,8 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   })
   handle(Channels.MessagesList, (conversationId: string) => listMessages(db, conversationId))
   handle(Channels.ChatSend, (conversationId: string, text: string) => engine.sendChat(conversationId, text))
-  handle(Channels.ChatStop, (conversationId: string) => engine.stop(conversationId))
+  // REL-02:透传页面绑定的 runId,迟到旧 run 的停止与活动运行不一致时被 engine 忽略(防误停新运行)
+  handle(Channels.ChatStop, (conversationId: string, runId?: string) => engine.stop(conversationId, runId))
   handle(Channels.ChatRetry, (conversationId: string) => engine.retry(conversationId))
   // R8:当前活动运行快照(视图切回);恢复 epoch 后由 invalidateAllRuns 清空
   handle(Channels.ChatActiveRun, (conversationId: string) => engine.getActiveChatRun(conversationId))

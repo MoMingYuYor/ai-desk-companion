@@ -27,13 +27,18 @@ vi.hoisted(() => {
 
 // 导入 preload 即触发 contextBridge.exposeInMainWorld('api', ...)
 import { contextBridge } from 'electron'
+import { Channels } from '../../src/shared/api'
 import { isQualifiedRendererDocument } from '../../src/preload/index'
 
 type OnFn = (channel: string, listener: (...args: unknown[]) => void) => () => void
 
 // vitest 5 迁移:静态导入阶段触发的 mock 调用会在测试开始前被重置,
 // 须以 resetModules + 动态导入获取 exposeInMainWorld 调用记录(与下方 importPreloadWith 同模式)
-async function exposedApi(): Promise<{ on: OnFn; subscribeMail: OnFn }> {
+async function exposedApi(): Promise<{
+  on: OnFn
+  subscribeMail: OnFn
+  stopChat: (conversationId: string, runId?: string) => Promise<void>
+}> {
   vi.resetModules()
   electronMocks.exposeInMainWorld.mockClear()
   ;(globalThis as { window?: unknown }).window = {
@@ -42,7 +47,7 @@ async function exposedApi(): Promise<{ on: OnFn; subscribeMail: OnFn }> {
   await import('../../src/preload/index')
   const call = electronMocks.exposeInMainWorld.mock.calls.find(([name]) => name === 'api')
   if (!call) throw new Error('preload 未暴露 window.api')
-  return call[1] as { on: OnFn; subscribeMail: OnFn }
+  return call[1] as { on: OnFn; subscribeMail: OnFn; stopChat: (conversationId: string, runId?: string) => Promise<void> }
 }
 
 describe('preload 通用 on() 事件通道白名单', () => {
@@ -144,5 +149,19 @@ describe('isQualifiedRendererDocument 判定矩阵', () => {
     expect(isQualifiedRendererDocument(`${dev}/workbench.html`, dev)).toBe(true)
     expect(isQualifiedRendererDocument('http://localhost:5173.evil.com/workbench.html', dev)).toBe(false)
     expect(isQualifiedRendererDocument('http://localhost:9999/workbench.html', dev)).toBe(false)
+  })
+})
+
+// REL-02:stopChat 的 runId 必须从渲染层一路透传到 ipcRenderer.invoke
+// (preload 为泛型透传,不修改;此处断言两参到达 invoke,主进程侧由 tests/ipcChatStop.test.ts 覆盖)
+describe('preload invoke 透传(stopChat 携带 runId)', () => {
+  it('stopChat 将 conversationId 与可选 runId 两参透传到 ipcRenderer.invoke', async () => {
+    const { stopChat } = await exposedApi()
+    electronMocks.invoke.mockClear()
+    await stopChat('conv-1', 'run-1')
+    expect(electronMocks.invoke).toHaveBeenCalledWith(Channels.ChatStop, 'conv-1', 'run-1')
+    electronMocks.invoke.mockClear()
+    await stopChat('conv-1')
+    expect(electronMocks.invoke).toHaveBeenCalledWith(Channels.ChatStop, 'conv-1')
   })
 })
