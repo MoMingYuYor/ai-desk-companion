@@ -299,8 +299,13 @@ function bootstrap(): void {
     })
     scheduler.register('personal_ops', orchestrator.asRunDriver())
     scheduler.register('research', (runId) => researchWorkflow.driveResearch(runId))
-    // 重启后已批准未执行审批与排队运行由调度器统一再领取
-    scheduler.request()
+    // 重启后已批准未执行审批与排队运行由调度器统一再领取。
+    // 健康检查模式跳过注册与首次唤醒:其自检运行不走规划,
+    // 否则调度器微任务会在首个 await 间隙把 queued 自检运行驱动成
+    // planning→failed(全新目录无模型),收尾取消即撞非法状态转移。
+    if (!CLI_HEALTHCHECK) {
+      scheduler.request()
+    }
 
     // MCP-01:--mcp 模式以 stdio 提供同一网关/审批边界,不创建窗口与 GUI IPC。
     // Windows/Electron 的 process.stdin 首读即合成 EOF(MCP-01 实测),改用 fd 0
