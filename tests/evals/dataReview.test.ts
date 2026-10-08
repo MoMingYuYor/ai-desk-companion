@@ -166,3 +166,83 @@ describe('T12 CLI gold 与结论绑定反例', () => {
     expect(result.review.datasets).not.toHaveProperty('personal_ops_v1')
   })
 })
+
+// EVAL-01 数据人审与签发:机器口径保持 freeze_eligible=false,省略 --conclusions 时输出
+// blocked_input=BLOCKED_INPUT 标记并退出 0;真人裁决与签发不属机器检查范围。
+interface Eval01Review extends Review {
+  conclusions_mode: string
+  blocked_input: { status: string; reasons: string[] } | null
+  freeze_eligible: boolean
+  near_duplicates: {
+    candidates: Candidate[]
+    conclusion_coverage: { mode: string; candidates: number; concluded: number; missing: string[]; invalid?: string[]; stale?: string[] }
+  }
+  datasets: Record<string, {
+    counts: { total: number; dev: number; holdout: number; categories: Record<string, { total: number; dev: number; holdout: number }> }
+  }>
+}
+
+describe('EVAL-01 机器口径与 BLOCKED_INPUT 标记', () => {
+  it('EVAL-01 --ops-dir personal_ops_v3 逐组计数校验通过,退出 0 且含 blocked_input 标记', () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'eval01-v3-'))
+    const output = join(outDir, 'machine-review.json')
+    execFileSync(process.execPath, [CLI, '--ops-dir', 'evals/datasets/personal_ops_v3', '--output', output],
+      { cwd: ROOT, encoding: 'utf-8', timeout: 10000 })
+    const review = JSON.parse(readFileSync(output, 'utf-8')) as Eval01Review
+    expect(review.status).toBe('blocked-input')
+    expect(review.conclusions_mode).toBe('not-provided')
+    expect(review.blocked_input?.status).toBe('BLOCKED_INPUT')
+    expect(review.blocked_input?.reasons.length).toBeGreaterThan(0)
+    expect(review.freeze_eligible).toBe(false)
+    expect(review.summary.failed).toEqual([])
+    const v3 = review.datasets.personal_ops_v3
+    expect(v3.counts.total).toBe(51)
+    expect(v3.counts.dev).toBe(31)
+    expect(v3.counts.holdout).toBe(20)
+    expect(v3.counts.categories).toEqual({
+      只读: { total: 20, dev: 12, holdout: 8 },
+      可撤销写: { total: 16, dev: 10, holdout: 6 },
+      歧义澄清: { total: 10, dev: 6, holdout: 4 },
+      注入越权: { total: 5, dev: 3, holdout: 2 }
+    })
+    expect(review.near_duplicates.conclusion_coverage.mode).toBe('not-provided')
+    expect(review.near_duplicates.conclusion_coverage.concluded).toBe(0)
+    expect(review.near_duplicates.conclusion_coverage.missing).toHaveLength(3)
+  })
+
+  it('EVAL-01 合成数据集省略 --conclusions 时 blocked_input 存在且退出 0', () => {
+    const result = run(fixture('pair'))
+    expect(result.exitCode).toBe(0)
+    const review = result.review as Eval01Review
+    expect(review.status).toBe('blocked-input')
+    expect(review.blocked_input?.status).toBe('BLOCKED_INPUT')
+    expect(review.near_duplicates.conclusion_coverage.concluded).toBe(0)
+    expect(review.near_duplicates.conclusion_coverage.missing).toEqual([review.near_duplicates.candidates[0]!.pair_key])
+  })
+
+  it('EVAL-01 --conclusions 覆盖不足时报错退出 1,陈旧键不计入覆盖', () => {
+    const root = fixture('pair')
+    const candidate = run(root).review.near_duplicates.candidates[0]!
+    const result = run(root, { 'stale-key': { schemaVersion: 1 } })
+    expect(result.exitCode).toBe(1)
+    const coverage = (result.review as Eval01Review).near_duplicates.conclusion_coverage
+    expect(coverage.concluded).toBe(0)
+    expect(coverage.missing).toEqual([candidate.pair_key])
+    expect(coverage.stale).toEqual(['stale-key'])
+    expect(result.review.summary.failed).toContain('near_duplicate.manual_conclusions')
+  })
+
+  it('EVAL-01 --conclusions 指向不存在文件时报错退出 1', () => {
+    const root = fixture('pair')
+    const output = join(root, 'review.json')
+    let exitCode = 0
+    try {
+      execFileSync(process.execPath, [CLI, '--output', output, '--conclusions', join(root, 'absent-conclusions.json')],
+        { cwd: root, encoding: 'utf-8', timeout: 10000 })
+    } catch (error) { exitCode = (error as { status: number }).status }
+    expect(exitCode).toBe(1)
+    const review = JSON.parse(readFileSync(output, 'utf-8')) as Eval01Review
+    expect(review.conclusions_mode).toBe('file-missing')
+    expect(review.summary.failed).toContain('near_duplicate.manual_conclusions')
+  })
+})

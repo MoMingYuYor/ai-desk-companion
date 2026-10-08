@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 // DATA-01 数据审查脚本:统一案例、标注与数据冻结的机器校验与近重复筛查。
 //
-// 用法: node scripts/check-eval-data.mjs [--output <path>] [--conclusions <path>]
+// 用法: node scripts/check-eval-data.mjs [--output <path>] [--conclusions <path>] [--ops-dir <path>]
 //   --output <path>       将 dataset-review.json 写入指定文件(自动创建父目录);缺省打印 stdout。
 //   --conclusions <path>  人工结论文件(键为候选对 pairKey,见输出 near_duplicates.candidates[].pair_key)。
+//                         仅在显式提供时读取:提供则校验覆盖并把人工结论并入机器口径;省略则不读任何
+//                         默认路径,输出 blocked_input=BLOCKED_INPUT 标记(EVAL-01 数据人审签发的前置口径),
+//                         机器检查全部通过时仍退出 0,但 freeze_eligible 恒为 false。
+//   --ops-dir <path>      Ops 数据集目录(相对 ROOT),缺省 personal_ops_v2 保持既有兼容。
 //
 // 覆盖规范(delivery.md DATA-01)要求的校验:
 //   1) case_id 唯一、fixture 可加载、gold 可读、manifest 类别 total/dev/holdout 与逐组计数
@@ -15,7 +19,8 @@
 //      group、URL 归一化;
 //   5) 字符三元组 Jaccard>=0.8 近重复候选筛查(仅筛查,不直接判泄漏),逐对人工结论合并。
 //
-// 退出码: 0=结构与人工泄漏检查全部通过; 1=存在校验失败或候选缺人工结论。
+// 退出码: 0=结构与人工泄漏检查全部通过(含省略 --conclusions 的 blocked-input 口径);
+//         1=存在校验失败,或提供了 --conclusions 但候选缺人工结论/结论无效。
 // 本脚本与 src/main/evals/dataset.ts 的 loader 相互独立:loader 管运行时契约,本脚本
 // 产冻结证据;规范化实现为只读复刻,漂移由 tests/evals/dataset.test.ts 的交叉核对用例兜底。
 import { createHash } from 'node:crypto'
@@ -565,7 +570,9 @@ function main() {
     return i >= 0 ? args[i + 1] : undefined
   }
   const outputPath = argOf('--output')
-  const conclusionsPath = argOf('--conclusions') ?? join(ROOT, 'artifacts', 'data-review', 'near-duplicate-conclusions.json')
+  const conclusionsIdx = args.indexOf('--conclusions')
+  const conclusionsProvided = conclusionsIdx >= 0 && typeof args[conclusionsIdx + 1] === 'string' && args[conclusionsIdx + 1] !== ''
+  const conclusionsPath = conclusionsProvided ? args[conclusionsIdx + 1] : null
 
   const ops = readDataset(OPS_DIR)
   const res = readDataset(RES_DIR)
@@ -647,13 +654,23 @@ function main() {
     ops_inputs: ops.cases.length
   }
 
-  // 合并人工结论
+  // 合并人工结论:仅在显式提供 --conclusions 时读取;省略时不读任何默认路径,输出 BLOCKED_INPUT 口径
   let conclusions = {}
   let conclusionsFile = null
-  if (existsSync(conclusionsPath)) {
+  let conclusionsMode = 'not-provided'
+  const blockedInputReasons = []
+  if (conclusionsProvided) {
     conclusionsFile = conclusionsPath
-    const raw = JSON.parse(readFileSync(conclusionsPath, 'utf-8'))
-    conclusions = raw.conclusions ?? {}
+    if (existsSync(conclusionsPath)) {
+      conclusionsMode = 'file-loaded'
+      const raw = JSON.parse(readFileSync(conclusionsPath, 'utf-8'))
+      conclusions = raw.conclusions ?? {}
+    } else {
+      conclusionsMode = 'file-missing'
+      blockedInputReasons.push(`--conclusions 指向的文件不存在:${conclusionsPath}`)
+    }
+  } else {
+    blockedInputReasons.push('未提供 --conclusions(human-conclusions.json):近重复候选的人工结论未并入机器口径')
   }
   const missingConclusions = []
   const invalidConclusions = []
@@ -666,6 +683,7 @@ function main() {
     if (c.verdict === 'leak') leakPairs.push(cand.pair_key)
   }
   nearDup.conclusion_coverage = {
+    mode: conclusionsMode,
     candidates: nearDup.candidates.length,
     concluded: nearDup.candidates.length - missingConclusions.length - invalidConclusions.length,
     missing: missingConclusions,
@@ -673,9 +691,17 @@ function main() {
     stale: Object.keys(conclusions).filter((key) => !nearDup.candidates.some((c) => c.pair_key === key)).sort(),
     leak_pairs: leakPairs
   }
-  check('near_duplicate.manual_conclusions', missingConclusions.length === 0 && invalidConclusions.length === 0,
-    missingConclusions.length || invalidConclusions.length ? `候选缺有效绑定结论:missing=${missingConclusions.join('; ')},invalid=${invalidConclusions.join('; ')}` : `全部 ${nearDup.candidates.length} 个候选均有有效绑定结论`)
-  check('near_duplicate.no_leak', leakPairs.length === 0, leakPairs.length ? `判定泄漏:${leakPairs.join('; ')}` : '有效绑定结论未报告泄漏;审查者性质及独立复核另行记录')
+  if (conclusionsProvided) {
+    check('near_duplicate.manual_conclusions', missingConclusions.length === 0 && invalidConclusions.length === 0,
+      missingConclusions.length || invalidConclusions.length ? `候选缺有效绑定结论:missing=${missingConclusions.join('; ')},invalid=${invalidConclusions.join('; ')}` : `全部 ${nearDup.candidates.length} 个候选均有有效绑定结论`)
+  } else {
+    // BLOCKED_INPUT 口径:省略人工结论不是机器失败,登记为 blocked 并成为人工签发前置条件
+    checks.push({ id: 'near_duplicate.manual_conclusions', status: 'blocked',
+      detail: `BLOCKED_INPUT:${blockedInputReasons[0]} ${nearDup.candidates.length} 个候选全部待真人逐对裁决(见 conclusion_coverage.missing)` })
+  }
+  check('near_duplicate.no_leak', leakPairs.length === 0, leakPairs.length ? `判定泄漏:${leakPairs.join('; ')}`
+    : conclusionsProvided ? '有效绑定结论未报告泄漏;审查者性质及独立复核另行记录'
+      : 'BLOCKED_INPUT 口径:无人工结论可评估泄漏,候选泄漏判断留待真人审阅')
 
   // 诚实不足语义
   const honestMachine = [{
@@ -689,12 +715,21 @@ function main() {
 
   // 汇总
   const failed = checks.filter((c) => c.status === 'fail').map((c) => c.id)
-  const status = failed.length === 0 ? 'pass' : (missingConclusions.length > 0 && failed.every((f) => f === 'near_duplicate.manual_conclusions') ? 'pending-manual-conclusions' : 'fail')
+  const conclusionsCovered = conclusionsProvided && missingConclusions.length === 0 && invalidConclusions.length === 0
+  const status = failed.length === 0
+    ? (conclusionsCovered ? 'pass' : 'blocked-input')
+    : (missingConclusions.length > 0 && failed.every((f) => f === 'near_duplicate.manual_conclusions') ? 'pending-manual-conclusions' : 'fail')
   const review = {
     schema_version: 'dataset-review.v2',
     generated_at: new Date().toISOString(),
     generator: { script: 'scripts/check-eval-data.mjs', node: process.version, rubric: GOLD_GUIDELINE_VERSION, claim_types: [...CLAIM_TYPES] },
     conclusions_file: conclusionsFile,
+    conclusions_mode: conclusionsMode,
+    blocked_input: conclusionsProvided ? null : {
+      status: 'BLOCKED_INPUT',
+      reasons: blockedInputReasons,
+      note: '本报告为机器口径(review_scope=machine-only);省略 --conclusions 时退出 0 仅代表结构与绑定校验通过。正式 data-release 保持 BLOCKED_INPUT,直至真人审阅者完成审阅包全部对象并签署;机器口径 freeze_eligible=false 不因此变更。'
+    },
     status,
     review_scope: 'machine-only',
     freeze_eligible: false,
@@ -746,7 +781,7 @@ function main() {
   } else {
     console.log(json)
   }
-  process.exit(status === 'pass' ? 0 : 1)
+  process.exit(status === 'pass' || status === 'blocked-input' ? 0 : 1)
 }
 
 main()
